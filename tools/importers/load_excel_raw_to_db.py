@@ -12,7 +12,7 @@ from sqlalchemy import text
 from app.database import engine, init_database
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_SOURCES_DIR = PROJECT_ROOT / "data_sources"
 
 WORKBOOKS = [

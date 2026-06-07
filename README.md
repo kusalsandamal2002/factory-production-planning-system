@@ -42,28 +42,10 @@ These values are stored in the PostgreSQL `shifts` table and can be changed late
 
 ## Project Structure
 
-```text
-factory_oven_planner/
-  app/
-    models.py                 # Final-level PostgreSQL database tables
-    database.py               # SQLAlchemy database connection
-    seed_data.py              # Demo master data and demo users
-    services/
-      scheduler.py            # Oven scheduling and live capacity calculation
-      order_service.py        # Order confirmation and schedule saving
-      auth_service.py         # Login authentication
-    ui/
-      login_window.py
-      main_window.py
-      dashboard_page.py
-      order_entry_page.py
-      schedule_page.py
-      styles.py
-  docker-compose.yml          # PostgreSQL database for local run
-  requirements.txt
-  run.py
-  .env.example
-```
+Runtime application code is in `app/`. Database migrations, support tools,
+documentation, source data, and retained backups are separated into dedicated
+top-level folders. See [docs/project_structure.md](docs/project_structure.md)
+for the complete layout and maintenance rules.
 
 ## How to Run
 

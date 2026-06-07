@@ -18,6 +18,7 @@ backup_priority_update/
 backup_before_dummy_cleanup*/
 backup_before_sidebar_rework/
 backup_*/
+backups/code_backups/local_snapshots/
 
 *.log
 .DS_Store

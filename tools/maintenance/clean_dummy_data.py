@@ -199,7 +199,10 @@ def main() -> None:
         print("It keeps users and roles so you can still login.")
         print("")
         print("Run again with:")
-        print(f"python clean_dummy_data.py --confirm {CONFIRM_TEXT}")
+        print(
+            "python -m tools.maintenance.clean_dummy_data "
+            f"--confirm {CONFIRM_TEXT}"
+        )
         return
 
     print("Starting safe dummy data cleanup...")
