@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QDate, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QDateEdit,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -16,8 +17,14 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from sqlalchemy import text
-from app.database import engine
+
+from app.database import get_session
+from app.services.material_requirement_service import (
+    MaterialRequirementRow,
+    PlanningAssumptions,
+    build_material_requirements,
+)
+from app.services.production_requirement_service import load_production_requirements
 from app.utils.reports_export import export_to_csv
 
 
@@ -25,372 +32,231 @@ class MaterialRequirementPage(QWidget):
     def __init__(self, current_user=None):
         super().__init__()
         self.current_user = current_user
-        self.loaded_data: list[dict] = []
-
-        # Widgets
-        self.total_shortage_items = QLabel("0")
-        self.total_bom_weight = QLabel("0 KG")
-        self.total_beads_needed = QLabel("0 PCS")
-        self.total_bands_needed = QLabel("0 PCS")
-
+        self.rows: list[MaterialRequirementRow] = []
+        self.visible_rows: list[MaterialRequirementRow] = []
+        self.metrics = {
+            "items": QLabel("0"),
+            "bom": QLabel("0.00"),
+            "compound": QLabel("0.00"),
+            "warnings": QLabel("0"),
+        }
+        self.plan_date = QDateEdit()
+        self.plan_date.setCalendarPopup(True)
+        self.plan_date.setDisplayFormat("yyyy-MM-dd")
+        self.plan_date.setDate(QDate.currentDate())
+        self.plan_date.dateChanged.connect(self.refresh)
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search finished code, component code, or description...")
+        self.search_input.setPlaceholderText("Search finished item or component...")
         self.search_input.textChanged.connect(self.filter_table)
-
-        self.category_combo = QComboBox()
-        self.category_combo.addItems(["All Component Types", "BOM Raw Materials", "Compounds", "Beads", "Bands"])
-        self.category_combo.currentTextChanged.connect(self.filter_table)
-
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["ALL", "BOM", "COMPOUND", "BEAD", "BAND"])
+        self.type_combo.currentTextChanged.connect(self.filter_table)
         self.refresh_btn = QPushButton("Calculate Requirements")
         self.refresh_btn.setObjectName("PrimaryButton")
         self.refresh_btn.clicked.connect(self.refresh)
-
-        self.export_btn = QPushButton("Export Report")
+        self.export_btn = QPushButton("Export CSV")
         self.export_btn.setObjectName("SecondaryButton")
-        self.export_btn.clicked.connect(self.export_report)
+        self.export_btn.clicked.connect(self.export_csv)
 
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels(
-            ["Finished Item", "Shortage Qty", "Component Type", "Material Code", "Material Name", "Req Qty", "Unit"]
+            [
+                "Finished Item",
+                "Description",
+                "Production Required",
+                "Type",
+                "Material Code",
+                "Material Name",
+                "Usage / Unit",
+                "Base Required",
+                "Allowance",
+                "Final Required",
+                "Warning",
+            ]
         )
-
         self._setup_table()
         self._apply_styles()
         self._build_ui()
         self.refresh()
 
-    def _apply_styles(self) -> None:
-        self.setStyleSheet(
-            """
-            QFrame#ControlCard,
-            QFrame#TableCard,
-            QFrame#MetricCard {
-                background: #ffffff;
-                border: 1px solid #e2e8f0;
-                border-radius: 16px;
-            }
-            QLabel#MetricTitle {
-                color: #64748b;
-                font-size: 8.5pt;
-                font-weight: 850;
-            }
-            QLabel#MetricValue {
-                color: #0f172a;
-                font-size: 19pt;
-                font-weight: 950;
-            }
-            QLabel#SectionTitle {
-                color: #0f172a;
-                font-size: 15pt;
-                font-weight: 950;
-            }
-            QLabel#SectionHint {
-                color: #64748b;
-                font-size: 9.5pt;
-            }
-            """
-        )
-
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(16)
+        metrics = QHBoxLayout()
+        for title, key in [
+            ("Shortage Products", "items"),
+            ("BOM Requirement", "bom"),
+            ("Compound Requirement", "compound"),
+            ("Missing BOM Warnings", "warnings"),
+        ]:
+            metrics.addWidget(self._metric_card(title, self.metrics[key]), 1)
+        root.addLayout(metrics)
 
-        # Metrics layout
-        metrics_layout = QHBoxLayout()
-        metrics_layout.setSpacing(14)
-        metrics_layout.addWidget(self._metric_card("Shortage Products", self.total_shortage_items), 1)
-        metrics_layout.addWidget(self._metric_card("Total BOM weight", self.total_bom_weight), 1)
-        metrics_layout.addWidget(self._metric_card("Beads Required", self.total_beads_needed), 1)
-        metrics_layout.addWidget(self._metric_card("Bands Required", self.total_bands_needed), 1)
-        root.addLayout(metrics_layout)
-
-        # Controls card
-        ctrl_card = QFrame()
-        ctrl_card.setObjectName("ControlCard")
-        ctrl_layout = QVBoxLayout(ctrl_card)
-        ctrl_layout.setContentsMargins(18, 16, 18, 18)
-        ctrl_layout.setSpacing(12)
-
-        header = QHBoxLayout()
+        card = QFrame()
+        card.setObjectName("Card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 18)
+        heading = QHBoxLayout()
         title_box = QVBoxLayout()
-        title_box.setSpacing(4)
-        title = QLabel("Material Requirement Planning (MRP)")
+        title = QLabel("Material Requirement Planning")
         title.setObjectName("SectionTitle")
-        hint = QLabel("Calculates exact component quantities required to fulfill current production shortage demands.")
+        hint = QLabel(
+            "BOM wastage is applied per master record. Compound uses the visible "
+            "25% Excel allowance and band uses the visible 15% Excel allowance."
+        )
         hint.setObjectName("SectionHint")
+        hint.setWordWrap(True)
         title_box.addWidget(title)
         title_box.addWidget(hint)
-        header.addLayout(title_box, 1)
-        header.addWidget(self.refresh_btn)
-        header.addWidget(self.export_btn)
-        ctrl_layout.addLayout(header)
+        heading.addLayout(title_box, 1)
+        heading.addWidget(self.refresh_btn)
+        heading.addWidget(self.export_btn)
+        layout.addLayout(heading)
+        filters = QHBoxLayout()
+        filters.addWidget(QLabel("Planning Date"))
+        filters.addWidget(self.plan_date)
+        filters.addWidget(QLabel("Search"))
+        filters.addWidget(self.search_input, 1)
+        filters.addWidget(QLabel("Component Type"))
+        filters.addWidget(self.type_combo)
+        layout.addLayout(filters)
+        root.addWidget(card)
 
-        form = QHBoxLayout()
-        form.setSpacing(12)
-        form.addWidget(QLabel("Search"))
-        form.addWidget(self.search_input, 2)
-        form.addWidget(QLabel("Type"))
-        form.addWidget(self.category_combo, 1)
-        ctrl_layout.addLayout(form)
-
-        root.addWidget(ctrl_card)
-
-        # Table card
         table_card = QFrame()
-        table_card.setObjectName("TableCard")
+        table_card.setObjectName("Card")
         table_layout = QVBoxLayout(table_card)
         table_layout.setContentsMargins(18, 16, 18, 18)
-        table_layout.setSpacing(12)
-
-        table_title = QLabel("Calculated Components Requirements")
-        table_title.setObjectName("SectionTitle")
-        table_layout.addWidget(table_title)
-        table_layout.addWidget(self.table, 1)
-
+        table_layout.addWidget(self.table)
         root.addWidget(table_card, 1)
 
-    def _metric_card(self, title_text: str, value_label: QLabel) -> QFrame:
+    def _metric_card(self, title_text: str, label: QLabel) -> QFrame:
         card = QFrame()
         card.setObjectName("MetricCard")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(5)
-
         title = QLabel(title_text)
         title.setObjectName("MetricTitle")
-        value_label.setObjectName("MetricValue")
-
+        label.setObjectName("MetricValue")
         layout.addWidget(title)
-        layout.addWidget(value_label)
+        layout.addWidget(label)
         return card
 
     def _setup_table(self) -> None:
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(40)
+        self.table.verticalHeader().setDefaultSectionSize(42)
         self.table.setAlternatingRowColors(True)
-
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        for column in range(self.table.columnCount()):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)
+        widths = [115, 200, 110, 90, 125, 200, 90, 105, 85, 105, 150]
+        for index, width in enumerate(widths):
+            self.table.setColumnWidth(index, width)
 
-        self.table.setColumnWidth(0, 130)
-        self.table.setColumnWidth(1, 100)
-        self.table.setColumnWidth(2, 150)
-        self.table.setColumnWidth(3, 140)
-        self.table.setColumnWidth(5, 110)
-        self.table.setColumnWidth(6, 70)
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            """
+            QFrame#Card, QFrame#MetricCard { background:white; border:1px solid #e2e8f0; border-radius:14px; }
+            QLabel#MetricTitle { color:#64748b; font-size:8.5pt; font-weight:800; }
+            QLabel#MetricValue { color:#0f172a; font-size:18pt; font-weight:900; }
+            QLabel#SectionTitle { color:#0f172a; font-size:15pt; font-weight:900; }
+            QLabel#SectionHint { color:#64748b; font-size:9pt; }
+            QPushButton#PrimaryButton { background:#2563eb; color:white; border:0; border-radius:9px; padding:9px 15px; font-weight:900; }
+            QPushButton#SecondaryButton { background:#e2e8f0; color:#0f172a; border:0; border-radius:9px; padding:9px 15px; font-weight:900; }
+            QLineEdit, QComboBox, QDateEdit { background:white; border:1px solid #cbd5e1; border-radius:8px; padding:7px 10px; }
+            QTableWidget { background:white; border:1px solid #e2e8f0; border-radius:10px; gridline-color:#e2e8f0; alternate-background-color:#f8fafc; }
+            QHeaderView::section { background:#f1f5f9; color:#1e293b; border:0; border-right:1px solid #e2e8f0; padding:9px; font-weight:900; }
+            """
+        )
 
-    def refresh(self) -> None:
+    def refresh(self, *args) -> None:
         try:
-            self.calculate_mrp()
+            with get_session() as session:
+                production = load_production_requirements(
+                    session,
+                    planning_date=self.plan_date.date().toPython(),
+                    production_required_only=True,
+                )
+                self.rows = build_material_requirements(
+                    session,
+                    production_rows=production,
+                    assumptions=PlanningAssumptions(),
+                )
+            self.metrics["items"].setText(f"{len(production):,}")
+            self.metrics["bom"].setText(
+                f"{sum(row.required_qty for row in self.rows if row.component_type == 'BOM'):,.2f}"
+            )
+            self.metrics["compound"].setText(
+                f"{sum(row.required_qty for row in self.rows if row.component_type == 'COMPOUND'):,.2f}"
+            )
+            self.metrics["warnings"].setText(
+                f"{sum(bool(row.warning) for row in self.rows):,}"
+            )
             self.filter_table()
         except Exception as exc:
-            QMessageBox.critical(self, "MRP Calculation Error", f"MRP engine failed: {exc}")
+            QMessageBox.critical(self, "Material Requirement Error", str(exc))
 
-    def calculate_mrp(self) -> None:
-        self.loaded_data.clear()
-
-        # Load active shortages
-        sql_shortages = """
-            SELECT material_code, item_description, production_required_qty
-            FROM mpps_stock_planning_view
-            WHERE production_required_qty > 0;
-        """
-
-        with engine.begin() as connection:
-            shortages = connection.execute(text(sql_shortages)).mappings().all()
-            
-            # Load master lists for mapping
-            boms = connection.execute(
-                text("SELECT finished_item_code, raw_material_code, raw_material_name, usage_per_unit, unit, wastage_percentage FROM mpps_bom_items WHERE is_active=TRUE;")
-            ).mappings().all()
-
-            compounds = connection.execute(
-                text("SELECT item_code, compound_code, compound_name, compound_weight_per_unit, stage FROM mpps_compound_master WHERE is_active=TRUE;")
-            ).mappings().all()
-
-            beads = connection.execute(
-                text("SELECT item_code, bead_type, bead_per_tyre FROM mpps_bead_master WHERE is_active=TRUE;")
-            ).mappings().all()
-
-            bands = connection.execute(
-                text("SELECT item_code, band_code, band_type, band_usage_per_tyre FROM mpps_band_master WHERE is_active=TRUE;")
-            ).mappings().all()
-
-        # Group components by finished item
-        bom_map = {}
-        for b in boms:
-            bom_map.setdefault(b["finished_item_code"], []).append(b)
-
-        compound_map = {}
-        for c in compounds:
-            compound_map.setdefault(c["item_code"], []).append(c)
-
-        bead_map = {}
-        for bd in beads:
-            bead_map.setdefault(bd["item_code"], []).append(bd)
-
-        band_map = {}
-        for bn in bands:
-            band_map.setdefault(bn["item_code"], []).append(bn)
-
-        total_bom_weight_kg = 0.0
-        total_beads = 0.0
-        total_bands = 0.0
-        shortage_items_count = len(shortages)
-
-        for s in shortages:
-            code = s["material_code"]
-            qty = s["production_required_qty"]
-
-            # 1. BOM Materials
-            if code in bom_map:
-                for b in bom_map[code]:
-                    # usage * qty * (1 + wastage%)
-                    req = float(qty) * float(b["usage_per_unit"]) * (1.0 + float(b["wastage_percentage"]) / 100.0)
-                    total_bom_weight_kg += req
-                    self.loaded_data.append({
-                        "finished_item": code,
-                        "shortage_qty": qty,
-                        "comp_type": "BOM Raw Material",
-                        "mat_code": b["raw_material_code"],
-                        "mat_name": b["raw_material_name"],
-                        "req_qty": req,
-                        "unit": b["unit"]
-                    })
-
-            # 2. Compounds
-            if code in compound_map:
-                for c in compound_map[code]:
-                    req = float(qty) * float(c["compound_weight_per_unit"])
-                    total_bom_weight_kg += req
-                    self.loaded_data.append({
-                        "finished_item": code,
-                        "shortage_qty": qty,
-                        "comp_type": "Compound",
-                        "mat_code": c["compound_code"],
-                        "mat_name": f"{c['compound_name']} ({c['stage']})",
-                        "req_qty": req,
-                        "unit": "KG"
-                    })
-
-            # 3. Beads
-            if code in bead_map:
-                for bd in bead_map[code]:
-                    req = float(qty) * float(bd["bead_per_tyre"])
-                    total_beads += req
-                    self.loaded_data.append({
-                        "finished_item": code,
-                        "shortage_qty": qty,
-                        "comp_type": "Bead",
-                        "mat_code": bd["bead_type"],
-                        "mat_name": f"Bead type: {bd['bead_type']}",
-                        "req_qty": req,
-                        "unit": "PCS"
-                    })
-
-            # 4. Bands
-            if code in band_map:
-                for bn in band_map[code]:
-                    req = float(qty) * float(bn["band_usage_per_tyre"])
-                    total_bands += req
-                    self.loaded_data.append({
-                        "finished_item": code,
-                        "shortage_qty": qty,
-                        "comp_type": "Band",
-                        "mat_code": bn["band_code"] or "-",
-                        "mat_name": f"Band type: {bn['band_type']}",
-                        "req_qty": req,
-                        "unit": "PCS"
-                    })
-
-        self.total_shortage_items.setText(str(shortage_items_count))
-        self.total_bom_weight.setText(f"{total_bom_weight_kg:,.2f} KG")
-        self.total_beads_needed.setText(f"{int(total_beads):,} PCS")
-        self.total_bands_needed.setText(f"{int(total_bands):,} PCS")
-
-    def filter_table(self) -> None:
-        search_text = self.search_input.text().strip().lower()
-        cat_filter = self.category_combo.currentText()
-
-        # Map UI Category to loaded comp_type values
-        cat_map = {
-            "BOM Raw Materials": "BOM Raw Material",
-            "Compounds": "Compound",
-            "Beads": "Bead",
-            "Bands": "Band"
-        }
-        target_type = cat_map.get(cat_filter)
-
-        self.table.setRowCount(0)
-        row_idx = 0
-
-        for r in self.loaded_data:
-            # Type filter
-            if target_type and r["comp_type"] != target_type:
+    def filter_table(self, *args) -> None:
+        search = self.search_input.text().strip().lower()
+        component_type = self.type_combo.currentText()
+        self.visible_rows = []
+        for row in self.rows:
+            if component_type != "ALL" and row.component_type != component_type:
                 continue
+            searchable = (
+                f"{row.finished_item_code} {row.finished_item_description} "
+                f"{row.raw_material_code} {row.raw_material_name} {row.warning}"
+            ).lower()
+            if search and search not in searchable:
+                continue
+            self.visible_rows.append(row)
+        self._populate()
 
-            # Search filter
-            if search_text:
-                match = (
-                    search_text in r["finished_item"].lower() or
-                    search_text in r["mat_code"].lower() or
-                    search_text in r["mat_name"].lower() or
-                    search_text in r["comp_type"].lower()
-                )
-                if not match:
-                    continue
-
-            self.table.insertRow(row_idx)
-
-            items = [
-                r["finished_item"],
-                str(r["shortage_qty"]),
-                r["comp_type"],
-                r["mat_code"],
-                r["mat_name"],
-                f"{r['req_qty']:,.4f}",
-                r["unit"]
+    def _populate(self) -> None:
+        self.table.setRowCount(0)
+        for row_index, row in enumerate(self.visible_rows):
+            self.table.insertRow(row_index)
+            values = [
+                row.finished_item_code,
+                row.finished_item_description,
+                f"{row.production_required_qty:,}",
+                row.component_type,
+                row.raw_material_code,
+                row.raw_material_name,
+                f"{row.usage_per_unit:,.6f}",
+                f"{row.base_required_qty:,.4f}",
+                f"{row.allowance_rate:.0%}",
+                f"{row.required_qty:,.4f} {row.unit}",
+                row.warning or "-",
             ]
-
-            for col_idx, val in enumerate(items):
-                item = QTableWidgetItem(val)
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                if col_idx in (0, 1, 2, 3, 5, 6):
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                if column not in {1, 5, 10}:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.table.setItem(row_idx, col_idx, item)
+                self.table.setItem(row_index, column, item)
 
-            row_idx += 1
-
-        self.table.resizeRowsToContents()
-
-    def export_report(self) -> None:
-        try:
-            # We want to export whatever is currently loaded in the table
-            headers = ["Finished Item", "Shortage Qty", "Component Type", "Material Code", "Material Name", "Req Qty", "Unit"]
-            data = []
-            
-            for row in range(self.table.rowCount()):
-                row_data = []
-                for col in range(self.table.columnCount()):
-                    item = self.table.item(row, col)
-                    row_data.append(item.text() if item else "")
-                data.append(row_data)
-
-            if not data:
-                QMessageBox.warning(self, "Export Report", "No records found in the table to export.")
-                return
-
-            filepath = export_to_csv(headers, data, "material_requirement_report")
-            QMessageBox.information(self, "Export Success", f"Material requirement report successfully exported to:\n\n{filepath}")
-        except Exception as exc:
-            QMessageBox.critical(self, "Export Failed", f"Could not export report: {exc}")
+    def export_csv(self) -> None:
+        if not self.visible_rows:
+            QMessageBox.warning(self, "Export CSV", "There are no visible rows.")
+            return
+        headers = [
+            self.table.horizontalHeaderItem(column).text()
+            for column in range(self.table.columnCount())
+        ]
+        data = [
+            [
+                self.table.item(row, column).text()
+                if self.table.item(row, column) is not None
+                else ""
+                for column in range(self.table.columnCount())
+            ]
+            for row in range(self.table.rowCount())
+        ]
+        path = export_to_csv(headers, data, "material_requirement")
+        QMessageBox.information(self, "Export Complete", f"CSV exported to:\n\n{path}")

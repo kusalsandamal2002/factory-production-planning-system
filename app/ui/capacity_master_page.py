@@ -40,19 +40,19 @@ class CapacityEditDialog(QDialog):
         self.running_moulds_input = QDoubleSpinBox()
         self.running_moulds_input.setRange(0, 9999)
         self.running_moulds_input.setDecimals(2)
-        self.running_moulds_input.setValue(1.0)
+        self.running_moulds_input.setValue(0.0)
         self.running_moulds_input.valueChanged.connect(self._auto_calc_daily)
 
         self.per_mould_input = QDoubleSpinBox()
         self.per_mould_input.setRange(0, 999999)
         self.per_mould_input.setDecimals(2)
-        self.per_mould_input.setValue(24.0)
+        self.per_mould_input.setValue(0.0)
         self.per_mould_input.valueChanged.connect(self._auto_calc_daily)
 
         self.daily_capacity_input = QDoubleSpinBox()
         self.daily_capacity_input.setRange(0, 9999999)
         self.daily_capacity_input.setDecimals(2)
-        self.daily_capacity_input.setValue(24.0)
+        self.daily_capacity_input.setValue(0.0)
 
         self.active_checkbox = QCheckBox("Active Capacity Config")
         self.active_checkbox.setChecked(True)

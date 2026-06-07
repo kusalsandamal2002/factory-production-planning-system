@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import math
-from datetime import date
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QDate, Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QDateEdit,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -18,8 +18,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from sqlalchemy import text
-from app.database import engine
+
+from app.database import get_session
+from app.services.oven_capacity_service import build_capacity_analysis
+from app.services.oven_schedule_service import build_daily_oven_schedule
+from app.services.production_requirement_service import load_production_requirements
+from app.services.shipment_risk_service import ShipmentRiskRow, build_shipment_risks
 from app.utils.reports_export import export_to_csv
 
 
@@ -27,360 +31,265 @@ class ShipmentRiskPage(QWidget):
     def __init__(self, current_user=None):
         super().__init__()
         self.current_user = current_user
-        self.loaded_data: list[dict] = []
-
-        # Widgets
-        self.total_demands = QLabel("0")
-        self.low_risk_count = QLabel("0")
-        self.med_risk_count = QLabel("0")
-        self.high_risk_count = QLabel("0")
-        self.cannot_complete_count = QLabel("0")
-
+        self.rows: list[ShipmentRiskRow] = []
+        self.visible_rows: list[ShipmentRiskRow] = []
+        self.metrics = {
+            status: QLabel("0")
+            for status in ["TOTAL", "LOW RISK", "MEDIUM RISK", "HIGH RISK", "CANNOT COMPLETE", "DATA MISSING"]
+        }
+        self.plan_date = QDateEdit()
+        self.plan_date.setCalendarPopup(True)
+        self.plan_date.setDisplayFormat("yyyy-MM-dd")
+        self.plan_date.setDate(QDate.currentDate())
+        self.plan_date.dateChanged.connect(self.refresh)
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search customer, material code, or risk status...")
+        self.search_input.setPlaceholderText("Search reference, customer, material, or reason...")
         self.search_input.textChanged.connect(self.filter_table)
-
         self.risk_combo = QComboBox()
-        self.risk_combo.addItems(["All Risk Levels", "LOW RISK", "MEDIUM RISK", "HIGH RISK", "CANNOT COMPLETE"])
+        self.risk_combo.addItems(
+            ["ALL", "LOW RISK", "MEDIUM RISK", "HIGH RISK", "CANNOT COMPLETE", "DATA MISSING"]
+        )
         self.risk_combo.currentTextChanged.connect(self.filter_table)
-
         self.refresh_btn = QPushButton("Run Risk Analysis")
         self.refresh_btn.setObjectName("PrimaryButton")
         self.refresh_btn.clicked.connect(self.refresh)
-
-        self.export_btn = QPushButton("Export Report")
+        self.export_btn = QPushButton("Export CSV")
         self.export_btn.setObjectName("SecondaryButton")
-        self.export_btn.clicked.connect(self.export_report)
+        self.export_btn.clicked.connect(self.export_csv)
 
-        self.table = QTableWidget(0, 9)
+        self.table = QTableWidget(0, 13)
         self.table.setHorizontalHeaderLabels(
             [
-                "Customer Demand",
+                "Order / Demand Ref",
+                "Customer",
                 "Material Code",
-                "Ship Date",
+                "Due Date",
                 "Demand Qty",
-                "Avail Stock",
-                "Shortage Qty",
-                "Daily Cap",
-                "Est Days",
+                "Available Stock",
+                "Shortage",
+                "Production Required",
+                "Planned",
+                "Unplanned",
+                "Estimated Completion",
                 "Risk Status",
+                "Risk Reason",
             ]
         )
-
         self._setup_table()
         self._apply_styles()
         self._build_ui()
         self.refresh()
 
-    def _apply_styles(self) -> None:
-        self.setStyleSheet(
-            """
-            QFrame#ControlCard,
-            QFrame#TableCard,
-            QFrame#MetricCard {
-                background: #ffffff;
-                border: 1px solid #e2e8f0;
-                border-radius: 16px;
-            }
-            QLabel#MetricTitle {
-                color: #64748b;
-                font-size: 8.5pt;
-                font-weight: 850;
-            }
-            QLabel#MetricValue {
-                color: #0f172a;
-                font-size: 18pt;
-                font-weight: 950;
-            }
-            QLabel#SectionTitle {
-                color: #0f172a;
-                font-size: 15pt;
-                font-weight: 950;
-            }
-            QLabel#SectionHint {
-                color: #64748b;
-                font-size: 9.5pt;
-            }
-            """
-        )
-
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(16)
+        metrics = QHBoxLayout()
+        for title, key in [
+            ("Total Demands", "TOTAL"),
+            ("Low Risk", "LOW RISK"),
+            ("Medium Risk", "MEDIUM RISK"),
+            ("High Risk", "HIGH RISK"),
+            ("Cannot Complete", "CANNOT COMPLETE"),
+            ("Data Missing", "DATA MISSING"),
+        ]:
+            metrics.addWidget(self._metric_card(title, self.metrics[key]), 1)
+        root.addLayout(metrics)
 
-        # Metrics layout
-        metrics_layout = QHBoxLayout()
-        metrics_layout.setSpacing(10)
-        metrics_layout.addWidget(self._metric_card("Total Demands", self.total_demands), 1)
-        metrics_layout.addWidget(self._metric_card("Low Risk", self.low_risk_count), 1)
-        metrics_layout.addWidget(self._metric_card("Medium Risk", self.med_risk_count), 1)
-        metrics_layout.addWidget(self._metric_card("High Risk", self.high_risk_count), 1)
-        metrics_layout.addWidget(self._metric_card("Cannot Complete", self.cannot_complete_count), 1)
-        root.addLayout(metrics_layout)
-
-        # Controls card
-        ctrl_card = QFrame()
-        ctrl_card.setObjectName("ControlCard")
-        ctrl_layout = QVBoxLayout(ctrl_card)
-        ctrl_layout.setContentsMargins(18, 16, 18, 18)
-        ctrl_layout.setSpacing(12)
-
-        header = QHBoxLayout()
+        card = QFrame()
+        card.setObjectName("Card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 18)
+        heading = QHBoxLayout()
         title_box = QVBoxLayout()
-        title_box.setSpacing(4)
         title = QLabel("Shipment Risk Assessment")
         title.setObjectName("SectionTitle")
-        hint = QLabel("Calculates schedule buffer days against curing capacity constraints to classify customer demand delivery risks.")
+        hint = QLabel(
+            "Allocates stock and the quantity-based oven preview to active demand "
+            "in due-date order and explains every missing-data or completion risk."
+        )
         hint.setObjectName("SectionHint")
         title_box.addWidget(title)
         title_box.addWidget(hint)
-        header.addLayout(title_box, 1)
-        header.addWidget(self.refresh_btn)
-        header.addWidget(self.export_btn)
-        ctrl_layout.addLayout(header)
+        heading.addLayout(title_box, 1)
+        heading.addWidget(self.refresh_btn)
+        heading.addWidget(self.export_btn)
+        layout.addLayout(heading)
+        filters = QHBoxLayout()
+        filters.addWidget(QLabel("Planning Date"))
+        filters.addWidget(self.plan_date)
+        filters.addWidget(QLabel("Search"))
+        filters.addWidget(self.search_input, 1)
+        filters.addWidget(QLabel("Risk"))
+        filters.addWidget(self.risk_combo)
+        layout.addLayout(filters)
+        root.addWidget(card)
 
-        form = QHBoxLayout()
-        form.setSpacing(12)
-        form.addWidget(QLabel("Search"))
-        form.addWidget(self.search_input, 2)
-        form.addWidget(QLabel("Risk Level"))
-        form.addWidget(self.risk_combo, 1)
-        ctrl_layout.addLayout(form)
-
-        root.addWidget(ctrl_card)
-
-        # Table card
         table_card = QFrame()
-        table_card.setObjectName("TableCard")
+        table_card.setObjectName("Card")
         table_layout = QVBoxLayout(table_card)
         table_layout.setContentsMargins(18, 16, 18, 18)
-        table_layout.setSpacing(12)
-
-        table_title = QLabel("Demands Risk Assessment Table")
-        table_title.setObjectName("SectionTitle")
-        table_layout.addWidget(table_title)
-        table_layout.addWidget(self.table, 1)
-
+        table_layout.addWidget(self.table)
         root.addWidget(table_card, 1)
 
-    def _metric_card(self, title_text: str, value_label: QLabel) -> QFrame:
+    def _metric_card(self, title_text: str, label: QLabel) -> QFrame:
         card = QFrame()
         card.setObjectName("MetricCard")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(4)
-
+        layout.setContentsMargins(12, 10, 12, 10)
         title = QLabel(title_text)
         title.setObjectName("MetricTitle")
-        value_label.setObjectName("MetricValue")
-
+        label.setObjectName("MetricValue")
         layout.addWidget(title)
-        layout.addWidget(value_label)
+        layout.addWidget(label)
         return card
 
     def _setup_table(self) -> None:
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(40)
+        self.table.verticalHeader().setDefaultSectionSize(42)
         self.table.setAlternatingRowColors(True)
-
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)
+        for column in range(self.table.columnCount()):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(12, QHeaderView.ResizeMode.Stretch)
+        widths = [115, 170, 115, 95, 85, 95, 85, 110, 80, 85, 125, 125, 250]
+        for index, width in enumerate(widths):
+            self.table.setColumnWidth(index, width)
 
-        self.table.setColumnWidth(1, 110)
-        self.table.setColumnWidth(2, 100)
-        self.table.setColumnWidth(3, 90)
-        self.table.setColumnWidth(4, 90)
-        self.table.setColumnWidth(5, 100)
-        self.table.setColumnWidth(6, 90)
-        self.table.setColumnWidth(7, 90)
-        self.table.setColumnWidth(8, 140)
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            """
+            QFrame#Card, QFrame#MetricCard { background:white; border:1px solid #e2e8f0; border-radius:14px; }
+            QLabel#MetricTitle { color:#64748b; font-size:8pt; font-weight:800; }
+            QLabel#MetricValue { color:#0f172a; font-size:17pt; font-weight:900; }
+            QLabel#SectionTitle { color:#0f172a; font-size:15pt; font-weight:900; }
+            QLabel#SectionHint { color:#64748b; font-size:9pt; }
+            QPushButton#PrimaryButton { background:#2563eb; color:white; border:0; border-radius:9px; padding:9px 15px; font-weight:900; }
+            QPushButton#SecondaryButton { background:#e2e8f0; color:#0f172a; border:0; border-radius:9px; padding:9px 15px; font-weight:900; }
+            QLineEdit, QComboBox, QDateEdit { background:white; border:1px solid #cbd5e1; border-radius:8px; padding:7px 10px; }
+            QTableWidget { background:white; border:1px solid #e2e8f0; border-radius:10px; gridline-color:#e2e8f0; alternate-background-color:#f8fafc; }
+            QHeaderView::section { background:#f1f5f9; color:#1e293b; border:0; border-right:1px solid #e2e8f0; padding:9px; font-weight:900; }
+            """
+        )
 
-    def refresh(self) -> None:
+    def refresh(self, *args) -> None:
         try:
-            self.calculate_risks()
+            selected = self.plan_date.date().toPython()
+            with get_session() as session:
+                production = load_production_requirements(
+                    session, planning_date=selected
+                )
+                required = [row for row in production if row.production_required_qty > 0]
+                capacity = build_capacity_analysis(
+                    session, production_rows=required, planning_date=selected
+                )
+                schedule, _ = build_daily_oven_schedule(
+                    session,
+                    planning_date=selected,
+                    production_rows=required,
+                    capacity_rows=capacity,
+                )
+                self.rows = build_shipment_risks(
+                    session,
+                    planning_date=selected,
+                    production_rows=production,
+                    capacity_rows=capacity,
+                    schedule_rows=schedule,
+                )
+            self.metrics["TOTAL"].setText(f"{len(self.rows):,}")
+            for status in [
+                "LOW RISK",
+                "MEDIUM RISK",
+                "HIGH RISK",
+                "CANNOT COMPLETE",
+                "DATA MISSING",
+            ]:
+                self.metrics[status].setText(
+                    f"{sum(row.risk_status == status for row in self.rows):,}"
+                )
             self.filter_table()
         except Exception as exc:
-            QMessageBox.critical(self, "Risk Assessment Error", f"Risk engine failed: {exc}")
+            QMessageBox.critical(self, "Shipment Risk Error", str(exc))
 
-    def calculate_risks(self) -> None:
-        self.loaded_data.clear()
-
-        # Load customer demands, stocks, and daily capacity mapping
-        sql = """
-            SELECT
-                sd.id,
-                COALESCE(sd.customer_name, 'EXCEL_DEMAND') AS customer_name,
-                sd.material_code,
-                sd.demand_qty,
-                sd.shipment_date,
-                COALESCE(si.fg_stock + si.qc_stock - si.scrap_stock - si.blocked_stock, 0) AS available_stock,
-                COALESCE(cm.available_capacity_per_day, 0) AS daily_capacity
-            FROM mpps_shipment_demand sd
-            LEFT JOIN mpps_stock_items si
-              ON sd.material_code = si.material_code
-            LEFT JOIN mpps_capacity_master cm
-              ON si.bead_type = cm.item_code
-            WHERE sd.status IN ('PENDING', 'CONFIRMED', 'PLANNED', 'PARTIALLY_PLANNED')
-              AND sd.demand_qty > 0;
-        """
-
-        with engine.begin() as connection:
-            rows = connection.execute(text(sql)).mappings().all()
-
-        low_risk = 0
-        med_risk = 0
-        high_risk = 0
-        cannot_comp = 0
-        today_date = date.today()
-
-        for r in rows:
-            qty = r["demand_qty"]
-            stock = r["available_stock"]
-            cap = float(r["daily_capacity"] or 0.0)
-            ship_date = r["shipment_date"]
-
-            shortage = max(qty - stock, 0)
-
-            # Est. remaining calendar days to ship date
-            if ship_date:
-                remaining_days = max((ship_date - today_date).days, 0)
-            else:
-                remaining_days = 999  # Treat missing date as long buffer or warn
-
-            if shortage == 0:
-                status = "LOW RISK"
-                days_required = 0.0
-                low_risk += 1
-            else:
-                if cap > 0.0:
-                    days_required = float(shortage) / cap
-                    est_days = math.ceil(days_required)
-                    if est_days <= remaining_days:
-                        status = "MEDIUM RISK"
-                        med_risk += 1
-                    else:
-                        status = "HIGH RISK"
-                        high_risk += 1
-                else:
-                    days_required = 999.0
-                    status = "CANNOT COMPLETE"
-                    cannot_comp += 1
-
-            self.loaded_data.append({
-                "id": r["id"],
-                "customer": r["customer_name"],
-                "material_code": r["material_code"],
-                "ship_date": ship_date,
-                "qty": qty,
-                "stock": stock,
-                "shortage": shortage,
-                "capacity": cap,
-                "est_days": days_required,
-                "status": status
-            })
-
-        self.total_demands.setText(str(len(rows)))
-        self.low_risk_count.setText(str(low_risk))
-        self.med_risk_count.setText(str(med_risk))
-        self.high_risk_count.setText(str(high_risk))
-        self.cannot_complete_count.setText(str(cannot_comp))
-
-    def filter_table(self) -> None:
-        search_text = self.search_input.text().strip().lower()
-        risk_filter = self.risk_combo.currentText()
-
-        self.table.setRowCount(0)
-        row_idx = 0
-
-        for r in self.loaded_data:
-            # Risk level filter
-            if risk_filter != "All Risk Levels" and r["status"] != risk_filter:
+    def filter_table(self, *args) -> None:
+        search = self.search_input.text().strip().lower()
+        risk = self.risk_combo.currentText()
+        self.visible_rows = []
+        for row in self.rows:
+            if risk != "ALL" and row.risk_status != risk:
                 continue
+            searchable = (
+                f"{row.demand_reference} {row.customer_name} {row.material_code} "
+                f"{row.risk_status} {row.risk_reason}"
+            ).lower()
+            if search and search not in searchable:
+                continue
+            self.visible_rows.append(row)
+        self._populate()
 
-            # Search filter
-            if search_text:
-                match = (
-                    search_text in r["customer"].lower() or
-                    search_text in r["material_code"].lower() or
-                    search_text in r["status"].lower()
-                )
-                if not match:
-                    continue
-
-            self.table.insertRow(row_idx)
-
-            date_str = r["ship_date"].strftime("%Y-%m-%d") if r["ship_date"] else "No Date"
-            days_str = f"{math.ceil(r['est_days'])}" if r["est_days"] < 999.0 else "∞"
-            cap_str = f"{r['capacity']:.2f}"
-
-            items = [
-                r["customer"],
-                r["material_code"],
-                date_str,
-                str(r["qty"]),
-                str(r["stock"]),
-                str(r["shortage"]),
-                cap_str,
-                days_str,
-                r["status"]
+    def _populate(self) -> None:
+        self.table.setRowCount(0)
+        for row_index, row in enumerate(self.visible_rows):
+            self.table.insertRow(row_index)
+            values = [
+                row.demand_reference,
+                row.customer_name,
+                row.material_code,
+                row.due_date.isoformat() if row.due_date else "MISSING",
+                f"{row.demand_qty:,}",
+                f"{row.available_stock:,}",
+                f"{row.shortage_qty:,}",
+                f"{row.production_required_qty:,}",
+                f"{row.planned_qty:,}",
+                f"{row.unplanned_qty:,}",
+                row.estimated_completion_date.isoformat()
+                if row.estimated_completion_date
+                else "-",
+                row.risk_status,
+                row.risk_reason,
             ]
-
-            for col_idx, val in enumerate(items):
-                item = QTableWidgetItem(val)
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                if col_idx in (1, 2, 3, 4, 5, 6, 7, 8):
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                if column not in {1, 12}:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if column == 11:
+                    self._style_risk(item, row.risk_status)
+                if column == 12:
+                    item.setToolTip(row.risk_reason)
+                self.table.setItem(row_index, column, item)
 
-                # Style status badge
-                if col_idx == 8:
-                    if r["status"] == "LOW RISK":
-                        item.setForeground(Qt.GlobalColor.darkGreen)
-                    elif r["status"] == "MEDIUM RISK":
-                        item.setForeground(Qt.GlobalColor.darkBlue)
-                    elif r["status"] == "HIGH RISK":
-                        item.setForeground(Qt.GlobalColor.darkYellow)
-                    else:
-                        item.setForeground(Qt.GlobalColor.red)
-                        item.setToolTip("Cannot cure! No capacity allocated for this tire group.")
+    def _style_risk(self, item: QTableWidgetItem, status: str) -> None:
+        colors = {
+            "LOW RISK": ("#166534", "#dcfce7"),
+            "MEDIUM RISK": ("#1d4ed8", "#dbeafe"),
+            "HIGH RISK": ("#92400e", "#fef3c7"),
+            "CANNOT COMPLETE": ("#991b1b", "#fee2e2"),
+            "DATA MISSING": ("#475569", "#f1f5f9"),
+        }
+        foreground, background = colors.get(status, ("#475569", "#f1f5f9"))
+        item.setForeground(QColor(foreground))
+        item.setBackground(QColor(background))
 
-                self.table.setItem(row_idx, col_idx, item)
-
-            row_idx += 1
-
-        self.table.resizeRowsToContents()
-
-    def export_report(self) -> None:
-        try:
-            headers = [
-                "Customer Demand", "Material Code", "Ship Date", "Demand Qty", 
-                "Avail Stock", "Shortage Qty", "Daily Cap", "Est Days", "Risk Status"
+    def export_csv(self) -> None:
+        if not self.visible_rows:
+            QMessageBox.warning(self, "Export CSV", "There are no visible rows.")
+            return
+        headers = [
+            self.table.horizontalHeaderItem(column).text()
+            for column in range(self.table.columnCount())
+        ]
+        data = [
+            [
+                self.table.item(row, column).text()
+                if self.table.item(row, column) is not None
+                else ""
+                for column in range(self.table.columnCount())
             ]
-            data = []
-            
-            for row in range(self.table.rowCount()):
-                row_data = []
-                for col in range(self.table.columnCount()):
-                    item = self.table.item(row, col)
-                    row_data.append(item.text() if item else "")
-                data.append(row_data)
-
-            if not data:
-                QMessageBox.warning(self, "Export Report", "No records found in the table to export.")
-                return
-
-            filepath = export_to_csv(headers, data, "shipment_risk_report")
-            QMessageBox.information(self, "Export Success", f"Shipment risk report successfully exported to:\n\n{filepath}")
-        except Exception as exc:
-            QMessageBox.critical(self, "Export Failed", f"Could not export report: {exc}")
+            for row in range(self.table.rowCount())
+        ]
+        path = export_to_csv(headers, data, "shipment_risk")
+        QMessageBox.information(self, "Export Complete", f"CSV exported to:\n\n{path}")

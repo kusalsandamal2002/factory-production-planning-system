@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import math
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QDate, Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QDateEdit,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -17,8 +18,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from sqlalchemy import text
-from app.database import engine
+
+from app.database import get_session
+from app.services.oven_capacity_service import CapacityAnalysisRow, build_capacity_analysis
+from app.services.production_requirement_service import load_production_requirements
 from app.utils.reports_export import export_to_csv
 
 
@@ -26,322 +29,220 @@ class CapacityAnalysisPage(QWidget):
     def __init__(self, current_user=None):
         super().__init__()
         self.current_user = current_user
-        self.loaded_data: list[dict] = []
+        self.rows: list[CapacityAnalysisRow] = []
+        self.visible_rows: list[CapacityAnalysisRow] = []
+        self.total_items = QLabel("0")
+        self.capacity_items = QLabel("0")
+        self.cannot_complete = QLabel("0")
 
-        # Widgets
-        self.total_shortage_items = QLabel("0")
-        self.total_moulds_active = QLabel("0")
-        self.cannot_complete_count = QLabel("0")
-
+        self.plan_date = QDateEdit()
+        self.plan_date.setCalendarPopup(True)
+        self.plan_date.setDisplayFormat("yyyy-MM-dd")
+        self.plan_date.setDate(QDate.currentDate())
+        self.plan_date.dateChanged.connect(self.refresh)
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search item code, description or group...")
+        self.search_input.setPlaceholderText("Search item, description, or warning...")
         self.search_input.textChanged.connect(self.filter_table)
-
         self.status_combo = QComboBox()
-        self.status_combo.addItems(["All Status", "CAN COMPLETE Only", "CANNOT COMPLETE Only"])
+        self.status_combo.addItems(["ALL", "CAN COMPLETE", "CANNOT COMPLETE"])
         self.status_combo.currentTextChanged.connect(self.filter_table)
-
-        self.refresh_btn = QPushButton("Calculate Capacity Analysis")
+        self.refresh_btn = QPushButton("Calculate Capacity")
         self.refresh_btn.setObjectName("PrimaryButton")
         self.refresh_btn.clicked.connect(self.refresh)
-
-        self.export_btn = QPushButton("Export Report")
+        self.export_btn = QPushButton("Export CSV")
         self.export_btn.setObjectName("SecondaryButton")
-        self.export_btn.clicked.connect(self.export_report)
+        self.export_btn.clicked.connect(self.export_csv)
 
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 12)
         self.table.setHorizontalHeaderLabels(
             [
                 "Item Code",
                 "Description",
-                "Bead Type (Size Group)",
-                "Prod Req Qty",
-                "Daily Capacity",
-                "Days Required",
+                "Production Required",
+                "Running Moulds",
+                "Per Mould / Day",
+                "Calculated Capacity",
+                "Available Capacity",
+                "Required Days",
                 "Capacity Gap",
+                "Estimated Completion",
                 "Status",
+                "Warning",
             ]
         )
-
         self._setup_table()
         self._apply_styles()
         self._build_ui()
         self.refresh()
 
-    def _apply_styles(self) -> None:
-        self.setStyleSheet(
-            """
-            QFrame#ControlCard,
-            QFrame#TableCard,
-            QFrame#MetricCard {
-                background: #ffffff;
-                border: 1px solid #e2e8f0;
-                border-radius: 16px;
-            }
-            QLabel#MetricTitle {
-                color: #64748b;
-                font-size: 8.5pt;
-                font-weight: 850;
-            }
-            QLabel#MetricValue {
-                color: #0f172a;
-                font-size: 19pt;
-                font-weight: 950;
-            }
-            QLabel#SectionTitle {
-                color: #0f172a;
-                font-size: 15pt;
-                font-weight: 950;
-            }
-            QLabel#SectionHint {
-                color: #64748b;
-                font-size: 9.5pt;
-            }
-            """
-        )
-
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(16)
-
-        # Metrics layout
-        metrics_layout = QHBoxLayout()
-        metrics_layout.setSpacing(14)
-        metrics_layout.addWidget(self._metric_card("Shortage Products", self.total_shortage_items), 1)
-        metrics_layout.addWidget(self._metric_card("Active Moulds Needed", self.total_moulds_active), 1)
-        metrics_layout.addWidget(self._metric_card("Cannot Complete Items", self.cannot_complete_count), 1)
-        root.addLayout(metrics_layout)
-
-        # Controls card
-        ctrl_card = QFrame()
-        ctrl_card.setObjectName("ControlCard")
-        ctrl_layout = QVBoxLayout(ctrl_card)
-        ctrl_layout.setContentsMargins(18, 16, 18, 18)
-        ctrl_layout.setSpacing(12)
-
-        header = QHBoxLayout()
+        metrics = QHBoxLayout()
+        metrics.addWidget(self._metric_card("Production Required Items", self.total_items), 1)
+        metrics.addWidget(self._metric_card("Items With Capacity", self.capacity_items), 1)
+        metrics.addWidget(self._metric_card("Cannot Complete / Missing", self.cannot_complete), 1)
+        root.addLayout(metrics)
+        card = QFrame()
+        card.setObjectName("Card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 18)
+        heading = QHBoxLayout()
         title_box = QVBoxLayout()
-        title_box.setSpacing(4)
-        title = QLabel("Mould Capacity Analysis")
+        title = QLabel("Quantity-Based Mould Capacity Analysis")
         title.setObjectName("SectionTitle")
-        hint = QLabel("Compares current production shortages against daily mould curing limits to estimate schedules and gaps.")
+        hint = QLabel(
+            "Capacity is running moulds times approved pieces per mould per day. "
+            "No minute utilization or curing time is calculated."
+        )
         hint.setObjectName("SectionHint")
         title_box.addWidget(title)
         title_box.addWidget(hint)
-        header.addLayout(title_box, 1)
-        header.addWidget(self.refresh_btn)
-        header.addWidget(self.export_btn)
-        ctrl_layout.addLayout(header)
-
-        form = QHBoxLayout()
-        form.setSpacing(12)
-        form.addWidget(QLabel("Search"))
-        form.addWidget(self.search_input, 2)
-        form.addWidget(QLabel("Status Filter"))
-        form.addWidget(self.status_combo, 1)
-        ctrl_layout.addLayout(form)
-
-        root.addWidget(ctrl_card)
-
-        # Table card
+        heading.addLayout(title_box, 1)
+        heading.addWidget(self.refresh_btn)
+        heading.addWidget(self.export_btn)
+        layout.addLayout(heading)
+        filters = QHBoxLayout()
+        filters.addWidget(QLabel("Planning Date"))
+        filters.addWidget(self.plan_date)
+        filters.addWidget(QLabel("Search"))
+        filters.addWidget(self.search_input, 1)
+        filters.addWidget(QLabel("Status"))
+        filters.addWidget(self.status_combo)
+        layout.addLayout(filters)
+        root.addWidget(card)
         table_card = QFrame()
-        table_card.setObjectName("TableCard")
+        table_card.setObjectName("Card")
         table_layout = QVBoxLayout(table_card)
         table_layout.setContentsMargins(18, 16, 18, 18)
-        table_layout.setSpacing(12)
-
-        table_title = QLabel("Shortage Capacity Allocation")
-        table_title.setObjectName("SectionTitle")
-        table_layout.addWidget(table_title)
-        table_layout.addWidget(self.table, 1)
-
+        table_layout.addWidget(self.table)
         root.addWidget(table_card, 1)
 
-    def _metric_card(self, title_text: str, value_label: QLabel) -> QFrame:
+    def _metric_card(self, title_text: str, label: QLabel) -> QFrame:
         card = QFrame()
         card.setObjectName("MetricCard")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(5)
-
         title = QLabel(title_text)
         title.setObjectName("MetricTitle")
-        value_label.setObjectName("MetricValue")
-
+        label.setObjectName("MetricValue")
         layout.addWidget(title)
-        layout.addWidget(value_label)
+        layout.addWidget(label)
         return card
 
     def _setup_table(self) -> None:
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(40)
+        self.table.verticalHeader().setDefaultSectionSize(42)
         self.table.setAlternatingRowColors(True)
-
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        for column in range(self.table.columnCount()):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
+        widths = [115, 220, 110, 95, 100, 110, 110, 90, 95, 125, 125, 220]
+        for index, width in enumerate(widths):
+            self.table.setColumnWidth(index, width)
 
-        self.table.setColumnWidth(0, 110)
-        self.table.setColumnWidth(2, 140)
-        self.table.setColumnWidth(3, 110)
-        self.table.setColumnWidth(4, 110)
-        self.table.setColumnWidth(5, 110)
-        self.table.setColumnWidth(6, 110)
-        self.table.setColumnWidth(7, 140)
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            """
+            QFrame#Card, QFrame#MetricCard { background:white; border:1px solid #e2e8f0; border-radius:14px; }
+            QLabel#MetricTitle { color:#64748b; font-size:8.5pt; font-weight:800; }
+            QLabel#MetricValue { color:#0f172a; font-size:18pt; font-weight:900; }
+            QLabel#SectionTitle { color:#0f172a; font-size:15pt; font-weight:900; }
+            QLabel#SectionHint { color:#64748b; font-size:9pt; }
+            QPushButton#PrimaryButton { background:#2563eb; color:white; border:0; border-radius:9px; padding:9px 15px; font-weight:900; }
+            QPushButton#SecondaryButton { background:#e2e8f0; color:#0f172a; border:0; border-radius:9px; padding:9px 15px; font-weight:900; }
+            QLineEdit, QComboBox, QDateEdit { background:white; border:1px solid #cbd5e1; border-radius:8px; padding:7px 10px; }
+            QTableWidget { background:white; border:1px solid #e2e8f0; border-radius:10px; gridline-color:#e2e8f0; alternate-background-color:#f8fafc; }
+            QHeaderView::section { background:#f1f5f9; color:#1e293b; border:0; border-right:1px solid #e2e8f0; padding:9px; font-weight:900; }
+            """
+        )
 
-    def refresh(self) -> None:
+    def refresh(self, *args) -> None:
         try:
-            self.calculate_capacity()
+            selected = self.plan_date.date().toPython()
+            with get_session() as session:
+                production = load_production_requirements(
+                    session, planning_date=selected, production_required_only=True
+                )
+                self.rows = build_capacity_analysis(
+                    session, production_rows=production, planning_date=selected
+                )
+            self.total_items.setText(f"{len(self.rows):,}")
+            self.capacity_items.setText(
+                f"{sum(row.available_capacity > 0 for row in self.rows):,}"
+            )
+            self.cannot_complete.setText(
+                f"{sum(row.status == 'CANNOT COMPLETE' for row in self.rows):,}"
+            )
             self.filter_table()
         except Exception as exc:
-            QMessageBox.critical(self, "Capacity Analysis Error", f"Capacity engine failed: {exc}")
+            QMessageBox.critical(self, "Capacity Analysis Error", str(exc))
 
-    def calculate_capacity(self) -> None:
-        self.loaded_data.clear()
+    def filter_table(self, *args) -> None:
+        search = self.search_input.text().strip().lower()
+        status = self.status_combo.currentText()
+        self.visible_rows = []
+        for row in self.rows:
+            if status != "ALL" and row.status != status:
+                continue
+            searchable = f"{row.item_code} {row.item_description} {row.warning}".lower()
+            if search and search not in searchable:
+                continue
+            self.visible_rows.append(row)
+        self._populate()
 
-        # Query shortages and join capacity master on bead_type = item_code
-        sql = """
-            SELECT
-                spv.material_code,
-                spv.item_description,
-                spv.bead_type,
-                spv.production_required_qty,
-                COALESCE(cm.available_capacity_per_day, 0) AS daily_capacity,
-                COALESCE(cm.running_moulds, 0) AS moulds
-            FROM mpps_stock_planning_view spv
-            LEFT JOIN mpps_capacity_master cm
-              ON spv.bead_type = cm.item_code
-            WHERE spv.production_required_qty > 0;
-        """
-
-        with engine.begin() as connection:
-            rows = connection.execute(text(sql)).mappings().all()
-
-        cannot_complete = 0
-        total_moulds = 0.0
-
-        for r in rows:
-            qty = r["production_required_qty"]
-            cap = float(r["daily_capacity"] or 0)
-            moulds = float(r["moulds"] or 0)
-
-            if cap > 0:
-                days = float(qty) / cap
-                gap = cap - float(qty)
-                status = "CAN COMPLETE"
-                total_moulds += moulds
-            else:
-                days = 999.0  # infinite days representation
-                gap = -float(qty)
-                status = "CANNOT COMPLETE"
-                cannot_complete += 1
-
-            self.loaded_data.append({
-                "item_code": r["material_code"],
-                "description": r["item_description"],
-                "bead_type": r["bead_type"] or "-",
-                "qty": qty,
-                "daily_capacity": cap,
-                "days_required": days,
-                "capacity_gap": gap,
-                "status": status
-            })
-
-        self.total_shortage_items.setText(str(len(rows)))
-        self.total_moulds_active.setText(f"{total_moulds:.2f}")
-        self.cannot_complete_count.setText(str(cannot_complete))
-
-    def filter_table(self) -> None:
-        search_text = self.search_input.text().strip().lower()
-        status_filter = self.status_combo.currentText()
-
+    def _populate(self) -> None:
         self.table.setRowCount(0)
-        row_idx = 0
-
-        for r in self.loaded_data:
-            # Status filter
-            if status_filter == "CAN COMPLETE Only" and r["status"] != "CAN COMPLETE":
-                continue
-            if status_filter == "CANNOT COMPLETE Only" and r["status"] != "CANNOT COMPLETE":
-                continue
-
-            # Search filter
-            if search_text:
-                match = (
-                    search_text in r["item_code"].lower() or
-                    search_text in r["description"].lower() or
-                    search_text in r["bead_type"].lower() or
-                    search_text in r["status"].lower()
-                )
-                if not match:
-                    continue
-
-            self.table.insertRow(row_idx)
-
-            days_val = f"{r['days_required']:.2f}" if r["days_required"] < 999.0 else "∞"
-            gap_val = f"{r['capacity_gap']:,.2f}"
-
-            items = [
-                r["item_code"],
-                r["description"],
-                r["bead_type"],
-                str(r["qty"]),
-                f"{r['daily_capacity']:.2f}",
-                days_val,
-                gap_val,
-                r["status"]
+        for row_index, row in enumerate(self.visible_rows):
+            self.table.insertRow(row_index)
+            values = [
+                row.item_code,
+                row.item_description,
+                f"{row.production_required_qty:,}",
+                f"{row.running_moulds:,.2f}",
+                f"{row.per_mould_capacity:,.2f}",
+                f"{row.calculated_daily_capacity:,.2f}",
+                f"{row.available_capacity:,.2f}",
+                str(row.required_days) if row.required_days is not None else "-",
+                f"{row.capacity_gap:,.2f}",
+                row.estimated_completion_date.isoformat()
+                if row.estimated_completion_date
+                else "-",
+                row.status,
+                row.warning or "-",
             ]
-
-            for col_idx, val in enumerate(items):
-                item = QTableWidgetItem(val)
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                if col_idx in (0, 2, 3, 4, 5, 6, 7):
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                if column not in {1, 11}:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                
-                # Apply color styling to Status
-                if col_idx == 7:
-                    if r["status"] == "CAN COMPLETE":
-                        item.setForeground(Qt.GlobalColor.darkGreen)
-                    else:
-                        item.setForeground(Qt.GlobalColor.red)
-                        item.setToolTip("Missing capacity specification! Production cannot be scheduled.")
+                if column == 10:
+                    good = row.status == "CAN COMPLETE"
+                    item.setForeground(QColor("#166534" if good else "#991b1b"))
+                    item.setBackground(QColor("#dcfce7" if good else "#fee2e2"))
+                self.table.setItem(row_index, column, item)
 
-                self.table.setItem(row_idx, col_idx, item)
-
-            row_idx += 1
-
-        self.table.resizeRowsToContents()
-
-    def export_report(self) -> None:
-        try:
-            headers = [
-                "Item Code", "Description", "Bead Type (Size Group)", 
-                "Prod Req Qty", "Daily Capacity", "Days Required", "Capacity Gap", "Status"
+    def export_csv(self) -> None:
+        if not self.visible_rows:
+            QMessageBox.warning(self, "Export CSV", "There are no visible rows.")
+            return
+        headers = [
+            self.table.horizontalHeaderItem(column).text()
+            for column in range(self.table.columnCount())
+        ]
+        data = [
+            [
+                self.table.item(row, column).text()
+                if self.table.item(row, column) is not None
+                else ""
+                for column in range(self.table.columnCount())
             ]
-            data = []
-            
-            for row in range(self.table.rowCount()):
-                row_data = []
-                for col in range(self.table.columnCount()):
-                    item = self.table.item(row, col)
-                    row_data.append(item.text() if item else "")
-                data.append(row_data)
-
-            if not data:
-                QMessageBox.warning(self, "Export Report", "No records found in the table to export.")
-                return
-
-            filepath = export_to_csv(headers, data, "capacity_analysis_report")
-            QMessageBox.information(self, "Export Success", f"Capacity analysis report successfully exported to:\n\n{filepath}")
-        except Exception as exc:
-            QMessageBox.critical(self, "Export Failed", f"Could not export report: {exc}")
+            for row in range(self.table.rowCount())
+        ]
+        path = export_to_csv(headers, data, "capacity_analysis")
+        QMessageBox.information(self, "Export Complete", f"CSV exported to:\n\n{path}")

@@ -58,6 +58,10 @@ class DataQualityIssuesPage(QWidget):
         self.refresh_btn.setObjectName("SecondaryButton")
         self.refresh_btn.clicked.connect(self.refresh)
 
+        self.export_btn = QPushButton("Export CSV")
+        self.export_btn.setObjectName("SecondaryButton")
+        self.export_btn.clicked.connect(self.export_issues)
+
         self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
             [
@@ -143,6 +147,7 @@ class DataQualityIssuesPage(QWidget):
         header.addWidget(self.resolve_btn)
         header.addWidget(self.reevaluate_btn)
         header.addWidget(self.refresh_btn)
+        header.addWidget(self.export_btn)
         ctrl_layout.addLayout(header)
 
         form = QHBoxLayout()
@@ -400,25 +405,164 @@ class DataQualityIssuesPage(QWidget):
             QMessageBox.critical(self, "Resolution Error", f"Failed to resolve issue: {exc}")
 
     def reevaluate_warnings(self) -> None:
-        # Re-run data quality checks non-destructively
         username = self.current_user.username if self.current_user else "anonymous"
 
         try:
-            from map_raw_excel_to_clean_mpps import create_data_quality_issues
-            create_data_quality_issues()
-            
             with engine.begin() as connection:
+                result = connection.execute(
+                    text(
+                        """
+                        WITH candidates AS (
+                            SELECT 'WARNING'::VARCHAR AS issue_level, 'WEIGHT'::VARCHAR AS issue_area,
+                                   si.source_workbook, si.source_sheet, si.source_row,
+                                   NULL::VARCHAR AS source_column, si.material_code,
+                                   'Average weight is missing or zero while production is required.'::TEXT AS issue_message
+                            FROM mpps_stock_planning_view spv
+                            JOIN mpps_stock_items si ON si.material_code = spv.material_code
+                            WHERE spv.production_required_qty > 0
+                              AND COALESCE(spv.average_weight, 0) <= 0
+                            UNION ALL
+                            SELECT 'WARNING', 'BOM', si.source_workbook, si.source_sheet, si.source_row,
+                                   NULL, si.material_code,
+                                   'BOM data is missing for this item while production is required.'
+                            FROM mpps_stock_planning_view spv
+                            JOIN mpps_stock_items si ON si.material_code = spv.material_code
+                            WHERE spv.production_required_qty > 0
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM mpps_bom_items m
+                                  WHERE m.finished_item_code = si.material_code AND m.is_active = TRUE
+                              )
+                            UNION ALL
+                            SELECT 'WARNING', 'COMPOUND', si.source_workbook, si.source_sheet, si.source_row,
+                                   NULL, si.material_code,
+                                   'Compound master data is missing while production is required.'
+                            FROM mpps_stock_planning_view spv
+                            JOIN mpps_stock_items si ON si.material_code = spv.material_code
+                            WHERE spv.production_required_qty > 0
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM mpps_compound_master m
+                                  WHERE m.item_code = si.material_code AND m.is_active = TRUE
+                              )
+                            UNION ALL
+                            SELECT 'WARNING', 'BEAD', si.source_workbook, si.source_sheet, si.source_row,
+                                   NULL, si.material_code,
+                                   'Bead master data is missing while production is required.'
+                            FROM mpps_stock_planning_view spv
+                            JOIN mpps_stock_items si ON si.material_code = spv.material_code
+                            WHERE spv.production_required_qty > 0
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM mpps_bead_master m
+                                  WHERE m.item_code = si.material_code AND m.is_active = TRUE
+                              )
+                            UNION ALL
+                            SELECT 'WARNING', 'BAND', si.source_workbook, si.source_sheet, si.source_row,
+                                   NULL, si.material_code,
+                                   'Band master data is missing while production is required.'
+                            FROM mpps_stock_planning_view spv
+                            JOIN mpps_stock_items si ON si.material_code = spv.material_code
+                            WHERE spv.production_required_qty > 0
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM mpps_band_master m
+                                  WHERE m.item_code = si.material_code AND m.is_active = TRUE
+                              )
+                            UNION ALL
+                            SELECT 'WARNING', 'CAPACITY', si.source_workbook, si.source_sheet, si.source_row,
+                                   NULL, si.material_code,
+                                   'Quantity capacity is missing for the item capacity key.'
+                            FROM mpps_stock_planning_view spv
+                            JOIN mpps_stock_items si ON si.material_code = spv.material_code
+                            WHERE spv.production_required_qty > 0
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM mpps_capacity_master m
+                                  WHERE m.item_code = si.bead_type AND m.is_active = TRUE
+                                    AND GREATEST(
+                                        COALESCE(m.available_capacity_per_day, 0),
+                                        COALESCE(m.running_moulds * m.per_mould_capacity, 0)
+                                    ) > 0
+                              )
+                            UNION ALL
+                            SELECT 'ERROR', 'STOCK VALUE', si.source_workbook, si.source_sheet, si.source_row,
+                                   NULL, si.material_code,
+                                   'One or more FG/QC/scrap/blocked stock values are negative.'
+                            FROM mpps_stock_items si
+                            WHERE si.fg_stock < 0 OR si.qc_stock < 0
+                               OR si.scrap_stock < 0 OR si.blocked_stock < 0
+                            UNION ALL
+                            SELECT 'WARNING', 'EXCEL FORMULA', wb.original_file_name, sh.sheet_name,
+                                   NULL, NULL, NULL,
+                                   ('Source sheet has ' || COUNT(*)::TEXT ||
+                                    ' cached formula error cells; workbook calculation mode may be stale.')::TEXT
+                            FROM excel_raw_cells cell
+                            JOIN excel_sheets sh ON sh.id = cell.sheet_id
+                            JOIN excel_workbooks wb ON wb.id = sh.workbook_id
+                            WHERE cell.is_formula = TRUE
+                              AND cell.display_value IN (
+                                  '#N/A', '#VALUE!', '#REF!', '#DIV/0!', '#NAME?'
+                              )
+                            GROUP BY wb.original_file_name, sh.sheet_name
+                        )
+                        INSERT INTO mpps_data_quality_issues (
+                            issue_level, issue_area, source_workbook, source_sheet,
+                            source_row, source_column, material_code, issue_message
+                        )
+                        SELECT c.issue_level, c.issue_area, c.source_workbook, c.source_sheet,
+                               c.source_row, c.source_column, c.material_code, c.issue_message
+                        FROM candidates c
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM mpps_data_quality_issues existing
+                            WHERE existing.is_resolved = FALSE
+                              AND existing.issue_area = c.issue_area
+                              AND COALESCE(existing.material_code, '') = COALESCE(c.material_code, '')
+                              AND COALESCE(existing.source_workbook, '') = COALESCE(c.source_workbook, '')
+                              AND COALESCE(existing.source_sheet, '') = COALESCE(c.source_sheet, '')
+                              AND existing.issue_message = c.issue_message
+                        );
+                        """
+                    )
+                )
                 connection.execute(
                     text(
                         """
                         INSERT INTO mpps_audit_logs (username, action_type, table_name, note)
-                        VALUES (:username, 'RESTORE', 'mpps_data_quality_issues', 'Re-evaluated all data quality warnings from active master data.');
+                        VALUES (:username, 'UPDATE', 'mpps_data_quality_issues', :note);
                         """
                     ),
-                    {"username": username}
+                    {
+                        "username": username,
+                        "note": (
+                            "Re-evaluated data quality warnings idempotently; "
+                            f"added {result.rowcount or 0} new issue(s)."
+                        ),
+                    },
                 )
 
-            QMessageBox.information(self, "Re-evaluation Complete", "All data quality issues and warnings have been re-evaluated against the active database state.")
+            QMessageBox.information(
+                self,
+                "Re-evaluation Complete",
+                f"Data quality checks completed. Added {result.rowcount or 0} new issue(s); "
+                "existing unresolved issues were not duplicated.",
+            )
             self.refresh()
         except Exception as exc:
             QMessageBox.critical(self, "Re-evaluation Failed", f"Failed to re-run data quality checks: {exc}")
+
+    def export_issues(self) -> None:
+        headers = [
+            self.table.horizontalHeaderItem(column).text()
+            for column in range(self.table.columnCount())
+        ]
+        rows = [
+            [
+                self.table.item(row, column).text()
+                if self.table.item(row, column) is not None
+                else ""
+                for column in range(self.table.columnCount())
+            ]
+            for row in range(self.table.rowCount())
+        ]
+        if not rows:
+            QMessageBox.warning(self, "Export CSV", "There are no visible issues.")
+            return
+        path = export_to_csv(headers, rows, "data_quality_issues")
+        QMessageBox.information(self, "Export Complete", f"CSV exported to:\n\n{path}")

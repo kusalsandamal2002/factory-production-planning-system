@@ -90,7 +90,10 @@ class OvenEditDialog(QDialog):
 
         title = QLabel("Oven Master Record")
         title.setObjectName("Title")
-        hint = QLabel("Register and maintain the production ovens available in the curing schedule scheduler.")
+        hint = QLabel(
+            "Register and maintain production ovens and presses used by the "
+            "quantity-based daily planner."
+        )
         hint.setObjectName("Hint")
         layout.addWidget(title)
         layout.addWidget(hint)
@@ -235,7 +238,10 @@ class OvenMasterPage(QWidget):
         title_box.setSpacing(4)
         title = QLabel("Oven Master Control")
         title.setObjectName("SectionTitle")
-        hint = QLabel("Register curing ovens. Schedulers use these oven resources for auto oven allocation planning.")
+        hint = QLabel(
+            "Register ovens and presses. The daily planner uses active resources "
+            "with observed item compatibility from preserved Excel plans."
+        )
         hint.setObjectName("SectionHint")
         title_box.addWidget(title)
         title_box.addWidget(hint)

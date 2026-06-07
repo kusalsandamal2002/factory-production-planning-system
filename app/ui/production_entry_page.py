@@ -52,7 +52,7 @@ class ProductionEntryPage(QWidget):
         self.save_btn.setObjectName("PrimaryButton")
         self.save_btn.clicked.connect(self.save_entry)
 
-        self.delete_btn = QPushButton("Void Selected")
+        self.delete_btn = QPushButton("Reverse Selected")
         self.delete_btn.setObjectName("DangerButton")
         self.delete_btn.setEnabled(False)
         self.delete_btn.clicked.connect(self.void_selected_entry)
@@ -291,6 +291,13 @@ class ProductionEntryPage(QWidget):
             WHERE tsm.movement_date = :movement_date
               AND tsm.movement_type = 'DAILY_PRODUCTION'
               AND tsm.direction = 'IN'
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM tire_stock_movements reversal
+                    WHERE reversal.source_ref = 'VOID-' || tsm.id::TEXT
+                      AND reversal.movement_type = 'DAILY_PRODUCTION_REVERSAL'
+                      AND reversal.direction = 'OUT'
+              )
             ORDER BY tsm.created_at DESC;
         """
 
@@ -453,7 +460,8 @@ class ProductionEntryPage(QWidget):
         ret = QMessageBox.question(
             self,
             "Void Entry Confirmation",
-            "Are you sure you want to void this production entry? This will subtract the quantity from stock balance.",
+            "Reverse this production entry? The original record will be retained and "
+            "an auditable OUT movement will subtract the quantity from stock.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
@@ -471,7 +479,16 @@ class ProductionEntryPage(QWidget):
                         SELECT tsm.quantity, tt.tire_code
                         FROM tire_stock_movements tsm
                         JOIN tire_types tt ON tt.id = tsm.tire_type_id
-                        WHERE tsm.id = :id;
+                        WHERE tsm.id = :id
+                          AND tsm.movement_type = 'DAILY_PRODUCTION'
+                          AND tsm.direction = 'IN'
+                          AND NOT EXISTS (
+                                SELECT 1
+                                FROM tire_stock_movements reversal
+                                WHERE reversal.source_ref = 'VOID-' || tsm.id::TEXT
+                                  AND reversal.movement_type = 'DAILY_PRODUCTION_REVERSAL'
+                                  AND reversal.direction = 'OUT'
+                          );
                         """
                     ),
                     {"id": self.selected_movement_id}
@@ -496,10 +513,38 @@ class ProductionEntryPage(QWidget):
                     {"qty": qty, "material_code": material_code}
                 )
 
-                # 3. Delete movement log
+                # 3. Preserve the original and create an auditable reversal.
                 connection.execute(
-                    text("DELETE FROM tire_stock_movements WHERE id = :id;"),
-                    {"id": self.selected_movement_id}
+                    text(
+                        """
+                        INSERT INTO tire_stock_movements (
+                            movement_date,
+                            tire_type_id,
+                            movement_type,
+                            direction,
+                            quantity,
+                            source_ref,
+                            note,
+                            created_by
+                        )
+                        SELECT
+                            movement_date,
+                            tire_type_id,
+                            'DAILY_PRODUCTION_REVERSAL',
+                            'OUT',
+                            quantity,
+                            'VOID-' || id::TEXT,
+                            :note,
+                            (SELECT id FROM users WHERE username = :username LIMIT 1)
+                        FROM tire_stock_movements
+                        WHERE id = :id;
+                        """
+                    ),
+                    {
+                        "id": self.selected_movement_id,
+                        "note": f"Reversal of daily production movement {self.selected_movement_id}.",
+                        "username": username,
+                    },
                 )
 
                 # 4. Insert audit log
@@ -510,7 +555,7 @@ class ProductionEntryPage(QWidget):
                             username, action_type, table_name, record_id, old_values, note
                         )
                         VALUES (
-                            :username, 'DELETE', 'tire_stock_movements', :record_id, :old_val, :note
+                            :username, 'UPDATE', 'tire_stock_movements', :record_id, :old_val, :note
                         );
                         """
                     ),
@@ -518,11 +563,19 @@ class ProductionEntryPage(QWidget):
                         "username": username,
                         "record_id": material_code,
                         "old_val": f"{{'qty': {qty}, 'voided_id': {self.selected_movement_id}}}",
-                        "note": f"Daily production entry voided. Updated mpps_stock_items fg_stock (-{qty})."
+                        "note": (
+                            "Daily production entry reversed without deleting history. "
+                            f"Updated mpps_stock_items fg_stock (-{qty})."
+                        )
                     }
                 )
 
-            QMessageBox.information(self, "Success", "Production entry voided successfully.")
+            QMessageBox.information(
+                self,
+                "Success",
+                "Production entry reversed successfully. The original and reversal "
+                "remain in the movement history.",
+            )
             self.refresh()
         except Exception as exc:
             QMessageBox.critical(self, "Error Voiding Entry", f"Database transaction failed: {exc}")
