@@ -1,6 +1,9 @@
-# Factory Oven Production Planning System
+# MPPS Factory Production Planning System
 
-Professional desktop prototype for factory oven capacity planning, customer order entry, live company receive-date calculation, operation manager confirmation, and daily oven schedule control.
+Professional desktop application for Excel-derived factory production planning.
+The system imports and traces MPPS and OVEN workbook data, converts shipment
+demand and stock into production requirements, calculates material needs, and
+supports quantity-based oven and mould/category capacity planning.
 
 ## Technology Stack
 
@@ -10,35 +13,38 @@ Professional desktop prototype for factory oven capacity planning, customer orde
 - Database driver: psycopg
 - Future migration support: Alembic-ready project structure
 
-## Business Rules Included
+## Current Planning Scope
 
-1. Factory has 25 ovens.
-2. Tire type curing times:
-   - Tire Type 1: 30 minutes
-   - Tire Type 2: 45 minutes
-   - Tire Type 3: 90 minutes
-   - Tire Type 4: 180 minutes
-   - Tire Type 5: 300 minutes
-3. Day shift max work time: 10 hours.
-4. Night shift max work time: 8 hours.
-5. Break between two tire productions: 20 minutes.
-6. One customer order can contain multiple tire types.
-7. Company Can Receive Date is calculated live while tire quantities are added.
-8. Operation manager must confirm the receive date before order is saved.
-9. Manager confirmed date cannot be earlier than the system calculated date.
-10. Existing production capacity is considered before scheduling a new order.
-11. Free oven capacity is used while other orders are still in production.
-12. Daily oven schedule can be manually changed by operation manager.
-13. Manual changes are saved in schedule change log.
+The current application direction is driven by the structure and formulas found
+in the MPPS and OVEN Excel workbooks:
 
-## Current Shift Time Assumption
+- Finished-goods stock planning against shipment demand
+- Production required quantity after available stock is considered
+- Production required tons using Excel-derived product weights
+- Compound, bead, and band material requirements
+- Quantity-based oven planning
+- Mould/category capacity planning
+- Day/night production quantity allocation
+- Shipment risk and shortage visibility
+- Administrative data-quality review
+- Raw workbook, worksheet, row, and cell traceability
 
-Because exact clock times were not provided, the prototype uses these editable master data values:
+Planning outputs retain source references so imported values and derived results
+can be investigated against the original workbooks. See
+[docs/excel_logic_discovery.md](docs/excel_logic_discovery.md) and
+[docs/real_oven_planning_design.md](docs/real_oven_planning_design.md) for the
+documented source logic and current planning design.
 
-- Day Shift: 08:00 to 18:00
-- Night Shift: 20:00 to 04:00
+## Legacy Prototype Assumptions
 
-These values are stored in the PostgreSQL `shifts` table and can be changed later.
+The earlier prototype used hard-coded oven counts, Tire Type 1-5 curing times,
+minute-based scheduling, fixed day/night hours, and a 20-minute production
+break. Those assumptions are not the basis of the current Excel-derived
+quantity planning workflow and must not be treated as current business rules.
+
+Minute-level curing, changeover, downtime, and utilization planning would
+require approved source master data that is not currently available in the
+workbooks.
 
 ## Project Structure
 
@@ -88,7 +94,10 @@ copy .env.example .env
 python run.py
 ```
 
-## Demo Login Details
+## Development/Demo Login Details
+
+These credentials are for local development or demonstration data only. They
+must not be used in a production deployment.
 
 ```text
 Admin:              admin / admin123
@@ -96,29 +105,18 @@ Operation Manager:  manager / manager123
 Owner Viewer:       owner / owner123
 ```
 
-## Owner Demo Flow
+## Data Safety
 
-1. Login as `manager / manager123`.
-2. Open `New Order`.
-3. Select a customer.
-4. Add Tire Type 1 quantity.
-5. Watch Company Can Receive Date update.
-6. Add Tire Type 3 and Tire Type 5 quantities.
-7. The Company Can Receive Date moves forward based on total oven capacity.
-8. Manager selects a confirmed receive date on or after the calculated date.
-9. Click `Confirm & Save Order`.
-10. Open `Daily Oven Schedule` to view assigned ovens, shift, start time, end time, and break slots.
-11. Select a schedule row and test a manual change with a reason.
+The following files contain local configuration, source data, or generated
+database content and must not be committed:
 
-## Important Notes
+- `.env`
+- `data_sources/`
+- Excel or CSV source files
+- virtual environment folders such as `venv/` or `.venv/`
+- database dumps, exports, or credential files
 
-This is a professional prototype using the final database approach. It is not a toy web demo.
-The database model can be expanded later for:
-
-- stock balance
-- raw material availability
-- machine maintenance
-- production approval workflow
-- Excel/PDF reports
-- audit log dashboard
-- shipment and delivery tracking
+Use `.env.example` for documented configuration keys. Keep source workbook
+files under the ignored `data_sources/` directory. Historical backup ownership
+and storage rules are documented in
+[backups/README.md](backups/README.md).
