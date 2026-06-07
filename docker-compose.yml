@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: factory_planner_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: factory_planner
+      POSTGRES_USER: factory_user
+      POSTGRES_PASSWORD: factory_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - factory_planner_pgdata:/var/lib/postgresql/data
+
+volumes:
+  factory_planner_pgdata:

@@ -1,0 +1,825 @@
+from __future__ import annotations
+
+from decimal import Decimal
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDoubleSpinBox,
+    QFrame,
+    QGridLayout,
+    QHeaderView,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from sqlalchemy import text
+
+from app.database import engine
+
+
+class BeadEditDialog(QDialog):
+    def __init__(self, parent=None, bead_item: dict | None = None):
+        super().__init__(parent)
+
+        self.bead_item = bead_item or {}
+        self.is_new = bead_item is None
+
+        self.setWindowTitle("Add Bead Item" if self.is_new else "Edit Bead Item")
+        self.setMinimumWidth(620)
+
+        self.item_code_input = QLineEdit()
+        self.item_code_input.setPlaceholderText("Item code / tyre size...")
+
+        self.bead_type_input = QLineEdit()
+        self.bead_type_input.setPlaceholderText("Bead type...")
+
+        self.usage_input = QDoubleSpinBox()
+        self.usage_input.setRange(0, 999999999)
+        self.usage_input.setDecimals(6)
+        self.usage_input.setSingleStep(0.1)
+
+        self.active_checkbox = QCheckBox("Active bead item")
+        self.active_checkbox.setChecked(True)
+
+        self.save_btn = QPushButton("Save Bead Item")
+        self.save_btn.setObjectName("PrimaryButton")
+        self.save_btn.clicked.connect(self.accept)
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setObjectName("SecondaryButton")
+        self.cancel_btn.clicked.connect(self.reject)
+
+        self._apply_styles()
+        self._build_ui()
+        self._load_bead_item()
+
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            """
+            QDialog {
+                background: #f8fafc;
+            }
+
+            QFrame#Card {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 16px;
+            }
+
+            QLabel#Title {
+                color: #0f172a;
+                font-size: 16pt;
+                font-weight: 950;
+            }
+
+            QLabel#Hint {
+                color: #64748b;
+                font-size: 9.5pt;
+                font-weight: 650;
+            }
+
+            QLabel#FieldLabel {
+                color: #334155;
+                font-size: 9pt;
+                font-weight: 850;
+            }
+
+            QLineEdit,
+            QDoubleSpinBox {
+                background: #ffffff;
+                color: #0f172a;
+                border: 1px solid #cbd5e1;
+                border-radius: 10px;
+                padding: 9px 12px;
+                font-size: 10pt;
+                font-weight: 650;
+                min-height: 24px;
+            }
+
+            QLineEdit:focus,
+            QDoubleSpinBox:focus {
+                border: 1px solid #2563eb;
+            }
+
+            QCheckBox {
+                color: #334155;
+                font-size: 10pt;
+                font-weight: 850;
+            }
+
+            QPushButton#PrimaryButton {
+                background: #2563eb;
+                color: white;
+                border: none;
+                border-radius: 10px;
+                padding: 10px 20px;
+                font-weight: 950;
+                min-height: 26px;
+            }
+
+            QPushButton#PrimaryButton:hover {
+                background: #1d4ed8;
+            }
+
+            QPushButton#SecondaryButton {
+                background: #e2e8f0;
+                color: #0f172a;
+                border: none;
+                border-radius: 10px;
+                padding: 10px 20px;
+                font-weight: 950;
+                min-height: 26px;
+            }
+
+            QPushButton#SecondaryButton:hover {
+                background: #cbd5e1;
+            }
+            """
+        )
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(14)
+
+        card = QFrame()
+        card.setObjectName("Card")
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 18, 20, 20)
+        layout.setSpacing(14)
+
+        title = QLabel("Bead Master")
+        title.setObjectName("Title")
+
+        hint = QLabel(
+            "Maintain bead type and bead usage per tyre. This data is used for bead material requirement planning."
+        )
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+
+        layout.addWidget(title)
+        layout.addWidget(hint)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(12)
+
+        self._add_field(form, 0, "Item Code / Size", self.item_code_input)
+        self._add_field(form, 1, "Bead Type", self.bead_type_input)
+        self._add_field(form, 2, "Bead Per Tyre", self.usage_input)
+
+        layout.addLayout(form)
+        layout.addWidget(self.active_checkbox)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        button_row.addWidget(self.cancel_btn)
+        button_row.addWidget(self.save_btn)
+
+        layout.addLayout(button_row)
+
+        root.addWidget(card)
+
+    def _add_field(self, grid: QGridLayout, row: int, label_text: str, widget: QWidget) -> None:
+        label = QLabel(label_text)
+        label.setObjectName("FieldLabel")
+
+        grid.addWidget(label, row, 0)
+        grid.addWidget(widget, row, 1)
+
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 1)
+
+    def _load_bead_item(self) -> None:
+        if not self.bead_item:
+            self.usage_input.setValue(1)
+            return
+
+        self.item_code_input.setText(str(self.bead_item.get("item_code") or ""))
+        self.bead_type_input.setText(str(self.bead_item.get("bead_type") or ""))
+        self.usage_input.setValue(float(self.bead_item.get("bead_per_tyre") or 0))
+        self.active_checkbox.setChecked(bool(self.bead_item.get("is_active")))
+
+    def get_data(self) -> dict:
+        item_code = self.item_code_input.text().strip()
+        bead_type = self.bead_type_input.text().strip()
+
+        if not item_code:
+            raise ValueError("Item Code / Size is required.")
+
+        if not bead_type:
+            raise ValueError("Bead Type is required.")
+
+        if self.usage_input.value() <= 0:
+            raise ValueError("Bead Per Tyre must be greater than 0.")
+
+        return {
+            "id": self.bead_item.get("id"),
+            "item_code": item_code,
+            "bead_type": bead_type,
+            "bead_per_tyre": Decimal(str(self.usage_input.value())),
+            "is_active": self.active_checkbox.isChecked(),
+        }
+
+
+class BeadMasterPage(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        self.selected_bead_id: int | None = None
+
+        self.total_rows_value = QLabel("0")
+        self.active_rows_value = QLabel("0")
+        self.item_codes_value = QLabel("0")
+        self.bead_types_value = QLabel("0")
+        self.missing_usage_value = QLabel("0")
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search item code, size or bead type...")
+        self.search_input.textChanged.connect(self.refresh_table)
+
+        self.item_code_input = QLineEdit()
+        self.item_code_input.setPlaceholderText("Filter item code / size...")
+        self.item_code_input.textChanged.connect(self.refresh_table)
+
+        self.status_combo = QComboBox()
+        self.status_combo.addItems(["All Status", "Active Only", "Inactive Only"])
+        self.status_combo.currentTextChanged.connect(self.refresh_table)
+
+        self.missing_usage_checkbox = QCheckBox("Missing / zero bead per tyre only")
+        self.missing_usage_checkbox.stateChanged.connect(self.refresh_table)
+
+        self.add_btn = QPushButton("+ Add Bead")
+        self.add_btn.setObjectName("PrimaryButton")
+        self.add_btn.clicked.connect(self.add_bead_item)
+
+        self.edit_btn = QPushButton("Edit Selected")
+        self.edit_btn.setObjectName("SecondaryButton")
+        self.edit_btn.setEnabled(False)
+        self.edit_btn.clicked.connect(self.edit_selected_bead_item)
+
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setObjectName("SecondaryButton")
+        self.refresh_btn.clicked.connect(self.refresh)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Item Code / Size",
+                "Bead Type",
+                "Bead / Tyre",
+                "Status",
+            ]
+        )
+
+        self._setup_table()
+        self._apply_styles()
+        self._build_ui()
+
+        self.refresh()
+
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            """
+            QFrame#MetricCard,
+            QFrame#ControlCard,
+            QFrame#TableCard {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 16px;
+            }
+
+            QLabel#MetricTitle {
+                color: #64748b;
+                font-size: 8.5pt;
+                font-weight: 850;
+            }
+
+            QLabel#MetricValue {
+                color: #0f172a;
+                font-size: 19pt;
+                font-weight: 950;
+            }
+
+            QLabel#SectionTitle {
+                color: #0f172a;
+                font-size: 15pt;
+                font-weight: 950;
+            }
+
+            QLabel#SectionHint {
+                color: #64748b;
+                font-size: 9.5pt;
+                font-weight: 650;
+            }
+
+            QLabel#FieldLabel {
+                color: #334155;
+                font-size: 9pt;
+                font-weight: 850;
+            }
+
+            QLineEdit,
+            QComboBox {
+                background: #ffffff;
+                color: #0f172a;
+                border: 1px solid #cbd5e1;
+                border-radius: 10px;
+                padding: 9px 12px;
+                font-size: 10pt;
+                font-weight: 650;
+                min-height: 24px;
+            }
+
+            QLineEdit:focus,
+            QComboBox:focus {
+                border: 1px solid #2563eb;
+            }
+
+            QCheckBox {
+                color: #334155;
+                font-size: 9.5pt;
+                font-weight: 850;
+            }
+
+            QPushButton#PrimaryButton {
+                background: #2563eb;
+                color: #ffffff;
+                border: none;
+                border-radius: 10px;
+                padding: 10px 18px;
+                font-weight: 950;
+                min-height: 26px;
+            }
+
+            QPushButton#PrimaryButton:hover {
+                background: #1d4ed8;
+            }
+
+            QPushButton#SecondaryButton {
+                background: #e2e8f0;
+                color: #0f172a;
+                border: none;
+                border-radius: 10px;
+                padding: 10px 18px;
+                font-weight: 950;
+                min-height: 26px;
+            }
+
+            QPushButton#SecondaryButton:hover {
+                background: #cbd5e1;
+            }
+
+            QPushButton#SecondaryButton:disabled {
+                background: #f1f5f9;
+                color: #94a3b8;
+            }
+
+            QTableWidget {
+                background: #ffffff;
+                color: #0f172a;
+                border: 1px solid #e2e8f0;
+                border-radius: 12px;
+                gridline-color: #e2e8f0;
+                alternate-background-color: #f8fafc;
+                selection-background-color: #dbeafe;
+                selection-color: #0f172a;
+            }
+
+            QTableWidget::item {
+                padding: 8px 10px;
+                border: none;
+            }
+
+            QHeaderView::section {
+                background: #f1f5f9;
+                color: #1e293b;
+                border: none;
+                border-right: 1px solid #e2e8f0;
+                border-bottom: 1px solid #e2e8f0;
+                padding: 10px;
+                font-weight: 950;
+            }
+            """
+        )
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(16)
+
+        root.addLayout(self._build_metrics_grid())
+        root.addWidget(self._build_control_card())
+        root.addWidget(self._build_table_card(), 1)
+
+    def _build_metrics_grid(self) -> QGridLayout:
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(14)
+
+        cards = [
+            self._metric_card("Total Bead Rows", self.total_rows_value),
+            self._metric_card("Active Rows", self.active_rows_value),
+            self._metric_card("Item Codes", self.item_codes_value),
+            self._metric_card("Bead Types", self.bead_types_value),
+            self._metric_card("Missing Bead / Tyre", self.missing_usage_value),
+        ]
+
+        for index, card in enumerate(cards):
+            grid.addWidget(card, index // 3, index % 3)
+
+        return grid
+
+    def _metric_card(self, title_text: str, value_label: QLabel) -> QFrame:
+        card = QFrame()
+        card.setObjectName("MetricCard")
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(5)
+
+        title = QLabel(title_text)
+        title.setObjectName("MetricTitle")
+
+        value_label.setObjectName("MetricValue")
+
+        layout.addWidget(title)
+        layout.addWidget(value_label)
+
+        return card
+
+    def _build_control_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("ControlCard")
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 18)
+        layout.setSpacing(14)
+
+        header = QHBoxLayout()
+
+        title_box = QVBoxLayout()
+        title_box.setSpacing(4)
+
+        title = QLabel("Bead Master Control")
+        title.setObjectName("SectionTitle")
+
+        hint = QLabel(
+            "Maintain bead requirement data by item or tyre size. This page replaces manual Total Bead sheet checking in Excel."
+        )
+        hint.setObjectName("SectionHint")
+        hint.setWordWrap(True)
+
+        title_box.addWidget(title)
+        title_box.addWidget(hint)
+
+        header.addLayout(title_box, 1)
+        header.addWidget(self.add_btn)
+        header.addWidget(self.edit_btn)
+        header.addWidget(self.refresh_btn)
+
+        layout.addLayout(header)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+
+        search_label = QLabel("Search")
+        search_label.setObjectName("FieldLabel")
+
+        item_label = QLabel("Item Code / Size")
+        item_label.setObjectName("FieldLabel")
+
+        status_label = QLabel("Status")
+        status_label.setObjectName("FieldLabel")
+
+        form.addWidget(search_label, 0, 0)
+        form.addWidget(self.search_input, 0, 1, 1, 5)
+
+        form.addWidget(item_label, 1, 0)
+        form.addWidget(self.item_code_input, 1, 1, 1, 2)
+
+        form.addWidget(status_label, 1, 3)
+        form.addWidget(self.status_combo, 1, 4, 1, 2)
+
+        form.setColumnStretch(1, 2)
+        form.setColumnStretch(2, 1)
+        form.setColumnStretch(4, 2)
+        form.setColumnStretch(5, 1)
+
+        layout.addLayout(form)
+        layout.addWidget(self.missing_usage_checkbox)
+
+        return card
+
+    def _build_table_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("TableCard")
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 18)
+        layout.setSpacing(14)
+
+        title = QLabel("Bead Master Data")
+        title.setObjectName("SectionTitle")
+
+        hint = QLabel(
+            "Double-click a row to edit. Changes update clean MPPS bead data, not the original raw Excel archive."
+        )
+        hint.setObjectName("SectionHint")
+        hint.setWordWrap(True)
+
+        layout.addWidget(title)
+        layout.addWidget(hint)
+        layout.addWidget(self.table, 1)
+
+        return card
+
+    def _setup_table(self) -> None:
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(48)
+        self.table.setAlternatingRowColors(True)
+
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+
+        self.table.setColumnWidth(0, 180)
+        self.table.setColumnWidth(2, 120)
+        self.table.setColumnWidth(3, 95)
+
+        self.table.itemSelectionChanged.connect(self.on_selection_changed)
+        self.table.itemDoubleClicked.connect(self.edit_selected_bead_item)
+
+    def refresh(self) -> None:
+        try:
+            self.refresh_metrics()
+            self.refresh_table()
+        except Exception as exc:
+            QMessageBox.critical(self, "Bead Master Error", str(exc))
+
+    def refresh_metrics(self) -> None:
+        with engine.begin() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    SELECT
+                        COUNT(*) AS total_rows,
+                        SUM(CASE WHEN is_active = TRUE THEN 1 ELSE 0 END) AS active_rows,
+                        COUNT(DISTINCT item_code) AS item_codes,
+                        COUNT(DISTINCT bead_type) AS bead_types,
+                        SUM(CASE WHEN COALESCE(bead_per_tyre, 0) <= 0 THEN 1 ELSE 0 END) AS missing_usage
+                    FROM mpps_bead_master;
+                    """
+                )
+            ).mappings().one()
+
+        self.total_rows_value.setText(self._format_int(row["total_rows"]))
+        self.active_rows_value.setText(self._format_int(row["active_rows"]))
+        self.item_codes_value.setText(self._format_int(row["item_codes"]))
+        self.bead_types_value.setText(self._format_int(row["bead_types"]))
+        self.missing_usage_value.setText(self._format_int(row["missing_usage"]))
+
+    def refresh_table(self, *args) -> None:
+        self.selected_bead_id = None
+        self.edit_btn.setEnabled(False)
+
+        search_text = self.search_input.text().strip()
+        item_text = self.item_code_input.text().strip()
+        status_value = self.status_combo.currentText().strip()
+
+        conditions = []
+        params = {
+            "search": f"%{search_text}%",
+            "item_code": f"%{item_text}%",
+        }
+
+        if search_text:
+            conditions.append(
+                """
+                (
+                    item_code ILIKE :search
+                    OR bead_type ILIKE :search
+                )
+                """
+            )
+
+        if item_text:
+            conditions.append("item_code ILIKE :item_code")
+
+        if status_value == "Active Only":
+            conditions.append("is_active = TRUE")
+        elif status_value == "Inactive Only":
+            conditions.append("is_active = FALSE")
+
+        if self.missing_usage_checkbox.isChecked():
+            conditions.append("COALESCE(bead_per_tyre, 0) <= 0")
+
+        where_sql = ""
+        if conditions:
+            where_sql = "WHERE " + " AND ".join(conditions)
+
+        sql = f"""
+            SELECT
+                id,
+                item_code,
+                bead_type,
+                bead_per_tyre,
+                is_active
+            FROM mpps_bead_master
+            {where_sql}
+            ORDER BY
+                item_code ASC,
+                bead_type ASC
+            LIMIT 1000;
+        """
+
+        with engine.begin() as connection:
+            rows = connection.execute(text(sql), params).mappings().all()
+
+        self.table.setRowCount(0)
+
+        for row_index, row in enumerate(rows):
+            self.table.insertRow(row_index)
+
+            values = [
+                row["item_code"],
+                row["bead_type"],
+                self._format_decimal(row["bead_per_tyre"], 6),
+                "Active" if row["is_active"] else "Inactive",
+            ]
+
+            for column_index, value in enumerate(values):
+                item = self._readonly_item(value)
+
+                if column_index in {2, 3}:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+                if column_index == 3:
+                    self._apply_status_style(item, bool(row["is_active"]))
+
+                if column_index == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, int(row["id"]))
+
+                self.table.setItem(row_index, column_index, item)
+
+        self.table.resizeRowsToContents()
+
+    def add_bead_item(self) -> None:
+        dialog = BeadEditDialog(self)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            data = dialog.get_data()
+            self.save_bead_item(data, is_new=True)
+            self.refresh()
+            QMessageBox.information(self, "Bead Added", "Bead item saved successfully.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Add Bead Failed", str(exc))
+
+    def edit_selected_bead_item(self, *args) -> None:
+        if not self.selected_bead_id:
+            return
+
+        bead_item = self.get_bead_item(self.selected_bead_id)
+
+        if bead_item is None:
+            QMessageBox.warning(self, "Bead Missing", "Selected bead item was not found.")
+            return
+
+        dialog = BeadEditDialog(self, dict(bead_item))
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            data = dialog.get_data()
+            self.save_bead_item(data, is_new=False)
+            self.refresh()
+            QMessageBox.information(self, "Bead Updated", "Bead item updated successfully.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Update Bead Failed", str(exc))
+
+    def get_bead_item(self, bead_id: int):
+        with engine.begin() as connection:
+            return connection.execute(
+                text(
+                    """
+                    SELECT
+                        id,
+                        item_code,
+                        bead_type,
+                        bead_per_tyre,
+                        is_active
+                    FROM mpps_bead_master
+                    WHERE id = :id
+                    LIMIT 1;
+                    """
+                ),
+                {"id": bead_id},
+            ).mappings().first()
+
+    def save_bead_item(self, data: dict, is_new: bool) -> None:
+        with engine.begin() as connection:
+            if is_new:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO mpps_bead_master (
+                            item_code,
+                            bead_type,
+                            bead_per_tyre,
+                            is_active
+                        )
+                        VALUES (
+                            :item_code,
+                            :bead_type,
+                            :bead_per_tyre,
+                            :is_active
+                        );
+                        """
+                    ),
+                    data,
+                )
+            else:
+                connection.execute(
+                    text(
+                        """
+                        UPDATE mpps_bead_master
+                        SET
+                            item_code = :item_code,
+                            bead_type = :bead_type,
+                            bead_per_tyre = :bead_per_tyre,
+                            is_active = :is_active
+                        WHERE id = :id;
+                        """
+                    ),
+                    data,
+                )
+
+    def on_selection_changed(self) -> None:
+        selected_items = self.table.selectedItems()
+
+        if not selected_items:
+            self.selected_bead_id = None
+            self.edit_btn.setEnabled(False)
+            return
+
+        row = selected_items[0].row()
+        item = self.table.item(row, 0)
+
+        if item is None:
+            self.selected_bead_id = None
+            self.edit_btn.setEnabled(False)
+            return
+
+        self.selected_bead_id = item.data(Qt.ItemDataRole.UserRole)
+        self.edit_btn.setEnabled(bool(self.selected_bead_id))
+
+    def _readonly_item(self, text_value: str) -> QTableWidgetItem:
+        item = QTableWidgetItem(str(text_value))
+        item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+        return item
+
+    def _apply_status_style(self, item: QTableWidgetItem, is_active: bool) -> None:
+        if is_active:
+            item.setForeground(QColor("#166534"))
+            item.setBackground(QColor("#dcfce7"))
+        else:
+            item.setForeground(QColor("#991b1b"))
+            item.setBackground(QColor("#fee2e2"))
+
+    def _format_int(self, value) -> str:
+        try:
+            return f"{int(value or 0):,}"
+        except Exception:
+            return "0"
+
+    def _format_decimal(self, value, decimals: int = 4) -> str:
+        try:
+            decimal_value = Decimal(str(value or 0))
+            return f"{decimal_value:,.{decimals}f}"
+        except Exception:
+            return "0.0000"
