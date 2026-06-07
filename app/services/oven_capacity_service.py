@@ -14,6 +14,7 @@ from app.services.production_requirement_service import ProductionRequirementRow
 class CapacityAnalysisRow:
     item_code: str
     item_description: str
+    capacity_key: str
     production_required_qty: int
     running_moulds: float
     per_mould_capacity: float
@@ -60,6 +61,7 @@ def build_capacity_analysis(
                 CapacityAnalysisRow(
                     item_code=production.material_code,
                     item_description=production.item_description,
+                    capacity_key=production.capacity_key,
                     production_required_qty=production.production_required_qty,
                     running_moulds=0.0,
                     per_mould_capacity=0.0,
@@ -104,6 +106,7 @@ def build_capacity_analysis(
             CapacityAnalysisRow(
                 item_code=production.material_code,
                 item_description=production.item_description,
+                capacity_key=production.capacity_key,
                 production_required_qty=production.production_required_qty,
                 running_moulds=round(moulds, 4),
                 per_mould_capacity=round(per_mould, 4),

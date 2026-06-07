@@ -88,12 +88,18 @@ calculated.
 1. Load dated production requirements ordered by earliest due date and shortage.
 2. Load direct item capacity.
 3. Find oven compatibility from the preserved `mpps_oven_plan` history.
-4. Plan at most one effective daily-capacity quantity for the selected date.
-5. Spread that quantity across historically used ovens in proportion to their
+4. Treat capacity records as shared mould/category capacity and allocate each
+   capacity key only once per selected date.
+5. Plan at most the remaining effective daily-capacity quantity.
+6. Spread that quantity across historically used active ovens in proportion to their
    recorded quantities.
-6. Split each allocation by the visible day-share assumption.
-7. Leave items with missing capacity or compatibility unplanned and explain the
+7. Split each allocation by the visible day-share assumption.
+8. Leave items with missing capacity or compatibility unplanned and explain the
    reason.
+
+Schedule output carries explicit flags/statuses for missing capacity, missing
+compatibility, missing due date, and missing unit weight. Demand without a due
+date remains included in production requirement calculations.
 
 This is deterministic, preserves source data, and does not claim an optimized
 minute-level sequence.

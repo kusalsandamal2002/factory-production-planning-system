@@ -88,7 +88,7 @@ class MaterialRequirementPage(QWidget):
             ("Shortage Products", "items"),
             ("BOM Requirement", "bom"),
             ("Compound Requirement", "compound"),
-            ("Missing BOM Warnings", "warnings"),
+            ("Missing Master Warnings", "warnings"),
         ]:
             metrics.addWidget(self._metric_card(title, self.metrics[key]), 1)
         root.addLayout(metrics)

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import date
-
 from PySide6.QtCore import QDate, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
@@ -21,34 +19,37 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from sqlalchemy import text
 
 from app.database import get_session
 from app.services.material_requirement_service import PlanningAssumptions
-from app.services.oven_capacity_service import build_capacity_analysis
 from app.services.oven_schedule_service import (
     OvenScheduleRow,
     OvenScheduleSummary,
-    build_daily_oven_schedule,
-    load_imported_oven_plan,
+    calculate_daily_oven_plan,
 )
-from app.services.production_requirement_service import load_production_requirements
 from app.utils.reports_export import export_to_csv
 
 
-class SchedulePage(QWidget):
-    """Quantity-based daily oven planning page.
+SCHEDULE_STATUSES = [
+    "ALL",
+    "PLANNED",
+    "PARTIAL",
+    "UNPLANNED",
+    "MISSING CAPACITY",
+    "MISSING COMPATIBILITY",
+    "MISSING WEIGHT",
+    "MISSING DUE DATE",
+]
 
-    The legacy minute scheduler remains available to the order enquiry workflow,
-    but this page intentionally uses only MPPS quantity, mould, and oven evidence.
-    """
+
+class SchedulePage(QWidget):
+    """Quantity/mould/day planning with no unverified minute logic."""
 
     def __init__(self, current_user_id=None):
         super().__init__()
         self.current_user = current_user_id
         self.plan_rows: list[OvenScheduleRow] = []
         self.visible_rows: list[OvenScheduleRow] = []
-        self.plan_source = "CALCULATED"
 
         self.plan_date = QDateEdit()
         self.plan_date.setCalendarPopup(True)
@@ -57,33 +58,34 @@ class SchedulePage(QWidget):
         self.plan_date.dateChanged.connect(self.refresh)
 
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search material, description, oven, or risk...")
+        self.search_input.setPlaceholderText(
+            "Search material, description, oven, status, or risk..."
+        )
         self.search_input.textChanged.connect(self.filter_table)
 
         self.status_combo = QComboBox()
-        self.status_combo.addItems(
-            ["ALL", "PLANNED", "PARTIALLY PLANNED", "UNPLANNED", "IMPORTED"]
-        )
+        self.status_combo.addItems(SCHEDULE_STATUSES)
         self.status_combo.currentTextChanged.connect(self.filter_table)
 
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setObjectName("SecondaryButton")
         self.refresh_btn.clicked.connect(self.refresh)
-
         self.recalculate_btn = QPushButton("Recalculate Plan")
         self.recalculate_btn.setObjectName("PrimaryButton")
         self.recalculate_btn.clicked.connect(self.recalculate_plan)
-
         self.export_btn = QPushButton("Export CSV")
         self.export_btn.setObjectName("SecondaryButton")
         self.export_btn.clicked.connect(self.export_csv)
 
         self.metric_labels = {
-            "active_ovens": QLabel("0"),
             "required": QLabel("0"),
             "planned": QLabel("0"),
             "unplanned": QLabel("0"),
             "tons": QLabel("0.00"),
+            "missing_capacity": QLabel("0"),
+            "missing_compatibility": QLabel("0"),
+            "missing_due_date": QLabel("0"),
+            "missing_weight": QLabel("0"),
             "warnings": QLabel("0"),
         }
         self.capacity_status = QLabel("NO DATA")
@@ -92,22 +94,25 @@ class SchedulePage(QWidget):
         self.assumption_note.setObjectName("AssumptionNote")
         self.assumption_note.setWordWrap(True)
 
-        self.table = QTableWidget(0, 13)
+        self.table = QTableWidget(0, 16)
         self.table.setHorizontalHeaderLabels(
             [
-                "Date",
                 "Material Code",
-                "Description",
-                "Oven / Press",
-                "Line / Category",
-                "Day Qty",
-                "Night Qty",
-                "Total Planned",
-                "Remaining",
+                "Item Description",
+                "Due Date",
+                "Demand Qty",
+                "Available Stock",
+                "Shortage Qty",
+                "Production Required",
+                "Effective Daily Capacity",
+                "Planned Day Qty",
+                "Planned Night Qty",
+                "Total Planned Qty",
+                "Remaining Unplanned",
                 "Planned Tons",
+                "Oven / Press",
                 "Status",
                 "Risk Reason",
-                "Source",
             ]
         )
 
@@ -125,15 +130,22 @@ class SchedulePage(QWidget):
         metrics.setHorizontalSpacing(12)
         metrics.setVerticalSpacing(12)
         cards = [
-            ("Active Ovens / Presses", self.metric_labels["active_ovens"]),
-            ("Production Required Qty", self.metric_labels["required"]),
-            ("Planned Qty", self.metric_labels["planned"]),
-            ("Unplanned Qty", self.metric_labels["unplanned"]),
-            ("Planned Tons", self.metric_labels["tons"]),
-            ("Risk Warnings", self.metric_labels["warnings"]),
+            ("Production Required Qty", "required"),
+            ("Planned Qty", "planned"),
+            ("Unplanned Qty", "unplanned"),
+            ("Planned Tons", "tons"),
+            ("Missing Capacity Items", "missing_capacity"),
+            ("Missing Compatibility Items", "missing_compatibility"),
+            ("Missing Due Date Items", "missing_due_date"),
+            ("Missing Weight Items", "missing_weight"),
+            ("Warning Items", "warnings"),
         ]
-        for index, (title, label) in enumerate(cards):
-            metrics.addWidget(self._metric_card(title, label), index // 3, index % 3)
+        for index, (title, key) in enumerate(cards):
+            metrics.addWidget(
+                self._metric_card(title, self.metric_labels[key]),
+                index // 3,
+                index % 3,
+            )
         root.addLayout(metrics)
 
         controls = QFrame()
@@ -147,8 +159,8 @@ class SchedulePage(QWidget):
         title = QLabel("Daily Quantity-Based Oven Plan")
         title.setObjectName("SectionTitle")
         hint = QLabel(
-            "Plans pieces by approved mould/day capacity and observed Excel oven "
-            "compatibility. No curing-minute or downtime values are invented."
+            "Uses shipment shortage, mould/day capacity, and historical active "
+            "oven compatibility. Imported mpps_oven_plan rows remain read-only."
         )
         hint.setObjectName("SectionHint")
         hint.setWordWrap(True)
@@ -177,7 +189,7 @@ class SchedulePage(QWidget):
         table_layout = QVBoxLayout(table_card)
         table_layout.setContentsMargins(18, 16, 18, 18)
         table_layout.setSpacing(10)
-        table_title = QLabel("Day / Night Allocation and Unplanned Risk")
+        table_title = QLabel("Day / Night Quantity Allocation and Risk")
         table_title.setObjectName("SectionTitle")
         table_layout.addWidget(table_title)
         table_layout.addWidget(self.table, 1)
@@ -204,9 +216,26 @@ class SchedulePage(QWidget):
         header = self.table.horizontalHeader()
         for column in range(self.table.columnCount()):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
-        widths = [92, 125, 230, 135, 120, 78, 82, 98, 90, 95, 135, 260, 90]
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(15, QHeaderView.ResizeMode.Stretch)
+        widths = [
+            120,
+            220,
+            95,
+            90,
+            100,
+            90,
+            115,
+            130,
+            105,
+            110,
+            110,
+            120,
+            95,
+            130,
+            145,
+            260,
+        ]
         for index, width in enumerate(widths):
             self.table.setColumnWidth(index, width)
 
@@ -214,12 +243,10 @@ class SchedulePage(QWidget):
         self.setStyleSheet(
             """
             QFrame#Card, QFrame#MetricCard {
-                background: #ffffff;
-                border: 1px solid #e2e8f0;
-                border-radius: 14px;
+                background:#ffffff; border:1px solid #e2e8f0; border-radius:14px;
             }
             QLabel#MetricTitle { color:#64748b; font-size:8.5pt; font-weight:800; }
-            QLabel#MetricValue { color:#0f172a; font-size:19pt; font-weight:900; }
+            QLabel#MetricValue { color:#0f172a; font-size:18pt; font-weight:900; }
             QLabel#SectionTitle { color:#0f172a; font-size:15pt; font-weight:900; }
             QLabel#SectionHint, QLabel#AssumptionNote { color:#64748b; font-size:9pt; }
             QLabel#StatusBadge {
@@ -252,91 +279,49 @@ class SchedulePage(QWidget):
         )
 
     def refresh(self, *args) -> None:
-        """Load preserved Excel plan for the date, or calculate a read-only preview."""
-        try:
-            selected = self.plan_date.date().toPython()
-            with get_session() as session:
-                imported = load_imported_oven_plan(session, planning_date=selected)
-                if imported:
-                    production = load_production_requirements(
-                        session, planning_date=selected
-                    )
-                    required = sum(
-                        row.production_required_qty
-                        for row in production
-                        if row.production_required_qty > 0
-                    )
-                    planned = sum(row.total_planned_qty for row in imported)
-                    active_ovens = int(
-                        session.execute(
-                            text("SELECT COUNT(*) FROM ovens WHERE is_active = TRUE")
-                        ).scalar_one()
-                    )
-                    summary = OvenScheduleSummary(
-                        active_ovens=active_ovens,
-                        production_required_qty=required,
-                        planned_qty=planned,
-                        unplanned_qty=max(required - planned, 0),
-                        planned_tons=round(sum(row.planned_tons for row in imported), 4),
-                        capacity_status="IMPORTED EXCEL PLAN",
-                        risk_warning_count=sum(bool(row.risk_reason) for row in imported),
-                        assumption_note=(
-                            "Read-only imported OVEN workbook plan. Imported rows preserve "
-                            "TOTAL quantity, so day/night detail is unavailable."
-                        ),
-                    )
-                    self._set_plan(imported, summary, "IMPORTED")
-                    return
-            self.recalculate_plan(show_message=False)
-        except Exception as exc:
-            QMessageBox.critical(self, "Daily Oven Schedule", str(exc))
+        self._load_plan(show_message=False)
 
-    def recalculate_plan(self, *args, show_message: bool = True) -> None:
+    def recalculate_plan(self, *args) -> None:
+        self._load_plan(show_message=True)
+
+    def _load_plan(self, *, show_message: bool) -> None:
         try:
-            selected: date = self.plan_date.date().toPython()
             with get_session() as session:
-                production = load_production_requirements(
+                rows, summary = calculate_daily_oven_plan(
                     session,
-                    planning_date=selected,
-                    production_required_only=True,
-                )
-                capacity = build_capacity_analysis(
-                    session,
-                    production_rows=production,
-                    planning_date=selected,
-                )
-                rows, summary = build_daily_oven_schedule(
-                    session,
-                    planning_date=selected,
-                    production_rows=production,
-                    capacity_rows=capacity,
+                    planning_date=self.plan_date.date().toPython(),
                     assumptions=PlanningAssumptions(),
                 )
-            self._set_plan(rows, summary, "CALCULATED")
+            self._set_plan(rows, summary)
             if show_message:
                 QMessageBox.information(
                     self,
                     "Plan Recalculated",
-                    "Quantity-based preview recalculated. Preserved Excel plan rows "
-                    "and database data were not overwritten.",
+                    "Quantity-based plan recalculated in memory. Imported Excel plan "
+                    "rows and all source data were not overwritten.",
                 )
         except Exception as exc:
-            QMessageBox.critical(self, "Plan Recalculation Failed", str(exc))
+            QMessageBox.critical(self, "Daily Oven Schedule", str(exc))
 
     def _set_plan(
         self,
         rows: list[OvenScheduleRow],
         summary: OvenScheduleSummary,
-        source: str,
     ) -> None:
         self.plan_rows = rows
-        self.plan_source = source
-        self.metric_labels["active_ovens"].setText(f"{summary.active_ovens:,}")
-        self.metric_labels["required"].setText(f"{summary.production_required_qty:,}")
-        self.metric_labels["planned"].setText(f"{summary.planned_qty:,}")
-        self.metric_labels["unplanned"].setText(f"{summary.unplanned_qty:,}")
+        values = {
+            "required": summary.production_required_qty,
+            "planned": summary.planned_qty,
+            "unplanned": summary.unplanned_qty,
+            "missing_capacity": summary.missing_capacity_items,
+            "missing_compatibility": summary.missing_compatibility_items,
+            "missing_due_date": summary.missing_due_date_items,
+            "missing_weight": summary.missing_weight_items,
+            "warnings": summary.risk_warning_count,
+        }
+        for key, value in values.items():
+            self.metric_labels[key].setText(f"{value:,}")
         self.metric_labels["tons"].setText(f"{summary.planned_tons:,.2f}")
-        self.metric_labels["warnings"].setText(f"{summary.risk_warning_count:,}")
         self.capacity_status.setText(summary.capacity_status)
         self.assumption_note.setText(summary.assumption_note)
         self.filter_table()
@@ -346,7 +331,7 @@ class SchedulePage(QWidget):
         status = self.status_combo.currentText()
         self.visible_rows = []
         for row in self.plan_rows:
-            if status != "ALL" and status not in {row.status, self.plan_source}:
+            if status != "ALL" and row.status != status:
                 continue
             searchable = " ".join(
                 [
@@ -368,41 +353,47 @@ class SchedulePage(QWidget):
         for row_index, row in enumerate(self.visible_rows):
             self.table.insertRow(row_index)
             values = [
-                row.plan_date.isoformat(),
                 row.material_code,
                 row.item_description,
-                row.oven_code,
-                row.line_category,
+                row.due_date.isoformat() if row.due_date else "MISSING",
+                f"{row.demand_qty:,}",
+                f"{row.available_stock:,}",
+                f"{row.shortage_qty:,}",
+                f"{row.production_required_qty:,}",
+                f"{row.effective_daily_capacity:,.2f}",
                 f"{row.day_qty:,}",
                 f"{row.night_qty:,}",
                 f"{row.total_planned_qty:,}",
                 f"{row.remaining_qty:,}",
                 f"{row.planned_tons:,.3f}",
+                row.oven_code,
                 row.status,
                 row.risk_reason or "-",
-                self.plan_source,
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
-                if column in {0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 12}:
+                if column not in {1, 15}:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if column == 10:
+                if column == 14:
                     self._style_status(item, row.status)
-                if column == 11 and row.risk_reason:
+                if column == 15:
                     item.setToolTip(row.risk_reason)
                 self.table.setItem(row_index, column, item)
 
     def _style_status(self, item: QTableWidgetItem, status: str) -> None:
-        if status in {"PLANNED", "IMPORTED"}:
-            item.setForeground(QColor("#166534"))
-            item.setBackground(QColor("#dcfce7"))
-        elif status == "PARTIALLY PLANNED":
-            item.setForeground(QColor("#92400e"))
-            item.setBackground(QColor("#fef3c7"))
-        else:
-            item.setForeground(QColor("#991b1b"))
-            item.setBackground(QColor("#fee2e2"))
+        colors = {
+            "PLANNED": ("#166534", "#dcfce7"),
+            "PARTIAL": ("#92400e", "#fef3c7"),
+            "UNPLANNED": ("#991b1b", "#fee2e2"),
+            "MISSING CAPACITY": ("#991b1b", "#fee2e2"),
+            "MISSING COMPATIBILITY": ("#991b1b", "#fee2e2"),
+            "MISSING WEIGHT": ("#92400e", "#fef3c7"),
+            "MISSING DUE DATE": ("#1d4ed8", "#dbeafe"),
+        }
+        foreground, background = colors.get(status, ("#475569", "#f1f5f9"))
+        item.setForeground(QColor(foreground))
+        item.setBackground(QColor(background))
 
     def export_csv(self) -> None:
         if not self.visible_rows:

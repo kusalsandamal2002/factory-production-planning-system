@@ -51,7 +51,6 @@ def build_material_requirements(
 
     for production in required:
         code = production.material_code
-        item_rows = 0
 
         for row in masters["bom"].get(code, []):
             usage = _to_float(row["usage_per_unit"])
@@ -69,7 +68,6 @@ def build_material_requirements(
                     row["unit"] or "KG",
                 )
             )
-            item_rows += 1
 
         for row in masters["compound"].get(code, []):
             usage = _to_float(row["compound_weight_per_unit"])
@@ -87,7 +85,6 @@ def build_material_requirements(
                     "KG",
                 )
             )
-            item_rows += 1
 
         for row in masters["bead"].get(code, []):
             usage = _to_float(row["bead_per_tyre"])
@@ -104,7 +101,6 @@ def build_material_requirements(
                     "PCS",
                 )
             )
-            item_rows += 1
 
         for row in masters["band"].get(code, []):
             usage = _to_float(row["band_usage_per_tyre"])
@@ -121,42 +117,15 @@ def build_material_requirements(
                     "PCS",
                 )
             )
-            item_rows += 1
 
         if not masters["bom"].get(code):
-            output.append(
-                MaterialRequirementRow(
-                    finished_item_code=code,
-                    finished_item_description=production.item_description,
-                    production_required_qty=production.production_required_qty,
-                    component_type="BOM",
-                    raw_material_code="-",
-                    raw_material_name="-",
-                    usage_per_unit=0.0,
-                    base_required_qty=0.0,
-                    allowance_rate=0.0,
-                    required_qty=0.0,
-                    unit="-",
-                    warning="MISSING BOM",
-                )
-            )
-        elif item_rows == 0:
-            output.append(
-                MaterialRequirementRow(
-                    finished_item_code=code,
-                    finished_item_description=production.item_description,
-                    production_required_qty=production.production_required_qty,
-                    component_type="DATA",
-                    raw_material_code="-",
-                    raw_material_name="-",
-                    usage_per_unit=0.0,
-                    base_required_qty=0.0,
-                    allowance_rate=0.0,
-                    required_qty=0.0,
-                    unit="-",
-                    warning="NO ACTIVE MATERIAL MASTER",
-                )
-            )
+            output.append(_missing_row(production, "BOM", "MISSING BOM"))
+        if not masters["compound"].get(code):
+            output.append(_missing_row(production, "COMPOUND", "MISSING COMPOUND"))
+        if not masters["bead"].get(code):
+            output.append(_missing_row(production, "BEAD", "MISSING BEAD"))
+        if not masters["band"].get(code):
+            output.append(_missing_row(production, "BAND", "MISSING BAND"))
     return output
 
 
@@ -216,6 +185,27 @@ def _row(
         required_qty=round(base * (1.0 + allowance), 6),
         unit=str(unit or "-"),
         warning="",
+    )
+
+
+def _missing_row(
+    production: ProductionRequirementRow,
+    component_type: str,
+    warning: str,
+) -> MaterialRequirementRow:
+    return MaterialRequirementRow(
+        finished_item_code=production.material_code,
+        finished_item_description=production.item_description,
+        production_required_qty=production.production_required_qty,
+        component_type=component_type,
+        raw_material_code="-",
+        raw_material_name="-",
+        usage_per_unit=0.0,
+        base_required_qty=0.0,
+        allowance_rate=0.0,
+        required_qty=0.0,
+        unit="-",
+        warning=warning,
     )
 
 

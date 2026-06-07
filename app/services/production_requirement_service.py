@@ -32,6 +32,9 @@ class ProductionRequirementRow:
     unit_weight_kg: float
     production_required_tons: float
     earliest_due_date: date | None
+    missing_due_date: bool
+    missing_weight: bool
+    negative_available_stock: bool
     status: str
     warnings: tuple[str, ...]
 
@@ -43,6 +46,7 @@ class ProductionRequirementSummary:
     production_required_items: int
     out_of_stock_items: int
     missing_weight_items: int
+    missing_due_date_items: int
     missing_demand_items: int
     total_shortage_qty: int
     total_production_required_qty: int
@@ -181,6 +185,7 @@ def summarize_production_requirements(
         production_required_items=sum(row.production_required_qty > 0 for row in rows),
         out_of_stock_items=sum(row.status == "OUT OF STOCK" for row in rows),
         missing_weight_items=sum(row.status == "MISSING WEIGHT" for row in rows),
+        missing_due_date_items=sum(row.missing_due_date for row in rows),
         missing_demand_items=sum(row.status == "MISSING DEMAND" for row in rows),
         total_shortage_qty=sum(row.shortage_qty for row in rows),
         total_production_required_qty=sum(row.production_required_qty for row in rows),
@@ -196,28 +201,27 @@ def _map_requirement(raw: dict[str, Any]) -> ProductionRequirementRow:
     demand = _to_int(raw["eligible_shipment_demand"])
     shortage = _to_int(raw["shortage_qty"])
     weight = _to_float(raw["unit_weight_kg"])
+    missing_due_date = _to_int(raw["missing_due_dates"]) > 0
+    missing_weight = shortage > 0 and weight <= 0
+    negative_available_stock = available < 0
     warnings: list[str] = []
 
-    if _to_int(raw["missing_due_dates"]) > 0:
-        warnings.append("Demand due date missing; included to avoid understating demand.")
-    if available < 0:
-        warnings.append("Available stock is negative; verify stock classifications.")
+    if missing_due_date:
+        warnings.append("MISSING_DUE_DATE")
+    if negative_available_stock:
+        warnings.append("NEGATIVE_AVAILABLE_STOCK")
     if _to_int(raw["confirmed_production_qty"]) > 0:
-        warnings.append(
-            "Production movements are informational because entries are already posted to FG stock."
-        )
+        warnings.append("PRODUCTION_MOVEMENT_ALREADY_POSTED_TO_FG")
     if _to_int(raw["completed_shipment_qty"]) > 0:
-        warnings.append(
-            "OUT movements are informational because no separate MPPS shipment allocation ledger exists."
-        )
+        warnings.append("SHIPMENT_MOVEMENT_INFORMATIONAL_ONLY")
 
     if demand <= 0:
         status = "MISSING DEMAND"
     elif shortage <= 0:
         status = "READY"
-    elif weight <= 0:
+    elif missing_weight:
         status = "MISSING WEIGHT"
-        warnings.append("Unit weight missing; production tons cannot be calculated.")
+        warnings.append("MISSING_WEIGHT")
     elif available <= 0:
         status = "OUT OF STOCK"
     elif available < demand:
@@ -245,6 +249,9 @@ def _map_requirement(raw: dict[str, Any]) -> ProductionRequirementRow:
         unit_weight_kg=weight,
         production_required_tons=tons,
         earliest_due_date=raw["earliest_due_date"],
+        missing_due_date=missing_due_date,
+        missing_weight=missing_weight,
+        negative_available_stock=negative_available_stock,
         status=status,
         warnings=tuple(warnings),
     )
