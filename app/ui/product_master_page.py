@@ -819,49 +819,9 @@ class ProductMasterPage(QWidget):
             connection.execute(
                 text(
                     """
-                    INSERT INTO tire_types (
-                        tire_code,
-                        tire_name,
-                        curing_minutes,
-                        is_active
-                    )
-                    VALUES (
-                        :material_code,
-                        :item_description,
-                        30,
-                        :is_active
-                    )
-                    ON CONFLICT (tire_code)
-                    DO UPDATE SET
-                        tire_name = EXCLUDED.tire_name,
-                        is_active = EXCLUDED.is_active;
-                    """
-                ),
-                data,
-            )
-
-            tire_type_id = connection.execute(
-                text(
-                    """
-                    SELECT id
-                    FROM tire_types
-                    WHERE tire_code = :material_code
-                    LIMIT 1;
-                    """
-                ),
-                data,
-            ).scalar()
-
-            save_data = dict(data)
-            save_data["tire_type_id"] = tire_type_id
-
-            connection.execute(
-                text(
-                    """
                     INSERT INTO mpps_stock_items (
                         material_code,
                         item_description,
-                        tire_type_id,
                         product_type,
                         product_group,
                         fg_stock,
@@ -879,7 +839,6 @@ class ProductMasterPage(QWidget):
                     VALUES (
                         :material_code,
                         :item_description,
-                        :tire_type_id,
                         'TYRE',
                         :product_group,
                         0,
@@ -897,7 +856,6 @@ class ProductMasterPage(QWidget):
                     ON CONFLICT (material_code)
                     DO UPDATE SET
                         item_description = EXCLUDED.item_description,
-                        tire_type_id = EXCLUDED.tire_type_id,
                         product_group = EXCLUDED.product_group,
                         average_weight = EXCLUDED.average_weight,
                         compound_weight = EXCLUDED.compound_weight,
@@ -909,7 +867,7 @@ class ProductMasterPage(QWidget):
                         updated_at = CURRENT_TIMESTAMP;
                     """
                 ),
-                save_data,
+                data,
             )
 
     def on_selection_changed(self) -> None:

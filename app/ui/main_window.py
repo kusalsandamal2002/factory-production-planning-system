@@ -21,7 +21,6 @@ from app.config import settings
 from app.models import User
 from app.ui.dashboard_page import DashboardPage
 from app.ui.details.shipment_details_page import ShipmentDetailsPage
-from app.ui.details.tire_details_page import TireDetailsPage
 from app.ui.module_hub_page import (
     create_admin_control_page,
     create_factory_data_center_page,
@@ -56,11 +55,6 @@ def _resolve_page_class(module_path: str, candidates: list[str]):
         f"Tried: {candidates}. Available: {available}"
     )
 
-
-ProductionEntryPage = _resolve_page_class(
-    "app.ui.production_entry_page",
-    ["ProductionEntryPage", "DailyProductionEntryPage", "DailyProductionPage"],
-)
 
 BandMasterPage = _resolve_page_class(
     "app.ui.band_master_page",
@@ -252,13 +246,13 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(20, 16, 20, 18)
         layout.setSpacing(10)
 
-        brand = QLabel("Factory Oven\nPlanner")
+        brand = QLabel("MPPS Factory\nPlanner")
         brand.setObjectName("BrandTitle")
         brand.setWordWrap(True)
         brand.setMinimumHeight(72)
         brand.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-        subtitle = QLabel("Excel Replacement • MPPS • Oven Planning")
+        subtitle = QLabel("Excel-Derived Stock, Material and Quantity Planning")
         subtitle.setObjectName("BrandSubtitle")
         subtitle.setWordWrap(True)
         subtitle.setMinimumHeight(34)
@@ -281,7 +275,6 @@ class MainWindow(QMainWindow):
 
         self._add_caption(layout, "Operations")
         self._add_nav_button(layout, "+   Customer / Shipment Demand", self.ORDER_ENTRY_INDEX)
-        self._add_nav_button(layout, "▣   Daily Production Entry", self.PRODUCTION_ENTRY_INDEX)
         self._add_nav_button(layout, "▣   Daily Oven Schedule", self.SCHEDULE_INDEX)
         self._add_nav_button(layout, "↳   Shipment Management", self.SHIPMENT_DETAILS_INDEX)
 
@@ -289,14 +282,13 @@ class MainWindow(QMainWindow):
 
         self._add_caption(layout, "MPPS Planning")
         self._add_nav_button(layout, "▤   Stock Planning", self.STOCK_PLANNING_INDEX)
+        self._add_nav_button(layout, "↳   MPPS Stock Overview", self.TIRE_STOCK_INDEX)
         self._add_nav_button(layout, "▥   Manager Output Center", self.MANAGER_OUTPUT_INDEX)
 
         layout.addSpacing(8)
 
         self._add_caption(layout, "Factory Data Center")
         self._add_nav_button(layout, "▧   Master Data Center", self.FACTORY_DATA_CENTER_INDEX)
-        self._add_nav_button(layout, "↳   Tire Details", self.TIRE_DETAILS_INDEX)
-        self._add_nav_button(layout, "↳   Tire Stock", self.TIRE_STOCK_INDEX)
 
         layout.addSpacing(8)
 
@@ -327,7 +319,10 @@ class MainWindow(QMainWindow):
             open_item_detail_callback=self.open_stock_item_detail
         )
         self.shipment_details_page = ShipmentDetailsPage()
-        self.tire_details_page = TireDetailsPage()
+        self.tire_details_page = PlaceholderPage(
+            "Archived Legacy Module",
+            "This archived module is not part of the current MPPS workflow.",
+        )
         self.tire_stock_page = TireStockPage()
         self.factory_data_center_page = create_factory_data_center_page(
             open_callback=self.open_module_action
@@ -344,7 +339,10 @@ class MainWindow(QMainWindow):
         self.compound_master_page = CompoundMasterPage()
         self.bead_master_page = BeadMasterPage()
 
-        self.production_entry_page = self._safe_create_page(ProductionEntryPage, self.current_user)
+        self.production_entry_page = PlaceholderPage(
+            "Archived Legacy Module",
+            "This archived module is not part of the current MPPS workflow.",
+        )
         self.band_master_page = self._safe_create_page(BandMasterPage)
         self.capacity_master_page = self._safe_create_page(CapacityMasterPage)
         self.oven_master_page = self._safe_create_page(OvenMasterPage)
@@ -402,23 +400,12 @@ class MainWindow(QMainWindow):
             return page_class()
 
     def _create_dashboard_page(self) -> DashboardPage:
-        try:
-            return DashboardPage(
-                open_total_shipments_callback=self.open_shipment_details_page,
-                open_completed_orders_callback=self.open_shipment_details_page,
-                open_pending_orders_callback=self.open_shipment_details_page,
-                open_overdue_orders_callback=self.open_shipment_details_page,
-            )
-        except TypeError:
-            try:
-                return DashboardPage(
-                    self.open_shipment_details_page,
-                    self.open_shipment_details_page,
-                    self.open_shipment_details_page,
-                    self.open_shipment_details_page,
-                )
-            except TypeError:
-                return DashboardPage()
+        return DashboardPage(
+            self.open_shipment_details_page,
+            self.open_shipment_details_page,
+            self.open_stock_planning_page,
+            self.open_stock_planning_page,
+        )
 
     def _wrap_scroll(self, widget: QWidget) -> QScrollArea:
         scroll = QScrollArea()
@@ -490,15 +477,13 @@ class MainWindow(QMainWindow):
         nav_map = {
             self.DASHBOARD_INDEX: 0,
             self.ORDER_ENTRY_INDEX: 1,
-            self.PRODUCTION_ENTRY_INDEX: 2,
-            self.SCHEDULE_INDEX: 3,
-            self.SHIPMENT_DETAILS_INDEX: 4,
-            self.STOCK_PLANNING_INDEX: 5,
+            self.SCHEDULE_INDEX: 2,
+            self.SHIPMENT_DETAILS_INDEX: 3,
+            self.STOCK_PLANNING_INDEX: 4,
+            self.TIRE_STOCK_INDEX: 5,
             self.MANAGER_OUTPUT_INDEX: 6,
             self.FACTORY_DATA_CENTER_INDEX: 7,
-            self.TIRE_DETAILS_INDEX: 8,
-            self.TIRE_STOCK_INDEX: 9,
-            self.ADMIN_CONTROL_INDEX: 10,
+            self.ADMIN_CONTROL_INDEX: 8,
         }
 
         return nav_map.get(index, -1)
@@ -506,17 +491,16 @@ class MainWindow(QMainWindow):
     def _refresh_page(self, index: int) -> None:
         page_by_index = {
             self.DASHBOARD_INDEX: self.dashboard_page,
+            self.ORDER_ENTRY_INDEX: self.order_entry_page,
             self.SCHEDULE_INDEX: self.schedule_page,
             self.STOCK_PLANNING_INDEX: self.stock_planning_page,
             self.SHIPMENT_DETAILS_INDEX: self.shipment_details_page,
-            self.TIRE_DETAILS_INDEX: self.tire_details_page,
             self.TIRE_STOCK_INDEX: self.tire_stock_page,
             self.PRODUCT_MASTER_INDEX: self.product_master_page,
             self.STOCK_MASTER_INDEX: self.stock_master_page,
             self.BOM_MASTER_INDEX: self.bom_master_page,
             self.COMPOUND_MASTER_INDEX: self.compound_master_page,
             self.BEAD_MASTER_INDEX: self.bead_master_page,
-            self.PRODUCTION_ENTRY_INDEX: self.production_entry_page,
             self.BAND_MASTER_INDEX: self.band_master_page,
             self.CAPACITY_MASTER_INDEX: self.capacity_master_page,
             self.OVEN_MASTER_INDEX: self.oven_master_page,

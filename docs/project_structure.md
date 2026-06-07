@@ -1,9 +1,8 @@
 # Project Structure
 
 This repository separates runtime code from database maintenance, data tools,
-documentation, and historical backups. The cleanup did not change application
-business rules, planning calculations, database schema, or Excel-derived
-formulas.
+documentation, and historical backups. The visible application uses MPPS stock,
+shipment demand, material requirements, and Excel-derived quantity capacity.
 
 ## Top-Level Layout
 
@@ -28,8 +27,8 @@ factory_oven_planner/
 Contains all code required by the running desktop application:
 
 - `app/ui/` contains PySide6 pages, windows, dialogs, and styles.
-- `app/services/` contains scheduling, capacity, stock, material, order, and
-  related application services.
+- `app/services/` contains MPPS demand, quantity scheduling, capacity, stock,
+  material, and shipment-risk services.
 - `app/utils/` contains reusable runtime formatting and export helpers.
 - `app/models.py`, `app/database.py`, `app/config.py`, and `app/main.py`
   provide the core data model, database connection, configuration, and startup.
@@ -92,6 +91,8 @@ Contains maintained project knowledge:
 Contains historical code snapshots kept only for reference:
 
 - `backups/code_backups/` contains tracked source copies moved out of runtime.
+- `backups/code_backups/legacy_minute_scheduler/` contains retired prototype
+  scheduling and related UI modules that are no longer imported by the app.
 - `backups/code_backups/local_snapshots/` contains generated local snapshots
   and is ignored by Git.
 

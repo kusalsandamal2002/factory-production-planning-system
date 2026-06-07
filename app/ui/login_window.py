@@ -43,8 +43,8 @@ class LoginWindow(QDialog):
         hero_layout.addWidget(brand)
 
         subtitle = QLabel(
-            "Professional PostgreSQL desktop prototype for order capacity "
-            "planning and oven scheduling."
+            "Professional MPPS and OVEN Excel-derived production planning, "
+            "stock, material, capacity, and shipment-risk control."
         )
         subtitle.setObjectName("BrandSubtitle")
         subtitle.setWordWrap(True)
@@ -52,7 +52,7 @@ class LoginWindow(QDialog):
 
         hero_layout.addStretch()
 
-        pill = QLabel("25 Ovens • 2 Shifts • Live Receive Date")
+        pill = QLabel("MPPS Stock | Quantity Capacity | Excel Traceability")
         pill.setObjectName("InfoPill")
         hero_layout.addWidget(pill)
 
@@ -69,7 +69,7 @@ class LoginWindow(QDialog):
         title = QLabel("Sign in")
         title.setObjectName("PageTitle")
 
-        subtitle2 = QLabel("Use demo access to review the owner presentation prototype.")
+        subtitle2 = QLabel("Development/demo access for the MPPS production planner.")
         subtitle2.setObjectName("PageSubtitle")
 
         form_layout.addWidget(title)

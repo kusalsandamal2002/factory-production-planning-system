@@ -106,10 +106,15 @@ minute-level sequence.
 
 ## Legacy Isolation
 
-`app/services/scheduler.py`, `app/services/schedule_priority_service.py`, and
-the `oven_schedule` table remain available for the existing order enquiry
-workflow. The Daily Oven Schedule page no longer reads or rebuilds that
-minute-based table.
+The retired scheduler, priority rebuild, receive-date order service, and related
+prototype UI pages are archived under
+`backups/code_backups/legacy_minute_scheduler/`. They are not imported by the
+current application.
+
+The legacy `oven_schedule`, `orders`, `order_items`, `tire_types`, `shifts`, and
+production-rule tables remain in the ORM/database for compatibility and audit
+history. Current visible planning pages do not read or rebuild the legacy
+minute-based schedule.
 
 ## Known Data Gaps
 

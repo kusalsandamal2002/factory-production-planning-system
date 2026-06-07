@@ -467,50 +467,11 @@ def load_demand_breakdown(
 ) -> list[DemandBreakdownRow]:
     rows: list[DemandBreakdownRow] = []
 
-    order_rows = session.execute(
-        text(
-            """
-            SELECT
-                'CUSTOMER_ORDER' AS source,
-                o.order_no AS order_no,
-                c.customer_name AS customer_name,
-                oi.quantity AS demand_qty,
-                o.manager_confirmed_receive_date AS shipment_date,
-                o.status AS status,
-                COALESCE(o.manager_note, '-') AS note
-            FROM order_items oi
-            JOIN orders o
-                ON o.id = oi.order_id
-            JOIN customers c
-                ON c.id = o.customer_id
-            JOIN tire_types tt
-                ON tt.id = oi.tire_type_id
-            WHERE tt.tire_code = :material_code
-              AND UPPER(o.status) IN ('PENDING', 'CONFIRMED', 'PLANNED', 'PARTIALLY_PLANNED')
-            ORDER BY o.manager_confirmed_receive_date ASC, o.order_no ASC;
-            """
-        ),
-        {"material_code": material_code},
-    ).mappings()
-
-    for row in order_rows:
-        rows.append(
-            DemandBreakdownRow(
-                source=str(row["source"]),
-                order_no=str(row["order_no"]),
-                customer_name=str(row["customer_name"]),
-                demand_qty=_to_int(row["demand_qty"]),
-                shipment_date=row["shipment_date"],
-                status=str(row["status"]),
-                note=str(row["note"] or "-"),
-            )
-        )
-
     manual_rows = session.execute(
         text(
             """
             SELECT
-                'MANUAL_SHIPMENT_DEMAND' AS source,
+                'MPPS_SHIPMENT_DEMAND' AS source,
                 '-' AS order_no,
                 COALESCE(customer_name, '-') AS customer_name,
                 demand_qty,

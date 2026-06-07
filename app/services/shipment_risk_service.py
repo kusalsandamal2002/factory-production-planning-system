@@ -57,23 +57,6 @@ def build_shipment_risks(
             WHERE UPPER(status) IN ('PENDING', 'CONFIRMED', 'PLANNED', 'PARTIALLY_PLANNED')
               AND demand_qty > 0
               AND (shipment_date IS NULL OR shipment_date <= :planning_date)
-            UNION ALL
-            SELECT
-                o.order_no AS demand_reference,
-                c.customer_name,
-                tt.tire_code AS material_code,
-                o.manager_confirmed_receive_date AS due_date,
-                oi.quantity AS demand_qty
-            FROM order_items oi
-            JOIN orders o ON o.id = oi.order_id
-            JOIN customers c ON c.id = o.customer_id
-            JOIN tire_types tt ON tt.id = oi.tire_type_id
-            WHERE UPPER(o.status) IN ('PENDING', 'CONFIRMED', 'PLANNED', 'PARTIALLY_PLANNED')
-              AND oi.quantity > 0
-              AND (
-                    o.manager_confirmed_receive_date IS NULL
-                    OR o.manager_confirmed_receive_date <= :planning_date
-              )
             ORDER BY due_date NULLS LAST, demand_reference;
             """
         ),

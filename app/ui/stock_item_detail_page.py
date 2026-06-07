@@ -327,7 +327,7 @@ class StockItemDetailPage(QWidget):
         self.stack.addWidget(self._build_stock_summary_page())
         self.stack.addWidget(self._build_table_page(
             "Demand Breakdown",
-            "Customer/order-wise active demand used for MPPS shipment demand calculation.",
+            "Active MPPS shipment demand used for stock and production planning.",
             self.demand_table,
         ))
         self.stack.addWidget(self._build_table_page(

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import time
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Customer, Oven, ProductionRule, Role, Shift, TireType, User
+from app.models import Role, User
 
 
 def hash_password(password: str) -> str:
@@ -43,30 +42,3 @@ def seed_database(session: Session) -> None:
             ),
         ]
     )
-
-    session.add_all(
-        [
-            Customer(customer_code=f"CUS-{i:03d}", customer_name=f"Customer {i:02d}", contact_person=f"Contact {i:02d}")
-            for i in range(1, 11)
-        ]
-    )
-
-    tire_data = [
-        ("TYPE-01", "Tire Type 1", 30),
-        ("TYPE-02", "Tire Type 2", 45),
-        ("TYPE-03", "Tire Type 3", 90),
-        ("TYPE-04", "Tire Type 4", 180),
-        ("TYPE-05", "Tire Type 5", 300),
-    ]
-    session.add_all([TireType(tire_code=code, tire_name=name, curing_minutes=minutes) for code, name, minutes in tire_data])
-
-    session.add_all([Oven(oven_code=f"OVEN-{i:02d}", oven_name=f"Oven {i:02d}") for i in range(1, 26)])
-
-    session.add_all(
-        [
-            Shift(shift_name="Day Shift", start_time=time(8, 0), end_time=time(18, 0), max_working_minutes=600),
-            Shift(shift_name="Night Shift", start_time=time(20, 0), end_time=time(4, 0), max_working_minutes=480),
-        ]
-    )
-
-    session.add(ProductionRule(rule_name="BREAK_BETWEEN_TIRES", rule_value=20, unit="minutes"))

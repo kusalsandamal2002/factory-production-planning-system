@@ -77,57 +77,14 @@ def load_production_requirements(
               AND demand_qty > 0
             GROUP BY material_code
         ),
-        order_demand AS (
-            SELECT
-                tt.tire_code AS material_code,
-                SUM(oi.quantity)::INTEGER AS demand_qty,
-                MIN(o.manager_confirmed_receive_date)
-                    FILTER (WHERE o.manager_confirmed_receive_date IS NOT NULL) AS earliest_due_date,
-                COUNT(*) FILTER (WHERE o.manager_confirmed_receive_date IS NULL)::INTEGER
-                    AS missing_due_dates
-            FROM order_items oi
-            JOIN orders o ON o.id = oi.order_id
-            JOIN tire_types tt ON tt.id = oi.tire_type_id
-            WHERE UPPER(o.status) IN ({status_sql})
-              AND (
-                    o.manager_confirmed_receive_date IS NULL
-                    OR o.manager_confirmed_receive_date <= :planning_date
-              )
-              AND oi.quantity > 0
-            GROUP BY tt.tire_code
-        ),
         combined_demand AS (
             SELECT
                 material_code,
                 SUM(demand_qty)::INTEGER AS demand_qty,
                 MIN(earliest_due_date) AS earliest_due_date,
                 SUM(missing_due_dates)::INTEGER AS missing_due_dates
-            FROM (
-                SELECT * FROM manual_demand
-                UNION ALL
-                SELECT * FROM order_demand
-            ) demand_rows
+            FROM manual_demand
             GROUP BY material_code
-        ),
-        movements AS (
-            SELECT
-                tt.tire_code AS material_code,
-                COALESCE(SUM(tsm.quantity) FILTER (
-                    WHERE tsm.direction = 'IN'
-                      AND tsm.movement_type = 'DAILY_PRODUCTION'
-                ), 0)::INTEGER AS confirmed_production_qty,
-                COALESCE(SUM(tsm.quantity) FILTER (
-                    WHERE tsm.direction = 'OUT'
-                      AND tsm.movement_type IN (
-                            'SHIPMENT',
-                            'CUSTOMER_SHIPMENT',
-                            'ORDER_SHIPMENT'
-                      )
-                ), 0)::INTEGER AS completed_shipment_qty
-            FROM tire_stock_movements tsm
-            JOIN tire_types tt ON tt.id = tsm.tire_type_id
-            WHERE tsm.movement_date <= :planning_date
-            GROUP BY tt.tire_code
         )
         SELECT
             si.material_code,
@@ -140,8 +97,8 @@ def load_production_requirements(
             si.blocked_stock,
             (si.fg_stock + si.qc_stock - si.scrap_stock - si.blocked_stock)::INTEGER
                 AS opening_available_stock,
-            COALESCE(m.confirmed_production_qty, 0) AS confirmed_production_qty,
-            COALESCE(m.completed_shipment_qty, 0) AS completed_shipment_qty,
+            0::INTEGER AS confirmed_production_qty,
+            0::INTEGER AS completed_shipment_qty,
             (si.fg_stock + si.qc_stock - si.scrap_stock - si.blocked_stock)::INTEGER
                 AS available_stock_at_date,
             COALESCE(cd.demand_qty, 0)::INTEGER AS eligible_shipment_demand,
@@ -155,7 +112,6 @@ def load_production_requirements(
             COALESCE(cd.missing_due_dates, 0)::INTEGER AS missing_due_dates
         FROM mpps_stock_items si
         LEFT JOIN combined_demand cd ON cd.material_code = si.material_code
-        LEFT JOIN movements m ON m.material_code = si.material_code
         WHERE si.is_active = TRUE
         ORDER BY
             GREATEST(

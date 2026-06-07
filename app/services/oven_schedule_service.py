@@ -93,7 +93,18 @@ def build_daily_oven_schedule(
     capacity_map = {row.item_code: row for row in capacity_rows}
     compatibility = _load_active_compatibility(session)
     active_ovens = int(
-        session.execute(text("SELECT COUNT(*) FROM ovens WHERE is_active = TRUE")).scalar_one()
+        session.execute(
+            text(
+                """
+                SELECT COUNT(DISTINCT oven.id)
+                FROM ovens oven
+                JOIN mpps_oven_plan plan
+                  ON plan.oven_code = oven.oven_code
+                WHERE oven.is_active = TRUE
+                  AND plan.planned_qty > 0;
+                """
+            )
+        ).scalar_one()
     )
 
     capacity_remaining: dict[str, int] = {}
@@ -232,11 +243,13 @@ def build_daily_oven_schedule(
         capacity_status=capacity_status,
         risk_warning_count=len(warning_items),
         assumption_note=(
-            f"Compound allowance {assumptions.compound_allowance_rate:.0%} | "
-            f"Band allowance {assumptions.band_allowance_rate:.0%} | "
-            f"Day/night split {assumptions.day_shift_share:.0%}/"
-            f"{1.0 - assumptions.day_shift_share:.0%} | "
-            "No minute-based utilization: verified cycle-time data is unavailable."
+            "This schedule uses Excel-derived quantity/mould/day planning. "
+            "Minute-level curing utilization is not shown because verified "
+            "cycle-time data is not available. "
+            f"Compound allowance {assumptions.compound_allowance_rate:.0%}; "
+            f"band allowance {assumptions.band_allowance_rate:.0%}; "
+            f"day/night split {assumptions.day_shift_share:.0%}/"
+            f"{1.0 - assumptions.day_shift_share:.0%}."
         ),
     )
     return output, summary

@@ -265,7 +265,7 @@ class CapacityMasterPage(QWidget):
         title_box.setSpacing(4)
         title = QLabel("Capacity Master Control")
         title.setObjectName("SectionTitle")
-        hint = QLabel("Define daily mould curing production capacities. Active items with zero capacity will raise warnings.")
+        hint = QLabel("Define daily mould/category production capacities. Active items with zero capacity will raise warnings.")
         hint.setObjectName("SectionHint")
         title_box.addWidget(title)
         title_box.addWidget(hint)
