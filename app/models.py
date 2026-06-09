@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time
+from decimal import Decimal
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
+    Computed,
     Date,
     DateTime,
     ForeignKey,
     Integer,
+    Numeric,
     String,
     Text,
     Time,
@@ -251,3 +255,80 @@ class AuditLog(Base):
     note: Mapped[str | None] = mapped_column(Text)
 
 
+class MonthlyStockCount(Base):
+    __tablename__ = "monthly_stock_counts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    stock_month_label: Mapped[str] = mapped_column(String(50), nullable=False)
+    month_key: Mapped[str] = mapped_column(String(7), nullable=False)
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    sheet_name: Mapped[str] = mapped_column(String(150), nullable=False, default="Sheet1")
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    uploaded_by: Mapped[str | None] = mapped_column(String(150))
+    total_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="IMPORTED", nullable=False)
+    remarks: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    lines: Mapped[list["MonthlyStockCountLine"]] = relationship(
+        back_populates="stock_count",
+        cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        CheckConstraint("month_key ~ '^[0-9]{4}-[0-9]{2}$'", name="chk_monthly_stock_counts_month_key"),
+        CheckConstraint("total_rows >= 0", name="chk_monthly_stock_counts_total_rows"),
+        CheckConstraint("status IN ('IMPORTED', 'ARCHIVED')", name="chk_monthly_stock_counts_status"),
+    )
+
+
+class MonthlyStockCountLine(Base):
+    __tablename__ = "monthly_stock_count_lines"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    stock_count_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("monthly_stock_counts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    material_code: Mapped[str] = mapped_column(String(100), nullable=False)
+    material_description: Mapped[str | None] = mapped_column(Text)
+    fg_qty: Mapped[Decimal] = mapped_column(Numeric(14, 3), default=Decimal("0"), nullable=False)
+    qc_qty: Mapped[Decimal] = mapped_column(Numeric(14, 3), default=Decimal("0"), nullable=False)
+    balance_to_prd_qty: Mapped[Decimal] = mapped_column(Numeric(14, 3), default=Decimal("0"), nullable=False)
+    final_stock_qty: Mapped[Decimal] = mapped_column(
+        Numeric(14, 3),
+        Computed("fg_qty + qc_qty + balance_to_prd_qty", persisted=True),
+        nullable=False,
+    )
+    over_prd_qty: Mapped[Decimal] = mapped_column(Numeric(14, 3), default=Decimal("0"), nullable=False)
+    over_prd_updated_at: Mapped[datetime | None] = mapped_column(DateTime)
+    source_row_number: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    stock_count: Mapped[MonthlyStockCount] = relationship(back_populates="lines")
+
+    __table_args__ = (
+        UniqueConstraint("stock_count_id", "material_code", name="uq_monthly_stock_line_material"),
+        CheckConstraint("fg_qty >= 0", name="chk_monthly_stock_line_fg_qty"),
+        CheckConstraint("qc_qty >= 0", name="chk_monthly_stock_line_qc_qty"),
+        CheckConstraint("balance_to_prd_qty >= 0", name="chk_monthly_stock_line_balance_to_prd_qty"),
+        CheckConstraint("over_prd_qty >= 0", name="chk_monthly_stock_line_over_prd_qty"),
+        CheckConstraint(
+            "source_row_number IS NULL OR source_row_number > 0",
+            name="chk_monthly_stock_line_source_row_number",
+        ),
+    )

@@ -18,7 +18,11 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import settings
-from app.models import User
+from app.database import get_session
+from app.models import Role, User
+from app.ui.bead_master_page import BeadMasterPage
+from app.ui.bom_master_page import BomMasterPage
+from app.ui.compound_master_page import CompoundMasterPage
 from app.ui.dashboard_page import DashboardPage
 from app.ui.details.shipment_details_page import ShipmentDetailsPage
 from app.ui.module_hub_page import (
@@ -26,15 +30,14 @@ from app.ui.module_hub_page import (
     create_factory_data_center_page,
     create_manager_output_page,
 )
+from app.ui.monthly_stock_count_page import MonthlyStockCountPage
 from app.ui.order_entry_page import OrderEntryPage
 from app.ui.product_master_page import ProductMasterPage
-from app.ui.stock_master_page import StockMasterPage
-from app.ui.bom_master_page import BomMasterPage
-from app.ui.compound_master_page import CompoundMasterPage
-from app.ui.bead_master_page import BeadMasterPage
 from app.ui.schedule_page import SchedulePage
+from app.ui.stock_master_page import StockMasterPage
 from app.ui.stock_planning_page import StockPlanningPage
 from app.ui.tire_stock_page import TireStockPage
+
 
 def _resolve_page_class(module_path: str, candidates: list[str]):
     module = import_module(module_path)
@@ -110,7 +113,6 @@ AuditLogPage = _resolve_page_class(
     "app.ui.audit_log_page",
     ["AuditLogPage", "AuditLogsPage"],
 )
-
 
 
 class PlaceholderPage(QWidget):
@@ -210,12 +212,18 @@ class MainWindow(QMainWindow):
     USERS_ROLES_INDEX = 24
     BACKUP_RESTORE_INDEX = 25
     AUDIT_LOG_INDEX = 26
-    PLACEHOLDER_INDEX = 27
+    MONTHLY_STOCK_COUNT_INDEX = 27
+    PLACEHOLDER_INDEX = 28
+
+    MONTHLY_STOCK_MANAGER_ROLE = "Monthly Stock Manager"
+    MONTHLY_STOCK_VIEWER_ROLE = "Monthly Stock Viewer"
 
     def __init__(self, current_user: User):
         super().__init__()
 
         self.current_user = current_user
+        self.monthly_stock_only_mode = self._is_monthly_stock_only_role()
+        self.monthly_stock_viewer_mode = self._is_monthly_stock_viewer_role()
         self.nav_buttons: list[QPushButton] = []
         self.placeholder_page: PlaceholderPage | None = None
 
@@ -235,9 +243,48 @@ class MainWindow(QMainWindow):
         shell_layout.addWidget(self._build_sidebar())
         shell_layout.addWidget(self._build_content(), 1)
 
-        self.navigate(self.DASHBOARD_INDEX)
+        if self.monthly_stock_only_mode:
+            self.navigate(self.MONTHLY_STOCK_COUNT_INDEX)
+        else:
+            self.navigate(self.DASHBOARD_INDEX)
+
+    def _current_role_name(self) -> str:
+        try:
+            role = getattr(self.current_user, "role", None)
+
+            if role is not None:
+                role_name = str(getattr(role, "role_name", "") or "").strip()
+                if role_name:
+                    return role_name
+        except Exception:
+            pass
+
+        role_id = getattr(self.current_user, "role_id", None)
+        if role_id is None:
+            return ""
+
+        try:
+            with get_session() as session:
+                role = session.get(Role, role_id)
+                if role is None:
+                    return ""
+                return str(role.role_name or "").strip()
+        except Exception:
+            return ""
+
+    def _is_monthly_stock_manager_role(self) -> bool:
+        return self._current_role_name().lower() == self.MONTHLY_STOCK_MANAGER_ROLE.lower()
+
+    def _is_monthly_stock_viewer_role(self) -> bool:
+        return self._current_role_name().lower() == self.MONTHLY_STOCK_VIEWER_ROLE.lower()
+
+    def _is_monthly_stock_only_role(self) -> bool:
+        return self._is_monthly_stock_manager_role() or self._is_monthly_stock_viewer_role()
 
     def _build_sidebar(self) -> QFrame:
+        if self.monthly_stock_only_mode:
+            return self._build_monthly_stock_only_sidebar()
+
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
         sidebar.setFixedWidth(320)
@@ -269,36 +316,78 @@ class MainWindow(QMainWindow):
         layout.addSpacing(8)
 
         self._add_caption(layout, "Dashboard")
-        self._add_nav_button(layout, "▦   Executive Dashboard", self.DASHBOARD_INDEX)
+        self._add_nav_button(layout, "Executive Dashboard", self.DASHBOARD_INDEX)
 
         layout.addSpacing(8)
 
         self._add_caption(layout, "Operations")
-        self._add_nav_button(layout, "+   Customer / Shipment Demand", self.ORDER_ENTRY_INDEX)
-        self._add_nav_button(layout, "▣   Daily Oven Schedule", self.SCHEDULE_INDEX)
-        self._add_nav_button(layout, "↳   Shipment Management", self.SHIPMENT_DETAILS_INDEX)
+        self._add_nav_button(layout, "Customer / Shipment Demand", self.ORDER_ENTRY_INDEX)
+        self._add_nav_button(layout, "Daily Oven Schedule", self.SCHEDULE_INDEX)
+        self._add_nav_button(layout, "Shipment Management", self.SHIPMENT_DETAILS_INDEX)
 
         layout.addSpacing(8)
 
         self._add_caption(layout, "MPPS Planning")
-        self._add_nav_button(layout, "▤   Stock Planning", self.STOCK_PLANNING_INDEX)
-        self._add_nav_button(layout, "↳   MPPS Stock Overview", self.TIRE_STOCK_INDEX)
-        self._add_nav_button(layout, "▥   Manager Output Center", self.MANAGER_OUTPUT_INDEX)
+        self._add_nav_button(layout, "Stock Planning", self.STOCK_PLANNING_INDEX)
+        self._add_nav_button(layout, "MPPS Stock Overview", self.TIRE_STOCK_INDEX)
+        self._add_nav_button(layout, "Monthly Stock Count", self.MONTHLY_STOCK_COUNT_INDEX)
+        self._add_nav_button(layout, "Manager Output Center", self.MANAGER_OUTPUT_INDEX)
 
         layout.addSpacing(8)
 
         self._add_caption(layout, "Factory Data Center")
-        self._add_nav_button(layout, "▧   Master Data Center", self.FACTORY_DATA_CENTER_INDEX)
+        self._add_nav_button(layout, "Master Data Center", self.FACTORY_DATA_CENTER_INDEX)
 
         layout.addSpacing(8)
 
         self._add_caption(layout, "Admin")
-        self._add_nav_button(layout, "⚙   Admin Control Center", self.ADMIN_CONTROL_INDEX)
+        self._add_nav_button(layout, "Admin Control Center", self.ADMIN_CONTROL_INDEX)
 
         layout.addStretch()
 
         layout.addWidget(self._build_user_box())
         layout.addWidget(self._build_connection_badge())
+
+        return sidebar
+
+    def _build_monthly_stock_only_sidebar(self) -> QFrame:
+        sidebar = QFrame()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(320)
+
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(20, 16, 20, 18)
+        layout.setSpacing(10)
+
+        brand = QLabel("MPPS Factory\nPlanner")
+        brand.setObjectName("BrandTitle")
+        brand.setWordWrap(True)
+        brand.setMinimumHeight(72)
+        brand.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+        subtitle = QLabel("Monthly Stock Count")
+        subtitle.setObjectName("BrandSubtitle")
+        subtitle.setWordWrap(True)
+        subtitle.setMinimumHeight(34)
+
+        layout.addWidget(brand)
+        layout.addWidget(subtitle)
+
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.HLine)
+        divider.setStyleSheet("background:#1e293b; max-height:1px;")
+
+        layout.addSpacing(10)
+        layout.addWidget(divider)
+        layout.addSpacing(8)
+
+        self._add_nav_button(layout, "Monthly Stock Count", self.MONTHLY_STOCK_COUNT_INDEX)
+
+        layout.addStretch()
+
+        if not self.monthly_stock_viewer_mode:
+            layout.addWidget(self._build_user_box())
+            layout.addWidget(self._build_connection_badge())
 
         return sidebar
 
@@ -312,27 +401,41 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
 
+        if self.monthly_stock_only_mode:
+            self.monthly_stock_count_page = MonthlyStockCountPage(self.current_user)
+            self.stack.addWidget(self._wrap_scroll(self.monthly_stock_count_page))
+            layout.addWidget(self.stack)
+            return content
+
         self.dashboard_page = self._create_dashboard_page()
         self.order_entry_page = OrderEntryPage(self.current_user)
         self.schedule_page = SchedulePage(self.current_user)
+
         self.stock_planning_page = StockPlanningPage(
             open_item_detail_callback=self.open_stock_item_detail
         )
+
         self.shipment_details_page = ShipmentDetailsPage()
+
         self.tire_details_page = PlaceholderPage(
             "Archived Legacy Module",
             "This archived module is not part of the current MPPS workflow.",
         )
+
         self.tire_stock_page = TireStockPage()
+
         self.factory_data_center_page = create_factory_data_center_page(
             open_callback=self.open_module_action
         )
+
         self.manager_output_page = create_manager_output_page(
             open_callback=self.open_module_action
         )
+
         self.admin_control_page = create_admin_control_page(
             open_callback=self.open_module_action
         )
+
         self.product_master_page = ProductMasterPage()
         self.stock_master_page = StockMasterPage()
         self.bom_master_page = BomMasterPage()
@@ -343,6 +446,7 @@ class MainWindow(QMainWindow):
             "Archived Legacy Module",
             "This archived module is not part of the current MPPS workflow.",
         )
+
         self.band_master_page = self._safe_create_page(BandMasterPage)
         self.capacity_master_page = self._safe_create_page(CapacityMasterPage)
         self.oven_master_page = self._safe_create_page(OvenMasterPage)
@@ -354,6 +458,8 @@ class MainWindow(QMainWindow):
         self.users_roles_page = self._safe_create_page(UsersRolesPage)
         self.backup_restore_page = self._safe_create_page(BackupRestorePage)
         self.audit_log_page = self._safe_create_page(AuditLogPage)
+
+        self.monthly_stock_count_page = MonthlyStockCountPage(self.current_user)
 
         self.placeholder_page = PlaceholderPage(
             "Module",
@@ -387,6 +493,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._wrap_scroll(self.users_roles_page))
         self.stack.addWidget(self._wrap_scroll(self.backup_restore_page))
         self.stack.addWidget(self._wrap_scroll(self.audit_log_page))
+        self.stack.addWidget(self._wrap_scroll(self.monthly_stock_count_page))
         self.stack.addWidget(self._wrap_scroll(self.placeholder_page))
 
         layout.addWidget(self.stack)
@@ -466,12 +573,38 @@ class MainWindow(QMainWindow):
         return badge
 
     def navigate(self, index: int) -> None:
+        if self.monthly_stock_only_mode:
+            self.stack.setCurrentIndex(0)
+
+            for button in self.nav_buttons:
+                button.setChecked(True)
+
+            self._refresh_monthly_stock_only_page()
+            return
+
         self.stack.setCurrentIndex(index)
 
         for button_position, button in enumerate(self.nav_buttons):
             button.setChecked(button_position == self._nav_position_from_index(index))
 
         self._refresh_page(index)
+
+    def _refresh_monthly_stock_only_page(self) -> None:
+        page = getattr(self, "monthly_stock_count_page", None)
+
+        if page is None:
+            return
+
+        for method_name in ("refresh", "refresh_page", "load_data"):
+            method = getattr(page, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except TypeError:
+                    pass
+                except Exception as exc:
+                    QMessageBox.warning(self, "Refresh Warning", str(exc))
+                break
 
     def _nav_position_from_index(self, index: int) -> int:
         nav_map = {
@@ -481,9 +614,10 @@ class MainWindow(QMainWindow):
             self.SHIPMENT_DETAILS_INDEX: 3,
             self.STOCK_PLANNING_INDEX: 4,
             self.TIRE_STOCK_INDEX: 5,
-            self.MANAGER_OUTPUT_INDEX: 6,
-            self.FACTORY_DATA_CENTER_INDEX: 7,
-            self.ADMIN_CONTROL_INDEX: 8,
+            self.MONTHLY_STOCK_COUNT_INDEX: 6,
+            self.MANAGER_OUTPUT_INDEX: 7,
+            self.FACTORY_DATA_CENTER_INDEX: 8,
+            self.ADMIN_CONTROL_INDEX: 9,
         }
 
         return nav_map.get(index, -1)
@@ -512,6 +646,7 @@ class MainWindow(QMainWindow):
             self.USERS_ROLES_INDEX: self.users_roles_page,
             self.BACKUP_RESTORE_INDEX: self.backup_restore_page,
             self.AUDIT_LOG_INDEX: self.audit_log_page,
+            self.MONTHLY_STOCK_COUNT_INDEX: self.monthly_stock_count_page,
         }
 
         page = page_by_index.get(index)
@@ -536,7 +671,14 @@ class MainWindow(QMainWindow):
     def open_stock_planning_page(self) -> None:
         self.navigate(self.STOCK_PLANNING_INDEX)
 
+    def open_monthly_stock_count_page(self) -> None:
+        self.navigate(self.MONTHLY_STOCK_COUNT_INDEX)
+
     def open_stock_item_detail(self, material_code: str) -> None:
+        if self.monthly_stock_only_mode:
+            self.navigate(self.MONTHLY_STOCK_COUNT_INDEX)
+            return
+
         title = f"Stock Item Detail: {material_code}"
         subtitle = (
             "Detailed BOM, compound, bead, band and capacity analysis for this item "
@@ -546,33 +688,18 @@ class MainWindow(QMainWindow):
         self.show_placeholder(title, subtitle)
 
     def open_module_action(self, action_key: str) -> None:
+        if self.monthly_stock_only_mode:
+            self.navigate(self.MONTHLY_STOCK_COUNT_INDEX)
+            return
+
         action_map = {
             "stock_planning": (self.STOCK_PLANNING_INDEX, None, None),
-            "product_master": (
-                self.PRODUCT_MASTER_INDEX,
-                None,
-                None,
-            ),
-            "stock_master": (
-                self.STOCK_MASTER_INDEX,
-                None,
-                None,
-            ),
-            "bom_master": (
-                self.BOM_MASTER_INDEX,
-                None,
-                None,
-            ),
-            "compound_master": (
-                self.COMPOUND_MASTER_INDEX,
-                None,
-                None,
-            ),
-            "bead_master": (
-                self.BEAD_MASTER_INDEX,
-                None,
-                None,
-            ),
+            "monthly_stock_count": (self.MONTHLY_STOCK_COUNT_INDEX, None, None),
+            "product_master": (self.PRODUCT_MASTER_INDEX, None, None),
+            "stock_master": (self.STOCK_MASTER_INDEX, None, None),
+            "bom_master": (self.BOM_MASTER_INDEX, None, None),
+            "compound_master": (self.COMPOUND_MASTER_INDEX, None, None),
+            "bead_master": (self.BEAD_MASTER_INDEX, None, None),
             "band_master": (self.BAND_MASTER_INDEX, None, None),
             "capacity_master": (self.CAPACITY_MASTER_INDEX, None, None),
             "oven_master": (self.OVEN_MASTER_INDEX, None, None),
@@ -604,6 +731,10 @@ class MainWindow(QMainWindow):
         self.show_placeholder(title or "Module", subtitle or "This module will be connected soon.")
 
     def show_placeholder(self, title: str, subtitle: str) -> None:
+        if self.monthly_stock_only_mode:
+            self.navigate(self.MONTHLY_STOCK_COUNT_INDEX)
+            return
+
         self.placeholder_page = PlaceholderPage(title, subtitle)
 
         old_widget = self.stack.widget(self.PLACEHOLDER_INDEX)
