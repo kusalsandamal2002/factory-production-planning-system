@@ -37,6 +37,7 @@ from app.ui.schedule_page import SchedulePage
 from app.ui.stock_master_page import StockMasterPage
 from app.ui.stock_planning_page import StockPlanningPage
 from app.ui.tire_stock_page import TireStockPage
+from app.ui.tyre_product_tree_page import TyreProductTreePage
 
 
 def _resolve_page_class(module_path: str, candidates: list[str]):
@@ -507,11 +508,7 @@ class MainWindow(QMainWindow):
             "Module",
             "This module will be connected in the next step.",
         )
-
-        self.tyre_product_tree_page = PlaceholderPage(
-            "Tyre Product Tree Master",
-            "Manage Resilient, Press-On and Cured-On tyre category rules, grades, layers, speed types and colours.",
-        )
+        self.tyre_product_tree_page = TyreProductTreePage()
 
         self.mold_master_v2_page = PlaceholderPage(
             "Mold Master",
