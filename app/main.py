@@ -34,7 +34,7 @@ def main() -> int:
         return 0
 
     window = MainWindow(login.current_user)
-    window.show()
+    window.showMaximized()
     return app.exec()
 
 
