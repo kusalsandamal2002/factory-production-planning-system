@@ -25,3 +25,9 @@ backups/code_backups/local_snapshots/
 Thumbs.db
 
 .vscode/
+
+# Local Python environment
+.venv/
+
+# Local V2 backup snapshots
+backups/v2_local_snapshots/
