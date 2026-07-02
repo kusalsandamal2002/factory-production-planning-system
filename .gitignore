@@ -31,3 +31,6 @@ Thumbs.db
 
 # Local V2 backup snapshots
 backups/v2_local_snapshots/
+
+backups/db/
+data/local_master/

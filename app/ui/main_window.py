@@ -1,4 +1,7 @@
 from __future__ import annotations
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtWidgets import QApplication
+
 
 from importlib import import_module
 
@@ -33,11 +36,14 @@ from app.ui.module_hub_page import (
 from app.ui.monthly_stock_count_page import MonthlyStockCountPage
 from app.ui.order_entry_page import OrderEntryPage
 from app.ui.product_master_page import ProductMasterPage
+from app.ui.production_line_master_page import ProductionLineMasterPage
 from app.ui.schedule_page import SchedulePage
 from app.ui.stock_master_page import StockMasterPage
 from app.ui.stock_planning_page import StockPlanningPage
 from app.ui.tire_stock_page import TireStockPage
 from app.ui.tyre_product_tree_page import TyreProductTreePage
+from app.ui.master_data_hub_page import MasterDataHubPage
+from app.ui.factory_capacity_page import FactoryCapacityPage
 
 
 def _resolve_page_class(module_path: str, candidates: list[str]):
@@ -224,11 +230,20 @@ class MainWindow(QMainWindow):
     SHIFT_PLAN_INDEX = 34
     REPORTS_INDEX = 35
 
+    FACTORY_CAPACITY_INDEX = 36
     MONTHLY_STOCK_MANAGER_ROLE = "Monthly Stock Manager"
     MONTHLY_STOCK_VIEWER_ROLE = "Monthly Stock Viewer"
 
     def __init__(self, current_user: User):
         super().__init__()
+        self._navigation_history: list[int] = []
+        self._navigation_back_in_progress = False
+        self._last_stack_index = -1
+
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
 
         self.current_user = current_user
         self.monthly_stock_only_mode = self._is_monthly_stock_only_role()
@@ -241,15 +256,15 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1250, 760)
         self.setStyleSheet(self.styleSheet() + """
             QLabel#BrandTitle {
-                font-size: 16pt;
+                color: #ffffff;
+                font-size: 13pt;
                 font-weight: 950;
-                line-height: 1.1;
             }
 
             QLabel#BrandSubtitle {
-                font-size: 8pt;
-                font-weight: 650;
-                color: #cbd5e1;
+                color: #9fb0c7;
+                font-size: 7.4pt;
+                font-weight: 750;
             }
 
             QPushButton#NavButton {
@@ -265,7 +280,24 @@ class MainWindow(QMainWindow):
                 font-size: 7.5pt;
                 letter-spacing: 1px;
             }
-        """)
+        
+            QLabel#SidebarUserRole {
+                color: #e5eefb;
+                font-size: 8.2pt;
+                font-weight: 900;
+                padding: 4px 8px 0px 8px;
+            }
+
+            QLabel#SidebarDbStatus {
+                color: #38bdf8;
+                background: #082f49;
+                border: 1px solid #075985;
+                border-radius: 9px;
+                padding: 6px 8px;
+                font-size: 7.8pt;
+                font-weight: 900;
+            }
+""")
 
 
         shell = QFrame()
@@ -324,11 +356,11 @@ class MainWindow(QMainWindow):
 
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(340)
+        sidebar.setFixedWidth(220)
 
         layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(20, 16, 20, 18)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 14, 12, 10)
+        layout.setSpacing(4)
 
         brand = QLabel("Factory Production\nPlanner")
         brand.setObjectName("BrandTitle")
@@ -358,19 +390,12 @@ class MainWindow(QMainWindow):
         layout.addSpacing(8)
 
         self._add_caption(layout, "Orders")
-        self._add_nav_button(layout, "Customer Orders", self.ORDER_ENTRY_INDEX)
+        self._add_nav_button(layout, "Shipment Orders", self.ORDER_ENTRY_INDEX)
 
         layout.addSpacing(8)
 
-        self._add_caption(layout, "Master Data")
-        self._add_nav_button(layout, "Tyre Item Master", self.PRODUCT_MASTER_INDEX)
-        self._add_nav_button(layout, "Tyre Product Tree", self.TYRE_PRODUCT_TREE_INDEX)
-        self._add_nav_button(layout, "Production Lines", self.OVEN_MASTER_INDEX)
-        self._add_nav_button(layout, "Mold Master", self.MOLD_MASTER_V2_INDEX)
-        self._add_nav_button(layout, "Casing Master", self.CASING_MASTER_V2_INDEX)
-        self._add_nav_button(layout, "Capacity / Time Master", self.CAPACITY_MASTER_INDEX)
-
-        layout.addSpacing(8)
+        self._add_caption(layout, "Data")
+        self._add_nav_button(layout, "Master Data", self.TYRE_PRODUCT_TREE_INDEX)
 
         self._add_caption(layout, "Planning")
         self._add_nav_button(layout, "Production Planning", self.SCHEDULE_INDEX)
@@ -396,7 +421,7 @@ class MainWindow(QMainWindow):
     def _build_monthly_stock_only_sidebar(self) -> QFrame:
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(340)
+        sidebar.setFixedWidth(220)
 
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(20, 16, 20, 18)
@@ -443,6 +468,8 @@ class MainWindow(QMainWindow):
         layout.setSpacing(0)
 
         self.stack = QStackedWidget()
+        self._last_stack_index = self.stack.currentIndex()
+        self.stack.currentChanged.connect(self._on_stack_changed)
 
         if self.monthly_stock_only_mode:
             self.monthly_stock_count_page = MonthlyStockCountPage(self.current_user)
@@ -492,7 +519,7 @@ class MainWindow(QMainWindow):
 
         self.band_master_page = self._safe_create_page(BandMasterPage)
         self.capacity_master_page = self._safe_create_page(CapacityMasterPage)
-        self.oven_master_page = self._safe_create_page(OvenMasterPage)
+        self.oven_master_page = ProductionLineMasterPage()
         self.material_requirement_page = self._safe_create_page(MaterialRequirementPage)
         self.capacity_analysis_page = self._safe_create_page(CapacityAnalysisPage)
         self.shipment_risk_page = self._safe_create_page(ShipmentRiskPage)
@@ -508,7 +535,25 @@ class MainWindow(QMainWindow):
             "Module",
             "This module will be connected in the next step.",
         )
-        self.tyre_product_tree_page = TyreProductTreePage()
+        self.tyre_product_tree_page = MasterDataHubPage(
+            on_open_page=lambda index: self.navigate(index),
+            page_indexes={
+                "Factory Capacity": self.FACTORY_CAPACITY_INDEX,
+                "Tyre Item Master": self.PRODUCT_MASTER_INDEX,
+                "Legacy Excel Import": self.RAW_EXCEL_VIEWER_INDEX,
+            },
+        )
+
+        self.factory_capacity_page = FactoryCapacityPage(
+            on_open_page=lambda index: self.navigate(index),
+            on_back=lambda: self.navigate(self.TYRE_PRODUCT_TREE_INDEX),
+            page_indexes={
+                "Production Lines": self.OVEN_MASTER_INDEX,
+                "Mold Master": self.MOLD_MASTER_V2_INDEX,
+                "Casing Master": self.CASING_MASTER_V2_INDEX,
+                "Capacity / Time Master": self.CAPACITY_MASTER_INDEX,
+            },
+        )
 
         self.mold_master_v2_page = PlaceholderPage(
             "Mold Master",
@@ -576,6 +621,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._wrap_scroll(self.daily_plan_page))
         self.stack.addWidget(self._wrap_scroll(self.shift_plan_page))
         self.stack.addWidget(self._wrap_scroll(self.reports_page))
+        self.stack.addWidget(self._wrap_scroll(self.factory_capacity_page))
 
         layout.addWidget(self.stack)
 
@@ -604,23 +650,64 @@ class MainWindow(QMainWindow):
         scroll.setWidget(widget)
         return scroll
 
-    def _add_caption(self, layout: QVBoxLayout, text: str) -> None:
+    def _add_caption(self, layout, text):
         caption = QLabel(text.upper())
         caption.setObjectName("SidebarCaption")
+        caption.setFixedHeight(24)
+        caption.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        caption.setStyleSheet("""
+            QLabel#SidebarCaption {
+                color: #8ea0ba;
+                background: transparent;
+                font-size: 7.5pt;
+                font-weight: 900;
+                padding-left: 8px;
+                padding-top: 2px;
+                padding-bottom: 2px;
+            }
+        """)
         layout.addWidget(caption)
+        return caption
 
-    def _add_nav_button(self, layout: QVBoxLayout, text: str, index: int) -> QPushButton:
+
+    def _add_nav_button(self, layout, text, index):
         button = QPushButton(text)
-        button.setObjectName("NavButton")
-        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setObjectName("SidebarNavButton")
         button.setCheckable(True)
-        button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        button.setFixedHeight(34)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setStyleSheet("""
+            QPushButton#SidebarNavButton {
+                background: transparent;
+                color: #e5eefb;
+                border: none;
+                border-radius: 9px;
+                padding: 7px 10px;
+                text-align: left;
+                font-size: 8.5pt;
+                font-weight: 800;
+            }
+
+            QPushButton#SidebarNavButton:hover {
+                background: #172235;
+                color: #ffffff;
+            }
+
+            QPushButton#SidebarNavButton:checked {
+                background: #2563eb;
+                color: #ffffff;
+                font-weight: 950;
+            }
+        """)
+
+        if not hasattr(self, "nav_buttons_by_index"):
+            self.nav_buttons_by_index = {}
+
+        self.nav_buttons_by_index.setdefault(index, []).append(button)
         button.clicked.connect(lambda checked=False, page_index=index: self.navigate(page_index))
-
-        self.nav_buttons.append(button)
         layout.addWidget(button)
-
         return button
+
 
     def _build_user_box(self) -> QFrame:
         box = QFrame()
@@ -649,11 +736,127 @@ class MainWindow(QMainWindow):
 
     def _build_connection_badge(self) -> QLabel:
         badge = QLabel("PostgreSQL Connected")
+        badge.setObjectName("SidebarDbStatus")
         badge.setObjectName("ConnectionBadge")
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         return badge
 
+
+
+    def _on_stack_changed(self, index: int) -> None:
+        if not hasattr(self, "_navigation_history"):
+            self._navigation_history = []
+
+        previous_index = getattr(self, "_last_stack_index", -1)
+
+        if getattr(self, "_navigation_back_in_progress", False):
+            self._last_stack_index = index
+            return
+
+        if previous_index >= 0 and previous_index != index:
+            if not self._navigation_history or self._navigation_history[-1] != previous_index:
+                self._navigation_history.append(previous_index)
+                self._navigation_history = self._navigation_history[-50:]
+
+        self._last_stack_index = index
+
+    def go_back(self) -> bool:
+        if not hasattr(self, "stack"):
+            return False
+
+        if not getattr(self, "_navigation_history", []):
+            return False
+
+        current_index = self.stack.currentIndex()
+
+        while self._navigation_history:
+            target_index = self._navigation_history.pop()
+
+            if target_index != current_index:
+                self._navigation_back_in_progress = True
+                try:
+                    self.navigate(target_index)
+                finally:
+                    self._navigation_back_in_progress = False
+
+                return True
+
+        return False
+
+    def _is_editing_text_input(self) -> bool:
+        app = QApplication.instance()
+        if app is None:
+            return False
+
+        widget = app.focusWidget()
+
+        editable_widget_names = {
+            "QLineEdit",
+            "QTextEdit",
+            "QPlainTextEdit",
+            "QSpinBox",
+            "QDoubleSpinBox",
+            "QDateEdit",
+            "QDateTimeEdit",
+            "QTimeEdit",
+            "QComboBox",
+            "QCalendarWidget",
+        }
+
+        while widget is not None:
+            class_name = widget.metaObject().className()
+
+            if class_name in editable_widget_names:
+                return True
+
+            widget = widget.parentWidget()
+
+        return False
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            modifiers = event.modifiers()
+
+            is_backspace = key == Qt.Key.Key_Backspace
+            is_alt_left = key == Qt.Key.Key_Left and bool(modifiers & Qt.KeyboardModifier.AltModifier)
+
+            if is_backspace or is_alt_left:
+                if not self._is_editing_text_input():
+                    if self.go_back():
+                        return True
+
+        return super().eventFilter(obj, event)
+
+
+    def _sync_sidebar_selection(self, index):
+        effective_index = index
+
+        data_parent_index = getattr(self, "TYRE_PRODUCT_TREE_INDEX", None)
+        data_child_indexes = {
+            getattr(self, "TYRE_PRODUCT_TREE_INDEX", None),
+            getattr(self, "FACTORY_CAPACITY_INDEX", None),
+            getattr(self, "PRODUCT_MASTER_INDEX", None),
+            getattr(self, "OVEN_MASTER_INDEX", None),
+            getattr(self, "MOLD_MASTER_V2_INDEX", None),
+            getattr(self, "CASING_MASTER_V2_INDEX", None),
+            getattr(self, "CAPACITY_MASTER_INDEX", None),
+            getattr(self, "RAW_EXCEL_VIEWER_INDEX", None),
+        }
+        data_child_indexes.discard(None)
+
+        if data_parent_index is not None and index in data_child_indexes:
+            effective_index = data_parent_index
+
+        for page_index, buttons in getattr(self, "nav_buttons_by_index", {}).items():
+            for button in buttons:
+                button.blockSignals(True)
+                button.setChecked(page_index == effective_index)
+                button.blockSignals(False)
+
+
     def navigate(self, index: int) -> None:
+        self._sync_sidebar_selection(index)
         if self.monthly_stock_only_mode:
             self.stack.setCurrentIndex(0)
 
