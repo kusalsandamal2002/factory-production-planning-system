@@ -215,6 +215,14 @@ class MainWindow(QMainWindow):
     MONTHLY_STOCK_COUNT_INDEX = 27
     PLACEHOLDER_INDEX = 28
 
+    TYRE_PRODUCT_TREE_INDEX = 29
+    MOLD_MASTER_V2_INDEX = 30
+    CASING_MASTER_V2_INDEX = 31
+    DELIVERY_DATE_INDEX = 32
+    DAILY_PLAN_INDEX = 33
+    SHIFT_PLAN_INDEX = 34
+    REPORTS_INDEX = 35
+
     MONTHLY_STOCK_MANAGER_ROLE = "Monthly Stock Manager"
     MONTHLY_STOCK_VIEWER_ROLE = "Monthly Stock Viewer"
 
@@ -230,6 +238,34 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(settings.app_name)
         self.resize(1600, 920)
         self.setMinimumSize(1250, 760)
+        self.setStyleSheet(self.styleSheet() + """
+            QLabel#BrandTitle {
+                font-size: 16pt;
+                font-weight: 950;
+                line-height: 1.1;
+            }
+
+            QLabel#BrandSubtitle {
+                font-size: 8pt;
+                font-weight: 650;
+                color: #cbd5e1;
+            }
+
+            QPushButton#NavButton {
+                min-height: 34px;
+                padding: 7px 12px;
+                text-align: left;
+                font-size: 9pt;
+            }
+
+            QLabel#SidebarCaption {
+                margin-top: 8px;
+                margin-bottom: 4px;
+                font-size: 7.5pt;
+                letter-spacing: 1px;
+            }
+        """)
+
 
         shell = QFrame()
         shell.setObjectName("AppShell")
@@ -287,19 +323,19 @@ class MainWindow(QMainWindow):
 
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(320)
+        sidebar.setFixedWidth(340)
 
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(20, 16, 20, 18)
         layout.setSpacing(10)
 
-        brand = QLabel("MPPS Factory\nPlanner")
+        brand = QLabel("Factory Production\nPlanner")
         brand.setObjectName("BrandTitle")
-        brand.setWordWrap(True)
-        brand.setMinimumHeight(72)
+        brand.setWordWrap(False)
+        brand.setMinimumHeight(42)
         brand.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-        subtitle = QLabel("Excel-Derived Stock, Material and Quantity Planning")
+        subtitle = QLabel("Industrial Tyre Production Planning")
         subtitle.setObjectName("BrandSubtitle")
         subtitle.setWordWrap(True)
         subtitle.setMinimumHeight(34)
@@ -316,32 +352,38 @@ class MainWindow(QMainWindow):
         layout.addSpacing(8)
 
         self._add_caption(layout, "Dashboard")
-        self._add_nav_button(layout, "Executive Dashboard", self.DASHBOARD_INDEX)
+        self._add_nav_button(layout, "Dashboard", self.DASHBOARD_INDEX)
 
         layout.addSpacing(8)
 
-        self._add_caption(layout, "Operations")
-        self._add_nav_button(layout, "Customer / Shipment Demand", self.ORDER_ENTRY_INDEX)
-        self._add_nav_button(layout, "Daily Oven Schedule", self.SCHEDULE_INDEX)
-        self._add_nav_button(layout, "Shipment Management", self.SHIPMENT_DETAILS_INDEX)
+        self._add_caption(layout, "Orders")
+        self._add_nav_button(layout, "Customer Orders", self.ORDER_ENTRY_INDEX)
 
         layout.addSpacing(8)
 
-        self._add_caption(layout, "MPPS Planning")
-        self._add_nav_button(layout, "Stock Planning", self.STOCK_PLANNING_INDEX)
-        self._add_nav_button(layout, "MPPS Stock Overview", self.TIRE_STOCK_INDEX)
-        self._add_nav_button(layout, "Monthly Stock Count", self.MONTHLY_STOCK_COUNT_INDEX)
-        self._add_nav_button(layout, "Manager Output Center", self.MANAGER_OUTPUT_INDEX)
+        self._add_caption(layout, "Master Data")
+        self._add_nav_button(layout, "Tyre Item Master", self.PRODUCT_MASTER_INDEX)
+        self._add_nav_button(layout, "Tyre Product Tree", self.TYRE_PRODUCT_TREE_INDEX)
+        self._add_nav_button(layout, "Production Lines", self.OVEN_MASTER_INDEX)
+        self._add_nav_button(layout, "Mold Master", self.MOLD_MASTER_V2_INDEX)
+        self._add_nav_button(layout, "Casing Master", self.CASING_MASTER_V2_INDEX)
+        self._add_nav_button(layout, "Capacity / Time Master", self.CAPACITY_MASTER_INDEX)
 
         layout.addSpacing(8)
 
-        self._add_caption(layout, "Factory Data Center")
-        self._add_nav_button(layout, "Master Data Center", self.FACTORY_DATA_CENTER_INDEX)
+        self._add_caption(layout, "Planning")
+        self._add_nav_button(layout, "Production Planning", self.SCHEDULE_INDEX)
+        self._add_nav_button(layout, "Delivery Date Calculation", self.DELIVERY_DATE_INDEX)
+        self._add_nav_button(layout, "Daily Plan", self.DAILY_PLAN_INDEX)
+        self._add_nav_button(layout, "Shift Plan", self.SHIFT_PLAN_INDEX)
+        self._add_nav_button(layout, "Material Requirement", self.MATERIAL_REQUIREMENT_INDEX)
 
         layout.addSpacing(8)
 
-        self._add_caption(layout, "Admin")
-        self._add_nav_button(layout, "Admin Control Center", self.ADMIN_CONTROL_INDEX)
+        self._add_caption(layout, "Reports & Admin")
+        self._add_nav_button(layout, "Reports", self.REPORTS_INDEX)
+        self._add_nav_button(layout, "Admin Settings", self.ADMIN_CONTROL_INDEX)
+        self._add_nav_button(layout, "Legacy Excel Import", self.RAW_EXCEL_VIEWER_INDEX)
 
         layout.addStretch()
 
@@ -353,16 +395,16 @@ class MainWindow(QMainWindow):
     def _build_monthly_stock_only_sidebar(self) -> QFrame:
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(320)
+        sidebar.setFixedWidth(340)
 
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(20, 16, 20, 18)
         layout.setSpacing(10)
 
-        brand = QLabel("MPPS Factory\nPlanner")
+        brand = QLabel("Factory Production\nPlanner")
         brand.setObjectName("BrandTitle")
-        brand.setWordWrap(True)
-        brand.setMinimumHeight(72)
+        brand.setWordWrap(False)
+        brand.setMinimumHeight(42)
         brand.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
         subtitle = QLabel("Monthly Stock Count")
@@ -466,6 +508,41 @@ class MainWindow(QMainWindow):
             "This module will be connected in the next step.",
         )
 
+        self.tyre_product_tree_page = PlaceholderPage(
+            "Tyre Product Tree Master",
+            "Manage Resilient, Press-On and Cured-On tyre category rules, grades, layers, speed types and colours.",
+        )
+
+        self.mold_master_v2_page = PlaceholderPage(
+            "Mold Master",
+            "Manage molds by production line, tyre item, availability and production compatibility.",
+        )
+
+        self.casing_master_v2_page = PlaceholderPage(
+            "Casing Master",
+            "Manage casing types and available casing counts for 400T and 800T production lines.",
+        )
+
+        self.delivery_date_page = PlaceholderPage(
+            "Delivery Date Calculation",
+            "Calculate realistic customer delivery dates using stock, production line, mold, casing, cavity and schedule availability.",
+        )
+
+        self.daily_plan_page = PlaceholderPage(
+            "Daily Production Plan",
+            "Generate and manage day-wise production plans from confirmed customer orders.",
+        )
+
+        self.shift_plan_page = PlaceholderPage(
+            "Day / Night Shift Plan",
+            "Split production plan into day shift and night shift targets with line-wise allocation.",
+        )
+
+        self.reports_page = PlaceholderPage(
+            "Reports",
+            "View production, planning, delivery commitment, line load, mold utilization and material requirement reports.",
+        )
+
         self.stack.addWidget(self._wrap_scroll(self.dashboard_page))
         self.stack.addWidget(self._wrap_scroll(self.order_entry_page))
         self.stack.addWidget(self._wrap_scroll(self.schedule_page))
@@ -495,6 +572,13 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._wrap_scroll(self.audit_log_page))
         self.stack.addWidget(self._wrap_scroll(self.monthly_stock_count_page))
         self.stack.addWidget(self._wrap_scroll(self.placeholder_page))
+        self.stack.addWidget(self._wrap_scroll(self.tyre_product_tree_page))
+        self.stack.addWidget(self._wrap_scroll(self.mold_master_v2_page))
+        self.stack.addWidget(self._wrap_scroll(self.casing_master_v2_page))
+        self.stack.addWidget(self._wrap_scroll(self.delivery_date_page))
+        self.stack.addWidget(self._wrap_scroll(self.daily_plan_page))
+        self.stack.addWidget(self._wrap_scroll(self.shift_plan_page))
+        self.stack.addWidget(self._wrap_scroll(self.reports_page))
 
         layout.addWidget(self.stack)
 
