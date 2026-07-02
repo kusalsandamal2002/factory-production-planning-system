@@ -53,7 +53,7 @@ class MetricCard(QFrame):
         self.hint_widget = QLabel(hint)
         self.hint_widget.setObjectName("MetricHint")
         self.hint_widget.setWordWrap(True)
-        self.open_button = QPushButton("Open details")
+        self.open_button = QPushButton("View details")
         self.open_button.setObjectName("SoftButton")
         self.open_button.setEnabled(on_click is not None)
         if on_click is not None:
@@ -122,27 +122,27 @@ class DashboardPage(QWidget):
         grid.setSpacing(12)
         cards = [
             (
-                "Active Shipment Demands",
+                "Customer Orders",
                 "active_demands",
-                "MPPS demand rows currently included in planning",
+                "Orders currently included in production planning",
                 shipment_callback,
             ),
             (
-                "Production Required Items",
+                "Production Orders",
                 "required_items",
-                "Materials with a stock shortage for the selected date",
+                "Items requiring production after stock verification",
                 planning_callback,
             ),
             (
-                "Production Required Qty",
+                "Required Production Qty",
                 "required_qty",
-                "Total quantity required after available stock",
+                "Total quantity to be produced after stock check",
                 planning_callback,
             ),
             (
-                "Planning Warnings",
+                "Planning Alerts",
                 "warnings",
-                "Missing due date, weight, capacity, or compatibility warnings",
+                "Orders or items needing planning attention",
                 planning_callback,
             ),
         ]
@@ -171,12 +171,9 @@ class DashboardPage(QWidget):
         layout.setContentsMargins(18, 16, 18, 18)
         layout.setSpacing(10)
 
-        title = QLabel("Selected Date Quantity Plan")
+        title = QLabel("Daily Production Plan")
         title.setObjectName("CardTitle")
-        hint = QLabel(
-            "Excel-derived production requirement, mould/category capacity, "
-            "and active historical oven compatibility."
-        )
+        hint = QLabel("Order-based daily production plan using line, mold, casing, cavity and capacity data.")
         hint.setObjectName("SectionHint")
         hint.setWordWrap(True)
         self.summary_date_label = QLabel("-")
@@ -189,11 +186,11 @@ class DashboardPage(QWidget):
         layout.addWidget(self.summary_date_label)
         layout.addWidget(self.summary_status_label)
 
-        self.planned_qty_row = SummaryRow("Selected Date Planned Qty", "0")
-        self.quantity_capacity_row = SummaryRow("Quantity Capacity", "0")
+        self.planned_qty_row = SummaryRow("Planned Qty", "0")
+        self.quantity_capacity_row = SummaryRow("Available Production Capacity", "0")
         self.capacity_usage_row = SummaryRow("Capacity Usage", "0%")
-        self.active_ovens_row = SummaryRow("Active Ovens", "0")
-        self.plan_status_row = SummaryRow("Quantity-Based Plan Status", "-")
+        self.active_ovens_row = SummaryRow("Active Press / Cavities", "0")
+        self.plan_status_row = SummaryRow("Plan Status", "-")
         for row in (
             self.planned_qty_row,
             self.quantity_capacity_row,
@@ -203,10 +200,7 @@ class DashboardPage(QWidget):
         ):
             layout.addWidget(row)
 
-        self.summary_note = QLabel(
-            "This dashboard uses quantity capacity. Verified cycle-time data is "
-            "not available for minute-level utilization."
-        )
+        self.summary_note = QLabel("This dashboard summarizes the current production planning position for the selected date.")
         self.summary_note.setObjectName("SectionHint")
         self.summary_note.setWordWrap(True)
         layout.addWidget(self.summary_note)
@@ -219,12 +213,9 @@ class DashboardPage(QWidget):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(18, 16, 18, 18)
         layout.setSpacing(10)
-        title = QLabel("Selected Date Quantity Capacity Usage")
+        title = QLabel("Production Capacity Usage")
         title.setObjectName("CardTitle")
-        hint = QLabel(
-            "Planned quantity compared with relevant available mould/category "
-            "capacity for materials requiring production."
-        )
+        hint = QLabel("Planned production quantity compared with available line, mold and cavity capacity.")
         hint.setObjectName("SectionHint")
         hint.setWordWrap(True)
         self.capacity_bar = QProgressBar()
