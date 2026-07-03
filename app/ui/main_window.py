@@ -44,6 +44,10 @@ from app.ui.tire_stock_page import TireStockPage
 from app.ui.tyre_product_tree_page import TyreProductTreePage
 from app.ui.master_data_hub_page import MasterDataHubPage
 from app.ui.factory_capacity_page import FactoryCapacityPage
+from app.ui.cavities_master_page import CavitiesMasterPage
+from app.ui.mold_master_page import MoldMasterPage
+from app.ui.casing_master_page import CasingMasterPage
+from app.ui.tyre_item_master_page import TyreItemMasterPage
 
 
 def _resolve_page_class(module_path: str, candidates: list[str]):
@@ -231,6 +235,8 @@ class MainWindow(QMainWindow):
     REPORTS_INDEX = 35
 
     FACTORY_CAPACITY_INDEX = 36
+
+    CAVITIES_MASTER_INDEX = 37
     MONTHLY_STOCK_MANAGER_ROLE = "Monthly Stock Manager"
     MONTHLY_STOCK_VIEWER_ROLE = "Monthly Stock Viewer"
 
@@ -355,6 +361,45 @@ class MainWindow(QMainWindow):
             return self._build_monthly_stock_only_sidebar()
 
         sidebar = QFrame()
+
+        sidebar.setObjectName("Sidebar")
+        sidebar.setStyleSheet("""
+            QFrame#Sidebar {
+                background: #0f172a;
+                border: none;
+            }
+
+            QFrame#Sidebar QLabel {
+                color: #e5edf8;
+                background: transparent;
+            }
+
+            QFrame#Sidebar QPushButton {
+                background: transparent;
+                color: #f8fafc;
+                border: none;
+                border-radius: 10px;
+                padding: 10px 12px;
+                text-align: left;
+                font-size: 9pt;
+                font-weight: 800;
+            }
+
+            QFrame#Sidebar QPushButton:hover {
+                background: #1e293b;
+                color: #ffffff;
+            }
+
+            QFrame#Sidebar QPushButton:checked {
+                background: #2563eb;
+                color: #ffffff;
+            }
+
+            QFrame#Sidebar QPushButton:disabled {
+                background: transparent;
+                color: #64748b;
+            }
+        """)
         sidebar.setObjectName("Sidebar")
         sidebar.setFixedWidth(220)
 
@@ -412,8 +457,6 @@ class MainWindow(QMainWindow):
         self._add_nav_button(layout, "Legacy Excel Import", self.RAW_EXCEL_VIEWER_INDEX)
 
         layout.addStretch()
-
-        layout.addWidget(self._build_user_box())
         layout.addWidget(self._build_connection_badge())
 
         return sidebar
@@ -454,7 +497,6 @@ class MainWindow(QMainWindow):
         layout.addStretch()
 
         if not self.monthly_stock_viewer_mode:
-            layout.addWidget(self._build_user_box())
             layout.addWidget(self._build_connection_badge())
 
         return sidebar
@@ -506,7 +548,7 @@ class MainWindow(QMainWindow):
             open_callback=self.open_module_action
         )
 
-        self.product_master_page = ProductMasterPage()
+        self.product_master_page = TyreItemMasterPage()
         self.stock_master_page = StockMasterPage()
         self.bom_master_page = BomMasterPage()
         self.compound_master_page = CompoundMasterPage()
@@ -549,21 +591,18 @@ class MainWindow(QMainWindow):
             on_back=lambda: self.navigate(self.TYRE_PRODUCT_TREE_INDEX),
             page_indexes={
                 "Production Lines": self.OVEN_MASTER_INDEX,
+                "Cavities": self.CAVITIES_MASTER_INDEX,
                 "Mold Master": self.MOLD_MASTER_V2_INDEX,
                 "Casing Master": self.CASING_MASTER_V2_INDEX,
                 "Capacity / Time Master": self.CAPACITY_MASTER_INDEX,
             },
         )
 
-        self.mold_master_v2_page = PlaceholderPage(
-            "Mold Master",
-            "Manage molds by production line, tyre item, availability and production compatibility.",
-        )
+        self.cavities_master_page = CavitiesMasterPage()
 
-        self.casing_master_v2_page = PlaceholderPage(
-            "Casing Master",
-            "Manage casing types and available casing counts for 400T and 800T production lines.",
-        )
+        self.mold_master_v2_page = MoldMasterPage()
+
+        self.casing_master_v2_page = CasingMasterPage()
 
         self.delivery_date_page = PlaceholderPage(
             "Delivery Date Calculation",
@@ -622,6 +661,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._wrap_scroll(self.shift_plan_page))
         self.stack.addWidget(self._wrap_scroll(self.reports_page))
         self.stack.addWidget(self._wrap_scroll(self.factory_capacity_page))
+        self.stack.addWidget(self._wrap_scroll(self.cavities_master_page))
 
         layout.addWidget(self.stack)
 
@@ -813,7 +853,52 @@ class MainWindow(QMainWindow):
 
         return False
 
+
+    def _handle_current_page_internal_back(self) -> bool:
+        """
+        Give the active page a chance to handle Backspace before MainWindow
+        global history navigation runs.
+        """
+        try:
+            current = self.stack.currentWidget()
+        except Exception:
+            return False
+
+        candidates = []
+
+        if current is not None:
+            candidates.append(current)
+
+            # Scroll wrapper case.
+            try:
+                wrapped = current.widget()
+                if wrapped is not None:
+                    candidates.append(wrapped)
+            except Exception:
+                pass
+
+            # Child page case.
+            try:
+                candidates.extend(current.findChildren(object))
+            except Exception:
+                pass
+
+        for candidate in candidates:
+            if hasattr(candidate, "handle_back_navigation"):
+                try:
+                    if candidate.handle_back_navigation():
+                        return True
+                except Exception:
+                    pass
+
+        return False
+
+
     def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Backspace:
+            if self._handle_current_page_internal_back():
+                return True
+
         if event.type() == QEvent.Type.KeyPress:
             key = event.key()
             modifiers = event.modifiers()

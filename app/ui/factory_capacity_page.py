@@ -119,7 +119,6 @@ class FactoryCapacityPage(QWidget):
         root.setSpacing(16)
 
         root.addWidget(self._build_header())
-        root.addLayout(self._build_metrics())
         root.addWidget(self._build_modules(), 1)
 
     def _build_header(self) -> QFrame:
@@ -140,7 +139,7 @@ class FactoryCapacityPage(QWidget):
         title.setObjectName("PageTitle")
 
         subtitle = QLabel(
-            "Manage operational capacity master data used for shipment receive date calculation, production scheduling and line loading."
+            "Manage factory capacity master data used for shipment receive date calculation, production scheduling and line loading."
         )
         subtitle.setObjectName("PageSubtitle")
         subtitle.setWordWrap(True)
@@ -158,45 +157,6 @@ class FactoryCapacityPage(QWidget):
 
         return card
 
-    def _build_metrics(self) -> QGridLayout:
-        grid = QGridLayout()
-        grid.setSpacing(12)
-
-        metrics = [
-            ("4", "Capacity Modules", "Line, mold, casing and time masters"),
-            ("86", "Active Cavities", "200T, 400T, 800T and SuperSolid"),
-            ("243", "Mold Capacity", "200T, 400T and 800T mold count"),
-            ("Ready", "Planning Base", "Capacity data prepared for scheduling"),
-        ]
-
-        for col, (value, label, hint) in enumerate(metrics):
-            grid.addWidget(self._metric_card(value, label, hint), 0, col)
-
-        return grid
-
-    def _metric_card(self, value: str, label: str, hint: str) -> QFrame:
-        card = QFrame()
-        card.setObjectName("MetricCard")
-
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(18, 14, 18, 14)
-        layout.setSpacing(4)
-
-        value_label = QLabel(value)
-        value_label.setObjectName("MetricValue")
-
-        label_widget = QLabel(label)
-        label_widget.setObjectName("MetricLabel")
-
-        hint_widget = QLabel(hint)
-        hint_widget.setObjectName("CardHint")
-        hint_widget.setWordWrap(True)
-
-        layout.addWidget(value_label)
-        layout.addWidget(label_widget)
-        layout.addWidget(hint_widget)
-
-        return card
 
     def _build_modules(self) -> QFrame:
         panel = QFrame()
@@ -217,12 +177,17 @@ class FactoryCapacityPage(QWidget):
             (
                 "Production Lines",
                 "LINE MASTER",
-                "Maintain 200T, 400T, 800T and SuperSolid production line capacity.",
+                "Maintain factory production line groups from the oven sheet reference.",
+            ),
+            (
+                "Cavities",
+                "CAVITY DATA",
+                "Maintain cavity and press positions, breakdown status, assignment and availability.",
             ),
             (
                 "Mold Master",
                 "MOLD DATA",
-                "Maintain mold availability, mold count and item compatibility.",
+                "Maintain mold availability, mold count and tyre item compatibility.",
             ),
             (
                 "Casing Master",
@@ -232,7 +197,7 @@ class FactoryCapacityPage(QWidget):
             (
                 "Capacity / Time Master",
                 "TIME DATA",
-                "Maintain cavity capacity, production time, curing time and shift parameters.",
+                "Maintain production time, curing time, shift parameters and capacity rules.",
             ),
         ]
 
