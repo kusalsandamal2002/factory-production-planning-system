@@ -1,16 +1,14 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import date
-from math import floor
-from typing import Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QCalendarWidget,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QProgressBar,
     QPushButton,
     QVBoxLayout,
@@ -18,316 +16,472 @@ from PySide6.QtWidgets import (
 )
 from sqlalchemy import text
 
-from app.database import get_session
-from app.services.oven_capacity_service import build_capacity_analysis
-from app.services.oven_schedule_service import build_daily_oven_schedule
-from app.services.production_requirement_service import (
-    load_production_requirements,
-    summarize_production_requirements,
-)
-from app.ui.production_calendar_panel import ProductionCalendarPanel
-
-
-class MetricCard(QFrame):
-    def __init__(
-        self,
-        label: str,
-        value: str,
-        hint: str,
-        on_click: Callable[[], None] | None = None,
-    ):
-        super().__init__()
-        self.setObjectName("MetricCard")
-        self.on_click = on_click
-        if on_click is not None:
-            self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(8)
-
-        self.label_widget = QLabel(label)
-        self.label_widget.setObjectName("MetricLabel")
-        self.value_widget = QLabel(value)
-        self.value_widget.setObjectName("MetricValue")
-        self.hint_widget = QLabel(hint)
-        self.hint_widget.setObjectName("MetricHint")
-        self.hint_widget.setWordWrap(True)
-        self.open_button = QPushButton("View details")
-        self.open_button.setObjectName("SoftButton")
-        self.open_button.setEnabled(on_click is not None)
-        if on_click is not None:
-            self.open_button.clicked.connect(on_click)
-
-        layout.addWidget(self.label_widget)
-        layout.addWidget(self.value_widget)
-        layout.addWidget(self.hint_widget)
-        layout.addStretch()
-        layout.addWidget(self.open_button)
-
-    def mousePressEvent(self, event) -> None:
-        if self.on_click is not None and event.button() == Qt.MouseButton.LeftButton:
-            self.on_click()
-        super().mousePressEvent(event)
-
-
-class SummaryRow(QFrame):
-    def __init__(self, label: str, value: str = "-"):
-        super().__init__()
-        self.setObjectName("SummaryRow")
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
-        self.label_widget = QLabel(label)
-        self.label_widget.setObjectName("SummaryLabel")
-        self.value_widget = QLabel(value)
-        self.value_widget.setObjectName("SummaryValue")
-        self.value_widget.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-        layout.addWidget(self.label_widget, 1)
-        layout.addWidget(self.value_widget, 1)
-
-    def update_value(self, value: str) -> None:
-        self.value_widget.setText(value)
+from app.database import engine
 
 
 class DashboardPage(QWidget):
-    def __init__(
-        self,
-        open_total_shipments_page: Callable[[], None] | None = None,
-        open_completed_orders_page: Callable[[], None] | None = None,
-        open_pending_orders_page: Callable[[], None] | None = None,
-        open_overdue_orders_page: Callable[[], None] | None = None,
-    ):
+    def __init__(self, *args, **kwargs):
         super().__init__()
-        shipment_callback = open_total_shipments_page or (lambda: None)
-        planning_callback = open_pending_orders_page or shipment_callback
+        self.setObjectName("DashboardPage")
 
-        self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(0, 0, 0, 0)
-        self.main_layout.setSpacing(16)
-        self.metric_cards: dict[str, MetricCard] = {}
+        self.setStyleSheet("""
+            QWidget#DashboardPage {
+                background: #f3f6fb;
+            }
 
-        self._build_metric_cards(shipment_callback, planning_callback)
-        self._build_middle_section()
-        self._build_capacity_panel()
+            QFrame#HeaderCard, QFrame#MetricCard, QFrame#PanelCard {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 20px;
+            }
+
+            QLabel#Breadcrumb {
+                color: #2563eb;
+                font-size: 9pt;
+                font-weight: 950;
+            }
+
+            QLabel#PageTitle {
+                color: #0f172a;
+                font-size: 22pt;
+                font-weight: 950;
+            }
+
+            QLabel#PageSubtitle {
+                color: #64748b;
+                font-size: 9.2pt;
+                font-weight: 650;
+            }
+
+            QLabel#MetricValue {
+                color: #020617;
+                font-size: 22pt;
+                font-weight: 950;
+            }
+
+            QLabel#MetricTitle {
+                color: #0f172a;
+                font-size: 10pt;
+                font-weight: 950;
+            }
+
+            QLabel#MetricHint {
+                color: #64748b;
+                font-size: 8.6pt;
+                font-weight: 650;
+            }
+
+            QLabel#SectionTitle {
+                color: #0f172a;
+                font-size: 15pt;
+                font-weight: 950;
+            }
+
+            QLabel#SectionText {
+                color: #334155;
+                font-size: 9.2pt;
+                font-weight: 650;
+            }
+
+            QLabel#StatusBadge {
+                background: #eef2ff;
+                color: #1d4ed8;
+                border: 1px solid #c7d2fe;
+                border-radius: 11px;
+                padding: 6px 12px;
+                font-size: 8.5pt;
+                font-weight: 950;
+            }
+
+            QPushButton#PrimaryButton {
+                background: #2563eb;
+                color: #ffffff;
+                border: none;
+                border-radius: 11px;
+                padding: 9px 14px;
+                font-size: 9pt;
+                font-weight: 950;
+            }
+
+            QPushButton#PrimaryButton:hover {
+                background: #1d4ed8;
+            }
+
+            QPushButton#SecondaryButton {
+                background: #e2e8f0;
+                color: #0f172a;
+                border: none;
+                border-radius: 11px;
+                padding: 9px 14px;
+                font-size: 9pt;
+                font-weight: 950;
+            }
+
+            QPushButton#SecondaryButton:hover {
+                background: #cbd5e1;
+            }
+
+            QProgressBar {
+                background: #e2e8f0;
+                border: none;
+                border-radius: 8px;
+                height: 16px;
+                text-align: center;
+                color: #0f172a;
+                font-size: 8pt;
+                font-weight: 900;
+            }
+
+            QProgressBar::chunk {
+                background: #2563eb;
+                border-radius: 8px;
+            }
+
+            QCalendarWidget {
+                background: #ffffff;
+                color: #0f172a;
+                border: 1px solid #e2e8f0;
+                border-radius: 14px;
+            }
+
+            QCalendarWidget QWidget {
+                background: #ffffff;
+                color: #0f172a;
+            }
+
+            QCalendarWidget QToolButton {
+                background: #eef2ff;
+                color: #1d4ed8;
+                border: 1px solid #c7d2fe;
+                border-radius: 9px;
+                padding: 6px 10px;
+                font-weight: 900;
+            }
+
+            QCalendarWidget QAbstractItemView {
+                background: #ffffff;
+                color: #0f172a;
+                selection-background-color: #2563eb;
+                selection-color: #ffffff;
+                gridline-color: #e2e8f0;
+                outline: none;
+            }
+        """)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
+
+        root.addWidget(self._build_header())
+        root.addLayout(self._build_metrics())
+
+        body = QHBoxLayout()
+        body.setSpacing(16)
+        body.addWidget(self._build_calendar_panel(), 1)
+        body.addWidget(self._build_daily_plan_panel(), 1)
+        root.addLayout(body, 1)
+
+        root.addWidget(self._build_capacity_panel(), 0)
+
         self.refresh()
 
-    def _build_metric_cards(
-        self,
-        shipment_callback: Callable[[], None],
-        planning_callback: Callable[[], None],
-    ) -> None:
-        grid = QGridLayout()
-        grid.setSpacing(12)
-        cards = [
-            (
-                "Customer Orders",
-                "active_demands",
-                "Orders currently included in production planning",
-                shipment_callback,
-            ),
-            (
-                "Production Orders",
-                "required_items",
-                "Items requiring production after stock verification",
-                planning_callback,
-            ),
-            (
-                "Required Production Qty",
-                "required_qty",
-                "Total quantity to be produced after stock check",
-                planning_callback,
-            ),
-            (
-                "Planning Alerts",
-                "warnings",
-                "Orders or items needing planning attention",
-                planning_callback,
-            ),
-        ]
-        for index, (title, key, hint, callback) in enumerate(cards):
-            card = MetricCard(title, "0", hint, callback)
-            self.metric_cards[key] = card
-            grid.addWidget(card, 0, index)
-        self.main_layout.addLayout(grid)
+    def _build_header(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("HeaderCard")
 
-    def _build_middle_section(self) -> None:
-        middle = QHBoxLayout()
-        middle.setSpacing(14)
-        self.calendar_panel = ProductionCalendarPanel()
-        self.calendar_panel.selected_date_changed.connect(
-            self.refresh_selected_date_summary
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(20, 14, 20, 14)
+        layout.setSpacing(14)
+
+        text_area = QVBoxLayout()
+        text_area.setSpacing(8)
+
+        breadcrumb = QLabel("Dashboard  /  Production Planning")
+        breadcrumb.setObjectName("Breadcrumb")
+
+        title = QLabel("Production Planning Dashboard")
+        title.setObjectName("PageTitle")
+
+        subtitle = QLabel(
+            "Summary view for shipment orders, production demand, capacity usage and daily planning status."
         )
-        self.summary_panel = self._build_selected_date_summary_panel()
-        middle.addWidget(self.calendar_panel, 3)
-        middle.addWidget(self.summary_panel, 2)
-        self.main_layout.addLayout(middle, 1)
+        subtitle.setObjectName("PageSubtitle")
+        subtitle.setWordWrap(True)
 
-    def _build_selected_date_summary_panel(self) -> QFrame:
-        frame = QFrame()
-        frame.setObjectName("PanelCard")
-        layout = QVBoxLayout(frame)
-        layout.setContentsMargins(18, 16, 18, 18)
-        layout.setSpacing(10)
+        text_area.addWidget(breadcrumb)
+        text_area.addWidget(title)
+        text_area.addWidget(subtitle)
+
+        self.today_badge = QLabel(date.today().strftime("%A, %Y-%m-%d"))
+        self.today_badge.setObjectName("StatusBadge")
+        self.today_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        layout.addLayout(text_area, 1)
+        layout.addWidget(self.today_badge)
+
+        return card
+
+    def _build_metrics(self) -> QGridLayout:
+        grid = QGridLayout()
+        grid.setSpacing(14)
+
+        self.metric_labels: dict[str, QLabel] = {}
+
+        cards = [
+            ("orders", "Customer Orders", "Orders currently included in production planning"),
+            ("production_orders", "Production Orders", "Items requiring production after stock verification"),
+            ("required_qty", "Required Production Qty", "Total quantity to be produced after stock check"),
+            ("alerts", "Planning Alerts", "Orders or items needing planning attention"),
+        ]
+
+        for col, (key, title, hint) in enumerate(cards):
+            grid.addWidget(self._metric_card(key, title, hint), 0, col)
+            grid.setColumnStretch(col, 1)
+
+        return grid
+
+    def _metric_card(self, key: str, title: str, hint: str) -> QFrame:
+        card = QFrame()
+        card.setObjectName("MetricCard")
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(8)
+
+        value = QLabel("0")
+        value.setObjectName("MetricValue")
+        self.metric_labels[key] = value
+
+        title_label = QLabel(title)
+        title_label.setObjectName("MetricTitle")
+
+        hint_label = QLabel(hint)
+        hint_label.setObjectName("MetricHint")
+        hint_label.setWordWrap(True)
+
+        button = QPushButton("View details")
+        button.setObjectName("SecondaryButton")
+
+        layout.addWidget(value)
+        layout.addWidget(title_label)
+        layout.addWidget(hint_label)
+        layout.addStretch()
+        layout.addWidget(button)
+
+        return card
+
+    def _build_calendar_panel(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("PanelCard")
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 14, 18, 16)
+        layout.setSpacing(14)
+
+        title = QLabel("Factory Working Calendar")
+        title.setObjectName("SectionTitle")
+
+        self.day_status = QLabel("Factory is operating 24/7. Production planning is allowed for this date.")
+        self.day_status.setObjectName("SectionText")
+        self.day_status.setWordWrap(True)
+
+        self.calendar = QCalendarWidget()
+        self.calendar.setMaximumHeight(270)
+        self.calendar.setGridVisible(False)
+        self.calendar.setSelectedDate(self.calendar.selectedDate().currentDate())
+
+        note = QLabel("Click a date to review factory holiday, special working day or production availability.")
+        note.setObjectName("SectionText")
+        note.setWordWrap(True)
+
+        layout.addWidget(title)
+        layout.addWidget(self.day_status)
+        layout.addWidget(self.calendar, 1)
+        layout.addWidget(note)
+
+        return card
+
+    def _build_daily_plan_panel(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("PanelCard")
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 14, 18, 16)
+        layout.setSpacing(14)
 
         title = QLabel("Daily Production Plan")
-        title.setObjectName("CardTitle")
-        hint = QLabel("Order-based daily production plan using line, mold, casing, cavity and capacity data.")
-        hint.setObjectName("SectionHint")
-        hint.setWordWrap(True)
-        self.summary_date_label = QLabel("-")
-        self.summary_date_label.setObjectName("InfoPill")
-        self.summary_status_label = QLabel("-")
-        self.summary_status_label.setObjectName("SuccessPill")
+        title.setObjectName("SectionTitle")
+
+        subtitle = QLabel("Order-based daily production plan using line, mold, casing, cavity and capacity data.")
+        subtitle.setObjectName("SectionText")
+        subtitle.setWordWrap(True)
+
+        self.plan_date = QLabel(f"Date: {date.today().strftime('%A, %Y-%m-%d')}")
+        self.plan_date.setObjectName("SectionText")
+
+        self.plan_status = QLabel("NO PRODUCTION REQUIRED")
+        self.plan_status.setObjectName("StatusBadge")
+        self.plan_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         layout.addWidget(title)
-        layout.addWidget(hint)
-        layout.addWidget(self.summary_date_label)
-        layout.addWidget(self.summary_status_label)
+        layout.addWidget(subtitle)
+        layout.addWidget(self.plan_date)
+        layout.addWidget(self.plan_status, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addSpacing(12)
 
-        self.planned_qty_row = SummaryRow("Planned Qty", "0")
-        self.quantity_capacity_row = SummaryRow("Available Production Capacity", "0")
-        self.capacity_usage_row = SummaryRow("Capacity Usage", "0%")
-        self.active_ovens_row = SummaryRow("Active Press / Cavities", "0")
-        self.plan_status_row = SummaryRow("Plan Status", "-")
-        for row in (
-            self.planned_qty_row,
-            self.quantity_capacity_row,
-            self.capacity_usage_row,
-            self.active_ovens_row,
-            self.plan_status_row,
-        ):
-            layout.addWidget(row)
+        self.plan_fields: dict[str, QLabel] = {}
 
-        self.summary_note = QLabel("This dashboard summarizes the current production planning position for the selected date.")
-        self.summary_note.setObjectName("SectionHint")
-        self.summary_note.setWordWrap(True)
-        layout.addWidget(self.summary_note)
+        fields = [
+            ("planned_qty", "Planned Qty"),
+            ("capacity", "Available Production Capacity"),
+            ("usage", "Capacity Usage"),
+            ("cavities", "Active Press / Cavities"),
+        ]
+
+        for key, label in fields:
+            row = QHBoxLayout()
+            name = QLabel(label)
+            name.setObjectName("SectionText")
+
+            value = QLabel("0")
+            value.setObjectName("SectionText")
+            value.setAlignment(Qt.AlignmentFlag.AlignRight)
+            self.plan_fields[key] = value
+
+            row.addWidget(name, 1)
+            row.addWidget(value)
+            layout.addLayout(row)
+
         layout.addStretch()
-        return frame
 
-    def _build_capacity_panel(self) -> None:
-        panel = QFrame()
-        panel.setObjectName("PanelCard")
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(18, 16, 18, 18)
+        summary = QLabel("This dashboard summarizes the current production planning position for the selected date.")
+        summary.setObjectName("SectionText")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        return card
+
+    def _build_capacity_panel(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("PanelCard")
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 12, 18, 14)
         layout.setSpacing(10)
+
         title = QLabel("Production Capacity Usage")
-        title.setObjectName("CardTitle")
-        hint = QLabel("Planned production quantity compared with available line, mold and cavity capacity.")
-        hint.setObjectName("SectionHint")
-        hint.setWordWrap(True)
+        title.setObjectName("SectionTitle")
+
+        subtitle = QLabel("Planned production quantity compared with available line, mold and cavity capacity.")
+        subtitle.setObjectName("SectionText")
+        subtitle.setWordWrap(True)
+
         self.capacity_bar = QProgressBar()
         self.capacity_bar.setRange(0, 100)
-        self.capacity_bar.setMinimumHeight(22)
+        self.capacity_bar.setValue(0)
+        self.capacity_bar.setFormat("0 planned / 0 quantity capacity")
+
         layout.addWidget(title)
-        layout.addWidget(hint)
+        layout.addWidget(subtitle)
         layout.addWidget(self.capacity_bar)
-        self.main_layout.addWidget(panel)
+
+        return card
 
     def refresh(self) -> None:
-        self.refresh_selected_date_summary(self.calendar_panel.selected_date())
+        values = self._load_dashboard_values()
 
-    def refresh_selected_date_summary(self, selected_date: date) -> None:
-        try:
-            data = self._load_dashboard_data(selected_date)
-        except Exception as exc:
-            QMessageBox.warning(self, "Dashboard Refresh", str(exc))
-            return
+        self.metric_labels["orders"].setText(str(values["orders"]))
+        self.metric_labels["production_orders"].setText(str(values["production_orders"]))
+        self.metric_labels["required_qty"].setText(str(values["required_qty"]))
+        self.metric_labels["alerts"].setText(str(values["alerts"]))
 
-        metrics = data["metrics"]
-        for key, value in metrics.items():
-            self.metric_cards[key].value_widget.setText(f"{value:,}")
+        self.plan_fields["planned_qty"].setText(str(values["required_qty"]))
+        self.plan_fields["capacity"].setText(str(values["capacity"]))
+        self.plan_fields["usage"].setText(f"{values['usage_percent']}%")
+        self.plan_fields["cavities"].setText(str(values["active_cavities"]))
 
-        self.summary_date_label.setText(
-            f"Date: {selected_date.strftime('%A, %Y-%m-%d')}"
-        )
-        status = data["status"]
-        self.summary_status_label.setText(status)
-        self._set_label_object_name(
-            self.summary_status_label,
-            "SuccessPill"
-            if status in {"FULLY PLANNED", "NO PRODUCTION REQUIRED"}
-            else "WarningPill",
-        )
-        self.planned_qty_row.update_value(f"{data['planned_qty']:,}")
-        self.quantity_capacity_row.update_value(f"{data['quantity_capacity']:,}")
-        self.capacity_usage_row.update_value(f"{data['capacity_usage']}%")
-        self.active_ovens_row.update_value(f"{data['active_ovens']:,}")
-        self.plan_status_row.update_value(status)
-        self.capacity_bar.setValue(max(0, min(100, data["capacity_usage"])))
-        self.capacity_bar.setFormat(
-            f"{data['planned_qty']:,} planned / "
-            f"{data['quantity_capacity']:,} quantity capacity"
-        )
+        self.capacity_bar.setValue(int(values["usage_percent"]))
+        self.capacity_bar.setFormat(f"{values['required_qty']} planned / {values['capacity']} quantity capacity")
 
-    def _load_dashboard_data(self, selected_date: date) -> dict:
-        with get_session() as session:
-            active_demands = int(
-                session.execute(
-                    text(
-                        """
-                        SELECT COUNT(*)
-                        FROM mpps_shipment_demand
-                        WHERE UPPER(status) IN (
-                            'PENDING', 'CONFIRMED', 'PLANNED', 'PARTIALLY_PLANNED'
-                        )
-                          AND demand_qty > 0;
-                        """
-                    )
-                ).scalar_one()
-            )
-            production = load_production_requirements(
-                session, planning_date=selected_date
-            )
-            production_summary = summarize_production_requirements(production)
-            required = [
-                row for row in production if row.production_required_qty > 0
-            ]
-            capacity = build_capacity_analysis(
-                session,
-                production_rows=required,
-                planning_date=selected_date,
-            )
-            _, plan_summary = build_daily_oven_schedule(
-                session,
-                planning_date=selected_date,
-                production_rows=required,
-                capacity_rows=capacity,
-            )
+    refresh_page = refresh
+    load_data = refresh
 
-        capacity_by_key: dict[str, int] = {}
-        for row in capacity:
-            if row.capacity_key and row.available_capacity > 0:
-                capacity_by_key[row.capacity_key] = max(
-                    capacity_by_key.get(row.capacity_key, 0),
-                    int(floor(row.available_capacity)),
-                )
-        quantity_capacity = sum(capacity_by_key.values())
-        capacity_usage = (
-            int(round(plan_summary.planned_qty / quantity_capacity * 100))
-            if quantity_capacity > 0
-            else 0
-        )
-        return {
-            "metrics": {
-                "active_demands": active_demands,
-                "required_items": production_summary.production_required_items,
-                "required_qty": production_summary.total_production_required_qty,
-                "warnings": max(
-                    production_summary.warning_count,
-                    plan_summary.risk_warning_count,
-                ),
-            },
-            "planned_qty": plan_summary.planned_qty,
-            "quantity_capacity": quantity_capacity,
-            "capacity_usage": capacity_usage,
-            "active_ovens": plan_summary.active_ovens,
-            "status": plan_summary.capacity_status,
+    def _load_dashboard_values(self) -> dict:
+        values = {
+            "orders": 0,
+            "production_orders": 0,
+            "required_qty": 0,
+            "alerts": 0,
+            "capacity": 0,
+            "usage_percent": 0,
+            "active_cavities": 0,
         }
 
-    def _set_label_object_name(self, label: QLabel, object_name: str) -> None:
-        label.setObjectName(object_name)
-        label.style().unpolish(label)
-        label.style().polish(label)
+        try:
+            with engine.connect() as conn:
+                values["orders"] = self._safe_count(conn, "orders")
+                values["production_orders"] = self._safe_count(conn, "order_items")
+                values["required_qty"] = self._safe_sum(conn, "order_items", "quantity")
+                values["active_cavities"] = self._safe_count_where(
+                    conn,
+                    "production_line_cavities",
+                    "LOWER(status) = 'active'",
+                )
+                values["capacity"] = values["active_cavities"]
+
+                if values["capacity"] > 0:
+                    values["usage_percent"] = min(100, round((values["required_qty"] / values["capacity"]) * 100))
+
+        except Exception:
+            pass
+
+        return values
+
+    def _table_exists(self, conn, table_name: str) -> bool:
+        return bool(conn.execute(
+            text("""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                      AND table_name = :table_name
+                )
+            """),
+            {"table_name": table_name},
+        ).scalar_one())
+
+    def _column_exists(self, conn, table_name: str, column_name: str) -> bool:
+        return bool(conn.execute(
+            text("""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = :table_name
+                      AND column_name = :column_name
+                )
+            """),
+            {"table_name": table_name, "column_name": column_name},
+        ).scalar_one())
+
+    def _safe_count(self, conn, table_name: str) -> int:
+        if not self._table_exists(conn, table_name):
+            return 0
+        return int(conn.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar_one() or 0)
+
+    def _safe_count_where(self, conn, table_name: str, where_clause: str) -> int:
+        if not self._table_exists(conn, table_name):
+            return 0
+        return int(conn.execute(text(f"SELECT COUNT(*) FROM {table_name} WHERE {where_clause}")).scalar_one() or 0)
+
+    def _safe_sum(self, conn, table_name: str, column_name: str) -> int:
+        if not self._table_exists(conn, table_name):
+            return 0
+        if not self._column_exists(conn, table_name, column_name):
+            return 0
+        return int(conn.execute(text(f"SELECT COALESCE(SUM({column_name}), 0) FROM {table_name}")).scalar_one() or 0)
+
+
+ProductionDashboardPage = DashboardPage
+PlanningDashboardPage = DashboardPage
+MainDashboardPage = DashboardPage
