@@ -1,10 +1,9 @@
 ﻿import sys
-from types import SimpleNamespace
 
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialog
 
-from app.ui.main_window import MainWindow
+from app.ui.login_dialog import LoginDialog
 
 
 def apply_app_palette(app: QApplication) -> None:
@@ -20,9 +19,11 @@ def apply_app_palette(app: QApplication) -> None:
     palette.setColor(QPalette.ColorRole.ButtonText, QColor("#0f172a"))
     palette.setColor(QPalette.ColorRole.Highlight, QColor("#2563eb"))
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+
     app.setPalette(palette)
 
-    app.setStyleSheet("""
+    app.setStyleSheet(
+        """
         QMainWindow {
             background: #f3f6fb;
         }
@@ -47,7 +48,8 @@ def apply_app_palette(app: QApplication) -> None:
             border: 1px solid #cbd5e1;
             padding: 6px;
         }
-    """)
+        """
+    )
 
 
 def main():
@@ -55,17 +57,19 @@ def main():
     app.setApplicationName("Factory Oven Production Planning System")
     apply_app_palette(app)
 
-    current_user = SimpleNamespace(
-        id=0,
-        username="system",
-        full_name="System User",
-        display_name="System User",
-        email="",
-        role="Operation Manager",
-        role_name="Operation Manager",
-    )
+    login_dialog = LoginDialog()
 
-    window = MainWindow(current_user)
+    if login_dialog.exec() != QDialog.DialogCode.Accepted:
+        return 0
+
+    if login_dialog.current_user is None:
+        return 0
+
+    # Important: MainWindow is imported only after successful login.
+    # This makes the login screen open much faster.
+    from app.ui.main_window import MainWindow
+
+    window = MainWindow(login_dialog.current_user)
     window.showMaximized()
 
     return app.exec()
