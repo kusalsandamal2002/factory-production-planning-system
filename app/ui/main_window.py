@@ -39,6 +39,7 @@ from app.ui.product_master_page import ProductMasterPage
 from app.ui.production_line_master_page import ProductionLineMasterPage
 from app.ui.schedule_page import SchedulePage
 from app.ui.stock_master_page import StockMasterPage
+from app.ui.daily_stock_page import DailyStockPage
 from app.ui.stock_planning_page import StockPlanningPage
 from app.ui.tire_stock_page import TireStockPage
 from app.ui.tyre_product_tree_page import TyreProductTreePage
@@ -237,6 +238,7 @@ class MainWindow(QMainWindow):
     FACTORY_CAPACITY_INDEX = 36
 
     CAVITIES_MASTER_INDEX = 37
+    DAILY_STOCK_INDEX = 38
     MONTHLY_STOCK_MANAGER_ROLE = "Monthly Stock Manager"
     MONTHLY_STOCK_VIEWER_ROLE = "Monthly Stock Viewer"
 
@@ -441,7 +443,6 @@ class MainWindow(QMainWindow):
 
         self._add_caption(layout, "Data")
         self._add_nav_button(layout, "Master Data", self.TYRE_PRODUCT_TREE_INDEX)
-        self._add_nav_button(layout, "Stock Page", self.STOCK_MASTER_INDEX)
 
         self._add_caption(layout, "Planning")
         self._add_nav_button(layout, "Production Planning", self.SCHEDULE_INDEX)
@@ -551,6 +552,7 @@ class MainWindow(QMainWindow):
 
         self.product_master_page = TyreItemMasterPage()
         self.stock_master_page = StockMasterPage()
+        self.daily_stock_page = DailyStockPage()
         self.bom_master_page = BomMasterPage()
         self.compound_master_page = CompoundMasterPage()
         self.bead_master_page = BeadMasterPage()
@@ -583,6 +585,8 @@ class MainWindow(QMainWindow):
             page_indexes={
                 "Factory Capacity": self.FACTORY_CAPACITY_INDEX,
                 "Tyre Item Master": self.PRODUCT_MASTER_INDEX,
+                "Final Tyre Stock": self.STOCK_MASTER_INDEX,
+                "Daily Stock": self.DAILY_STOCK_INDEX,
                 "Legacy Excel Import": self.RAW_EXCEL_VIEWER_INDEX,
             },
         )
@@ -663,6 +667,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._wrap_scroll(self.reports_page))
         self.stack.addWidget(self._wrap_scroll(self.factory_capacity_page))
         self.stack.addWidget(self._wrap_scroll(self.cavities_master_page))
+        self.stack.addWidget(self._wrap_scroll(self.daily_stock_page))
 
         layout.addWidget(self.stack)
 
