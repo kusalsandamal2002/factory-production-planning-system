@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
@@ -20,10 +20,13 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 from app.database import engine
+
+
+def _quote_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
 
 
 class StockEditDialog(QDialog):
@@ -32,10 +35,10 @@ class StockEditDialog(QDialog):
 
         self.stock_item = stock_item or {}
 
-        self.setWindowTitle("Edit Stock Balance")
+        self.setWindowTitle("Edit SAP Stock Balance")
         self.setMinimumWidth(620)
 
-        self.material_code_label = QLabel("-")
+        self.sap_code_label = QLabel("-")
         self.description_label = QLabel("-")
 
         self.fg_stock_input = QSpinBox()
@@ -70,6 +73,7 @@ class StockEditDialog(QDialog):
             """
             QDialog {
                 background: #f8fafc;
+                font-family: "Segoe UI";
             }
 
             QFrame#Card {
@@ -106,8 +110,7 @@ class StockEditDialog(QDialog):
                 font-weight: 800;
             }
 
-            QLineEdit,
-            QSpinBox {
+            QLineEdit, QSpinBox {
                 background: #ffffff;
                 color: #0f172a;
                 border: 1px solid #cbd5e1;
@@ -118,8 +121,7 @@ class StockEditDialog(QDialog):
                 min-height: 24px;
             }
 
-            QLineEdit:focus,
-            QSpinBox:focus {
+            QLineEdit:focus, QSpinBox:focus {
                 border: 1px solid #2563eb;
             }
 
@@ -165,12 +167,10 @@ class StockEditDialog(QDialog):
         layout.setContentsMargins(20, 18, 20, 20)
         layout.setSpacing(14)
 
-        title = QLabel("Stock Master")
+        title = QLabel("SAP Stock Balance")
         title.setObjectName("Title")
 
-        hint = QLabel(
-            "Update stock balances carefully. This changes the clean MPPS database stock values used for planning decisions."
-        )
+        hint = QLabel("Update stock balances carefully. These values are used for planning decisions.")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
 
@@ -181,8 +181,8 @@ class StockEditDialog(QDialog):
         form.setHorizontalSpacing(14)
         form.setVerticalSpacing(12)
 
-        self._add_readonly_field(form, 0, "Material Code", self.material_code_label)
-        self._add_readonly_field(form, 1, "Description", self.description_label)
+        self._add_readonly_field(form, 0, "SAP Code", self.sap_code_label)
+        self._add_readonly_field(form, 1, "Tyre Description", self.description_label)
         self._add_field(form, 2, "FG Stock", self.fg_stock_input)
         self._add_field(form, 3, "QC Stock", self.qc_stock_input)
         self._add_field(form, 4, "Scrap Stock", self.scrap_stock_input)
@@ -197,7 +197,6 @@ class StockEditDialog(QDialog):
         button_row.addWidget(self.save_btn)
 
         layout.addLayout(button_row)
-
         root.addWidget(card)
 
     def _add_field(self, grid: QGridLayout, row: int, label_text: str, widget: QWidget) -> None:
@@ -206,7 +205,6 @@ class StockEditDialog(QDialog):
 
         grid.addWidget(label, row, 0)
         grid.addWidget(widget, row, 1)
-
         grid.setColumnStretch(0, 0)
         grid.setColumnStretch(1, 1)
 
@@ -221,8 +219,8 @@ class StockEditDialog(QDialog):
         grid.addWidget(widget, row, 1)
 
     def _load_stock_item(self) -> None:
-        self.material_code_label.setText(str(self.stock_item.get("material_code") or "-"))
-        self.description_label.setText(str(self.stock_item.get("item_description") or "-"))
+        self.sap_code_label.setText(str(self.stock_item.get("sap_code") or "-"))
+        self.description_label.setText(str(self.stock_item.get("tyre_description") or "-"))
 
         self.fg_stock_input.setValue(int(self.stock_item.get("fg_stock") or 0))
         self.qc_stock_input.setValue(int(self.stock_item.get("qc_stock") or 0))
@@ -236,7 +234,7 @@ class StockEditDialog(QDialog):
             raise ValueError("Correction reason is required.")
 
         return {
-            "material_code": self.stock_item.get("material_code"),
+            "sap_code": self.stock_item.get("sap_code"),
             "fg_stock": self.fg_stock_input.value(),
             "qc_stock": self.qc_stock_input.value(),
             "scrap_stock": self.scrap_stock_input.value(),
@@ -249,22 +247,11 @@ class StockMasterPage(QWidget):
     def __init__(self):
         super().__init__()
 
-        self.selected_material_code: str | None = None
-
-        self.total_items_value = QLabel("0")
-        self.total_fg_value = QLabel("0")
-        self.total_qc_value = QLabel("0")
-        self.total_available_value = QLabel("0")
-        self.total_blocked_value = QLabel("0")
-        self.out_of_stock_value = QLabel("0")
+        self.selected_sap_code: str | None = None
 
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search material code, description or group...")
+        self.search_input.setPlaceholderText("Search SAP code or tyre description...")
         self.search_input.textChanged.connect(self.refresh_table)
-
-        self.product_group_combo = QComboBox()
-        self.product_group_combo.addItem("All Product Groups")
-        self.product_group_combo.currentTextChanged.connect(self.refresh_table)
 
         self.stock_status_combo = QComboBox()
         self.stock_status_combo.addItems(
@@ -278,6 +265,10 @@ class StockMasterPage(QWidget):
         )
         self.stock_status_combo.currentTextChanged.connect(self.refresh_table)
 
+        self.sync_btn = QPushButton("Sync Tyres From Master")
+        self.sync_btn.setObjectName("PrimaryButton")
+        self.sync_btn.clicked.connect(lambda: self.sync_tyres_from_master(show_message=True))
+
         self.edit_btn = QPushButton("Edit Selected Stock")
         self.edit_btn.setObjectName("PrimaryButton")
         self.edit_btn.setEnabled(False)
@@ -287,12 +278,11 @@ class StockMasterPage(QWidget):
         self.refresh_btn.setObjectName("SecondaryButton")
         self.refresh_btn.clicked.connect(self.refresh)
 
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
             [
-                "Material",
-                "Description",
-                "Group",
+                "SAP Code",
+                "Tyre Description",
                 "FG",
                 "QC",
                 "Scrap",
@@ -304,13 +294,11 @@ class StockMasterPage(QWidget):
         self._setup_table()
         self._apply_styles()
         self._build_ui()
-
         self.refresh()
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
             """
-            QFrame#MetricCard,
             QFrame#ControlCard,
             QFrame#TableCard {
                 background: #ffffff;
@@ -318,25 +306,13 @@ class StockMasterPage(QWidget):
                 border-radius: 16px;
             }
 
-            QLabel#MetricTitle {
-                color: #64748b;
-                font-size: 8.5pt;
-                font-weight: 850;
-            }
-
-            QLabel#MetricValue {
+            QLabel#PageTitle {
                 color: #0f172a;
                 font-size: 19pt;
                 font-weight: 950;
             }
 
-            QLabel#SectionTitle {
-                color: #0f172a;
-                font-size: 15pt;
-                font-weight: 950;
-            }
-
-            QLabel#SectionHint {
+            QLabel#PageHint {
                 color: #64748b;
                 font-size: 9.5pt;
                 font-weight: 650;
@@ -348,8 +324,7 @@ class StockMasterPage(QWidget):
                 font-weight: 850;
             }
 
-            QLineEdit,
-            QComboBox {
+            QLineEdit, QComboBox {
                 background: #ffffff;
                 color: #0f172a;
                 border: 1px solid #cbd5e1;
@@ -360,8 +335,7 @@ class StockMasterPage(QWidget):
                 min-height: 24px;
             }
 
-            QLineEdit:focus,
-            QComboBox:focus {
+            QLineEdit:focus, QComboBox:focus {
                 border: 1px solid #2563eb;
             }
 
@@ -431,46 +405,8 @@ class StockMasterPage(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(16)
 
-        root.addLayout(self._build_metrics_grid())
         root.addWidget(self._build_control_card())
         root.addWidget(self._build_table_card(), 1)
-
-    def _build_metrics_grid(self) -> QGridLayout:
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(14)
-
-        cards = [
-            self._metric_card("Total Items", self.total_items_value),
-            self._metric_card("FG Stock", self.total_fg_value),
-            self._metric_card("QC Stock", self.total_qc_value),
-            self._metric_card("Available Stock", self.total_available_value),
-            self._metric_card("Blocked Stock", self.total_blocked_value),
-            self._metric_card("Out of Stock Items", self.out_of_stock_value),
-        ]
-
-        for index, card in enumerate(cards):
-            grid.addWidget(card, index // 3, index % 3)
-
-        return grid
-
-    def _metric_card(self, title_text: str, value_label: QLabel) -> QFrame:
-        card = QFrame()
-        card.setObjectName("MetricCard")
-
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(5)
-
-        title = QLabel(title_text)
-        title.setObjectName("MetricTitle")
-
-        value_label.setObjectName("MetricValue")
-
-        layout.addWidget(title)
-        layout.addWidget(value_label)
-
-        return card
 
     def _build_control_card(self) -> QFrame:
         card = QFrame()
@@ -485,19 +421,20 @@ class StockMasterPage(QWidget):
         title_box = QVBoxLayout()
         title_box.setSpacing(4)
 
-        title = QLabel("Stock Master Control")
-        title.setObjectName("SectionTitle")
+        title = QLabel("SAP Stock Master")
+        title.setObjectName("PageTitle")
 
         hint = QLabel(
-            "Maintain FG, QC, scrap and blocked stock balances. These values directly affect shortage and production planning."
+            "Stock table uses SAP Code as the item key. Missing tyres can be synced from the tyre master with zero opening stock."
         )
-        hint.setObjectName("SectionHint")
+        hint.setObjectName("PageHint")
         hint.setWordWrap(True)
 
         title_box.addWidget(title)
         title_box.addWidget(hint)
 
         header.addLayout(title_box, 1)
+        header.addWidget(self.sync_btn)
         header.addWidget(self.edit_btn)
         header.addWidget(self.refresh_btn)
 
@@ -510,24 +447,19 @@ class StockMasterPage(QWidget):
         search_label = QLabel("Search")
         search_label.setObjectName("FieldLabel")
 
-        group_label = QLabel("Product Group")
-        group_label.setObjectName("FieldLabel")
-
         status_label = QLabel("Stock Status")
         status_label.setObjectName("FieldLabel")
 
         form.addWidget(search_label, 0, 0)
         form.addWidget(self.search_input, 0, 1, 1, 5)
 
-        form.addWidget(group_label, 1, 0)
-        form.addWidget(self.product_group_combo, 1, 1, 1, 2)
-
-        form.addWidget(status_label, 1, 3)
-        form.addWidget(self.stock_status_combo, 1, 4, 1, 2)
+        form.addWidget(status_label, 1, 0)
+        form.addWidget(self.stock_status_combo, 1, 1, 1, 5)
 
         form.setColumnStretch(1, 2)
         form.setColumnStretch(2, 1)
-        form.setColumnStretch(4, 2)
+        form.setColumnStretch(3, 1)
+        form.setColumnStretch(4, 1)
         form.setColumnStretch(5, 1)
 
         layout.addLayout(form)
@@ -542,13 +474,11 @@ class StockMasterPage(QWidget):
         layout.setContentsMargins(18, 16, 18, 18)
         layout.setSpacing(14)
 
-        title = QLabel("Stock Master Data")
-        title.setObjectName("SectionTitle")
+        title = QLabel("SAP Stock Data")
+        title.setObjectName("PageTitle")
 
-        hint = QLabel(
-            "Double-click a row to edit stock. Available stock is calculated as FG + QC - Scrap - Blocked."
-        )
-        hint.setObjectName("SectionHint")
+        hint = QLabel("Double-click a row to edit stock. Available stock = FG + QC - Scrap - Blocked.")
+        hint.setObjectName("PageHint")
         hint.setWordWrap(True)
 
         layout.addWidget(title)
@@ -575,115 +505,251 @@ class StockMasterPage(QWidget):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
 
-        self.table.setColumnWidth(0, 115)
-        self.table.setColumnWidth(2, 120)
-        self.table.setColumnWidth(3, 90)
-        self.table.setColumnWidth(4, 90)
-        self.table.setColumnWidth(5, 90)
-        self.table.setColumnWidth(6, 95)
-        self.table.setColumnWidth(7, 105)
+        self.table.setColumnWidth(0, 155)
+        self.table.setColumnWidth(2, 95)
+        self.table.setColumnWidth(3, 95)
+        self.table.setColumnWidth(4, 95)
+        self.table.setColumnWidth(5, 105)
+        self.table.setColumnWidth(6, 115)
 
         self.table.itemSelectionChanged.connect(self.on_selection_changed)
         self.table.itemDoubleClicked.connect(self.edit_selected_stock)
 
     def refresh(self) -> None:
         try:
-            self.load_product_groups()
-            self.refresh_metrics()
+            self.ensure_sap_stock_table()
+
+            if self.get_stock_count() == 0:
+                self.sync_tyres_from_master(show_message=False)
+
             self.refresh_table()
+
         except Exception as exc:
-            QMessageBox.critical(self, "Stock Master Error", str(exc))
+            QMessageBox.critical(self, "SAP Stock Error", str(exc))
 
-    def load_product_groups(self) -> None:
-        current_value = self.product_group_combo.currentText()
-
+    def ensure_sap_stock_table(self) -> None:
         with engine.begin() as connection:
-            rows = connection.execute(
+            connection.execute(
                 text(
                     """
-                    SELECT DISTINCT product_group
-                    FROM mpps_stock_items
-                    WHERE product_group IS NOT NULL
-                      AND TRIM(product_group) <> ''
-                    ORDER BY product_group;
+                    CREATE TABLE IF NOT EXISTS mpps_sap_stock_items (
+                        id SERIAL PRIMARY KEY,
+                        sap_code VARCHAR(100) NOT NULL UNIQUE,
+                        tyre_description TEXT NOT NULL,
+                        tyre_type VARCHAR(150),
+                        fg_stock INTEGER NOT NULL DEFAULT 0,
+                        qc_stock INTEGER NOT NULL DEFAULT 0,
+                        scrap_stock INTEGER NOT NULL DEFAULT 0,
+                        blocked_stock INTEGER NOT NULL DEFAULT 0,
+                        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                        source_table VARCHAR(150),
+                        source_note TEXT,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
                     """
                 )
-            ).scalars().all()
+            )
 
-        self.product_group_combo.blockSignals(True)
-        self.product_group_combo.clear()
-        self.product_group_combo.addItem("All Product Groups")
-
-        for value in rows:
-            self.product_group_combo.addItem(str(value))
-
-        index = self.product_group_combo.findText(current_value)
-
-        if index >= 0:
-            self.product_group_combo.setCurrentIndex(index)
-
-        self.product_group_combo.blockSignals(False)
-
-    def refresh_metrics(self) -> None:
+    def get_stock_count(self) -> int:
         with engine.begin() as connection:
-            row = connection.execute(
-                text(
-                    """
-                    SELECT
-                        COUNT(*) AS total_items,
-                        COALESCE(SUM(fg_stock), 0) AS total_fg,
-                        COALESCE(SUM(qc_stock), 0) AS total_qc,
-                        COALESCE(SUM(scrap_stock), 0) AS total_scrap,
-                        COALESCE(SUM(blocked_stock), 0) AS total_blocked,
-                        COALESCE(SUM(fg_stock + qc_stock - scrap_stock - blocked_stock), 0) AS total_available,
-                        SUM(
-                            CASE
-                                WHEN (fg_stock + qc_stock - scrap_stock - blocked_stock) <= 0 THEN 1
-                                ELSE 0
-                            END
-                        ) AS out_of_stock_items
-                    FROM mpps_stock_items
-                    WHERE is_active = TRUE;
-                    """
-                )
-            ).mappings().one()
+            return int(
+                connection.execute(
+                    text("SELECT COUNT(*) FROM mpps_sap_stock_items WHERE is_active = TRUE;")
+                ).scalar()
+                or 0
+            )
 
-        self.total_items_value.setText(self._format_int(row["total_items"]))
-        self.total_fg_value.setText(self._format_int(row["total_fg"]))
-        self.total_qc_value.setText(self._format_int(row["total_qc"]))
-        self.total_available_value.setText(self._format_int(row["total_available"]))
-        self.total_blocked_value.setText(self._format_int(row["total_blocked"]))
-        self.out_of_stock_value.setText(self._format_int(row["out_of_stock_items"]))
+    def sync_tyres_from_master(self, show_message: bool = True) -> None:
+        self.ensure_sap_stock_table()
+
+        source_rows, source_table = self.find_tyre_master_rows()
+
+        if not source_rows:
+            if show_message:
+                QMessageBox.warning(
+                    self,
+                    "No SAP Tyres Found",
+                    "Tyre master table with SAP Code was not found.\n\n"
+                    "Please confirm where your SAP tyre list is stored, or import the SAP tyre Excel list first.",
+                )
+            self.refresh_table()
+            return
+
+        insert_sql = text(
+            """
+            INSERT INTO mpps_sap_stock_items
+                (
+                    sap_code,
+                    tyre_description,
+                    tyre_type,
+                    fg_stock,
+                    qc_stock,
+                    scrap_stock,
+                    blocked_stock,
+                    is_active,
+                    source_table,
+                    source_note,
+                    updated_at
+                )
+            SELECT
+                CAST(:sap_code AS varchar),
+                CAST(:tyre_description AS text),
+                CAST(:tyre_type AS varchar),
+                0,
+                0,
+                0,
+                0,
+                TRUE,
+                CAST(:source_table AS varchar),
+                'Auto-created from tyre master with zero opening stock.',
+                CURRENT_TIMESTAMP
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM mpps_sap_stock_items
+                WHERE sap_code = CAST(:sap_code AS varchar)
+            );
+            """
+        )
+
+        inserted = 0
+
+        with engine.begin() as connection:
+            for row in source_rows:
+                result = connection.execute(
+                    insert_sql,
+                    {
+                        "sap_code": row["sap_code"],
+                        "tyre_description": row["tyre_description"],
+                        "tyre_type": row["tyre_type"],
+                        "source_table": source_table,
+                    },
+                )
+
+                inserted += int(result.rowcount or 0)
+
+        self.refresh_table()
+
+        if show_message:
+            QMessageBox.information(
+                self,
+                "SAP Stock Sync Complete",
+                f"Source table: {source_table}\nNew SAP stock items added: {inserted}",
+            )
+
+    def find_tyre_master_rows(self) -> tuple[list[dict], str]:
+        inspector = inspect(engine)
+
+        excluded_keywords = [
+            "stock",
+            "audit",
+            "user",
+            "role",
+            "alembic",
+        ]
+
+        sap_candidates = [
+            "sap_code",
+            "sapcode",
+            "sap_material_code",
+            "sap_material",
+            "material_code",
+            "item_code",
+            "code",
+        ]
+
+        desc_candidates = [
+            "tyre_description",
+            "item_description",
+            "description",
+            "product_description",
+            "product_name",
+            "name",
+        ]
+
+        type_candidates = [
+            "tyre_type",
+            "product_group",
+            "product_type",
+            "category",
+            "group_name",
+            "type",
+        ]
+
+        for table_name in inspector.get_table_names():
+            lower_table = table_name.lower()
+
+            if any(keyword in lower_table for keyword in excluded_keywords):
+                continue
+
+            columns = [column["name"] for column in inspector.get_columns(table_name)]
+            lower_map = {column.lower(): column for column in columns}
+
+            sap_col = self._first_existing_column(lower_map, sap_candidates)
+            desc_col = self._first_existing_column(lower_map, desc_candidates)
+            type_col = self._first_existing_column(lower_map, type_candidates)
+
+            if not sap_col or not desc_col:
+                continue
+
+            type_expr = (
+                f"CAST({_quote_ident(type_col)} AS varchar)"
+                if type_col
+                else "'Tyre'"
+            )
+
+            sql = f"""
+                SELECT DISTINCT
+                    CAST({_quote_ident(sap_col)} AS varchar) AS sap_code,
+                    CAST({_quote_ident(desc_col)} AS text) AS tyre_description,
+                    COALESCE(NULLIF(TRIM({type_expr}), ''), 'Tyre') AS tyre_type
+                FROM {_quote_ident(table_name)}
+                WHERE {_quote_ident(sap_col)} IS NOT NULL
+                  AND TRIM(CAST({_quote_ident(sap_col)} AS varchar)) <> ''
+                  AND {_quote_ident(desc_col)} IS NOT NULL
+                  AND TRIM(CAST({_quote_ident(desc_col)} AS varchar)) <> ''
+                ORDER BY sap_code ASC;
+            """
+
+            with engine.begin() as connection:
+                rows = connection.execute(text(sql)).mappings().all()
+
+            result_rows = [dict(row) for row in rows]
+
+            if result_rows:
+                return result_rows, table_name
+
+        return [], "-"
+
+    def _first_existing_column(self, lower_map: dict[str, str], candidates: list[str]) -> str | None:
+        for candidate in candidates:
+            if candidate.lower() in lower_map:
+                return lower_map[candidate.lower()]
+
+        return None
 
     def refresh_table(self, *args) -> None:
-        self.selected_material_code = None
+        self.selected_sap_code = None
         self.edit_btn.setEnabled(False)
 
         search_text = self.search_input.text().strip()
-        group_value = self.product_group_combo.currentText().strip()
         status_value = self.stock_status_combo.currentText().strip()
 
         conditions = ["is_active = TRUE"]
         params = {
             "search": f"%{search_text}%",
-            "product_group": group_value,
         }
 
         if search_text:
             conditions.append(
                 """
                 (
-                    material_code ILIKE :search
-                    OR item_description ILIKE :search
-                    OR COALESCE(product_group, '') ILIKE :search
+                    sap_code ILIKE :search
+                    OR tyre_description ILIKE :search
                 )
                 """
             )
-
-        if group_value and group_value != "All Product Groups":
-            conditions.append("product_group = :product_group")
 
         if status_value == "Available Stock":
             conditions.append("(fg_stock + qc_stock - scrap_stock - blocked_stock) > 0")
@@ -698,20 +764,17 @@ class StockMasterPage(QWidget):
 
         sql = f"""
             SELECT
-                material_code,
-                item_description,
-                product_group,
+                sap_code,
+                tyre_description,
                 fg_stock,
                 qc_stock,
                 scrap_stock,
                 blocked_stock,
                 (fg_stock + qc_stock - scrap_stock - blocked_stock) AS available_stock
-            FROM mpps_stock_items
+            FROM mpps_sap_stock_items
             {where_sql}
-            ORDER BY
-                available_stock ASC,
-                material_code ASC
-            LIMIT 1000;
+            ORDER BY available_stock DESC, sap_code ASC
+            LIMIT 2000;
         """
 
         with engine.begin() as connection:
@@ -723,9 +786,8 @@ class StockMasterPage(QWidget):
             self.table.insertRow(row_index)
 
             values = [
-                row["material_code"],
-                row["item_description"],
-                row["product_group"] or "-",
+                row["sap_code"],
+                row["tyre_description"],
                 self._format_int(row["fg_stock"]),
                 self._format_int(row["qc_stock"]),
                 self._format_int(row["scrap_stock"]),
@@ -736,24 +798,24 @@ class StockMasterPage(QWidget):
             for column_index, value in enumerate(values):
                 item = self._readonly_item(value)
 
-                if column_index in {3, 4, 5, 6, 7}:
+                if column_index in {0, 2, 3, 4, 5, 6}:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-                if column_index == 7:
+                if column_index == 6:
                     self._apply_available_stock_style(item, int(row["available_stock"] or 0))
 
                 if column_index == 0:
-                    item.setData(Qt.ItemDataRole.UserRole, row["material_code"])
+                    item.setData(Qt.ItemDataRole.UserRole, row["sap_code"])
 
                 self.table.setItem(row_index, column_index, item)
 
         self.table.resizeRowsToContents()
 
     def edit_selected_stock(self, *args) -> None:
-        if not self.selected_material_code:
+        if not self.selected_sap_code:
             return
 
-        stock_item = self.get_stock_item(self.selected_material_code)
+        stock_item = self.get_stock_item(self.selected_sap_code)
 
         if stock_item is None:
             QMessageBox.warning(self, "Stock Item Missing", "Selected stock item was not found.")
@@ -768,29 +830,31 @@ class StockMasterPage(QWidget):
             data = dialog.get_data()
             self.save_stock_balance(data)
             self.refresh()
+
             QMessageBox.information(self, "Stock Updated", "Stock balance updated successfully.")
+
         except Exception as exc:
             QMessageBox.critical(self, "Stock Update Failed", str(exc))
 
-    def get_stock_item(self, material_code: str):
+    def get_stock_item(self, sap_code: str):
         with engine.begin() as connection:
             return connection.execute(
                 text(
                     """
                     SELECT
-                        material_code,
-                        item_description,
-                        product_group,
+                        sap_code,
+                        tyre_description,
+                        tyre_type,
                         fg_stock,
                         qc_stock,
                         scrap_stock,
                         blocked_stock
-                    FROM mpps_stock_items
-                    WHERE material_code = :material_code
+                    FROM mpps_sap_stock_items
+                    WHERE sap_code = :sap_code
                     LIMIT 1;
                     """
                 ),
-                {"material_code": material_code},
+                {"sap_code": sap_code},
             ).mappings().first()
 
     def save_stock_balance(self, data: dict) -> None:
@@ -798,16 +862,15 @@ class StockMasterPage(QWidget):
             connection.execute(
                 text(
                     """
-                    UPDATE mpps_stock_items
+                    UPDATE mpps_sap_stock_items
                     SET
                         fg_stock = :fg_stock,
                         qc_stock = :qc_stock,
                         scrap_stock = :scrap_stock,
                         blocked_stock = :blocked_stock,
-                        last_updated_date = CURRENT_DATE,
                         source_note = :reason,
                         updated_at = CURRENT_TIMESTAMP
-                    WHERE material_code = :material_code;
+                    WHERE sap_code = :sap_code;
                     """
                 ),
                 data,
@@ -817,20 +880,20 @@ class StockMasterPage(QWidget):
         selected_items = self.table.selectedItems()
 
         if not selected_items:
-            self.selected_material_code = None
+            self.selected_sap_code = None
             self.edit_btn.setEnabled(False)
             return
 
         row = selected_items[0].row()
-        material_item = self.table.item(row, 0)
+        sap_item = self.table.item(row, 0)
 
-        if material_item is None:
-            self.selected_material_code = None
+        if sap_item is None:
+            self.selected_sap_code = None
             self.edit_btn.setEnabled(False)
             return
 
-        self.selected_material_code = material_item.data(Qt.ItemDataRole.UserRole)
-        self.edit_btn.setEnabled(bool(self.selected_material_code))
+        self.selected_sap_code = sap_item.data(Qt.ItemDataRole.UserRole)
+        self.edit_btn.setEnabled(bool(self.selected_sap_code))
 
     def _readonly_item(self, text_value: str) -> QTableWidgetItem:
         item = QTableWidgetItem(str(text_value))
