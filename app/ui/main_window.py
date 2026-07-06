@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import QApplication
 
@@ -441,6 +441,7 @@ class MainWindow(QMainWindow):
 
         self._add_caption(layout, "Data")
         self._add_nav_button(layout, "Master Data", self.TYRE_PRODUCT_TREE_INDEX)
+        self._add_nav_button(layout, "Stock Page", self.STOCK_MASTER_INDEX)
 
         self._add_caption(layout, "Planning")
         self._add_nav_button(layout, "Production Planning", self.SCHEDULE_INDEX)
@@ -1116,3 +1117,4 @@ class MainWindow(QMainWindow):
         )
 
         self.navigate(self.PLACEHOLDER_INDEX)
+
