@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import QApplication
 
@@ -50,6 +50,7 @@ from app.ui.mold_master_page import MoldMasterPage
 from app.ui.casing_master_page import CasingMasterPage
 from app.ui.tyre_item_master_page import TyreItemMasterPage
 from app.ui.admin_database_viewer_page import AdminDatabaseViewerPage
+from app.ui.factory_out_date_logic_page import FactoryOutDateLogicPage
 
 
 def _resolve_page_class(module_path: str, candidates: list[str]):
@@ -1065,6 +1066,23 @@ class MainWindow(QMainWindow):
         self.show_placeholder(title, subtitle)
 
 
+    def _show_factory_out_date_logic_page(self) -> None:
+        if not hasattr(self, "factory_out_date_logic_page"):
+            self.factory_out_date_logic_page = None
+
+        if not hasattr(self, "factory_out_date_logic_container"):
+            self.factory_out_date_logic_container = None
+
+        if self.factory_out_date_logic_page is None:
+            self.factory_out_date_logic_page = FactoryOutDateLogicPage()
+            self.factory_out_date_logic_container = self._wrap_scroll(
+                self.factory_out_date_logic_page
+            )
+            self.stack.addWidget(self.factory_out_date_logic_container)
+
+        self.stack.setCurrentWidget(self.factory_out_date_logic_container)
+
+
     def _show_admin_database_viewer_page(self) -> None:
         if not hasattr(self, "admin_database_viewer_page"):
             self.admin_database_viewer_page = None
@@ -1086,6 +1104,9 @@ class MainWindow(QMainWindow):
 
 
     def open_module_action(self, action_key: str) -> None:
+        if action_key == "factory_out_date_logic":
+            self._show_factory_out_date_logic_page()
+            return
         if action_key == "database_viewer":
             self._show_admin_database_viewer_page()
             return

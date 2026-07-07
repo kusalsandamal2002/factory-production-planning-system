@@ -1,0 +1,298 @@
+from __future__ import annotations
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+LOGIC_TEXT = """Factory Out Date Logic
+
+Business Logic Description
+
+Shipment Item Selection
+When a manager searches for a shipment item, the application must read the item from the approved SMDS/master-data source. Only items with Planning Manager Approval Status = Approved are allowed to enter the shipment order cart. Pending or Rejected items must be blocked from the cart until they are approved through the correct approval workflow.
+
+Cart Quantity and Item Receive Date
+After an approved item is selected, the manager enters the required quantity and saves that item into the cart. At this item-save point, the application should calculate and display the receive date for that item only. The full shipment order is not completed at this stage; it becomes a completed shipment order only after the manager clicks Save Shipment.
+
+Stock Allocation Before Production
+Before any production planning is started, the application must check whether the selected item has finished stock that has not already been allocated to another open shipment. That unallocated stock must be assigned to the shipment item first. Only the balance quantity that cannot be covered by stock should be sent to production planning.
+
+Production Resource Availability
+For the balance production quantity, the application must check mold availability, casing availability and line/cavity availability. Casing availability is checked only when the SMDS item requires a casing. If the casing type is No Casing, the casing check is skipped. The allocated cavity count is limited by the available mold, casing and line/cavity resources.
+
+SMDS Capacity Meaning
+The SMDS Day Plan, Night Plan and Total Plan values represent the quantity that can be produced for that item using one mold, one casing and one cavity. For the factory-out-date calculation, the application should use SMDS Total Plan as the daily per-cavity capacity. The output shown to the user only needs to be the date; showing the shift is not required.
+
+Daily Capacity = SMDS Total Plan × Allocated Cavity Count
+Required Production Days = ceil(Balance Production Quantity ÷ Daily Capacity)
+
+Final Shipment Receive Date
+A single shipment can contain many items. Each cart item should have its own calculated receive date after its quantity is saved. The final shipment receive date, also called the factory out date, is the latest receive date among all items in that shipment. When Save Shipment is clicked, the complete shipment order is saved with that final date.
+
+Current implementation: Shipment Entry now calculates item receive dates and the final shipment factory-out date using this business logic. This page remains a copyable business-logic reference note.
+""".strip()
+
+
+class FactoryOutDateLogicPage(QWidget):
+    """View-only English business logic note for shipment factory-out date calculation."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self._apply_styles()
+        self._build_ui()
+
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            """
+            QWidget {
+                font-family: "Segoe UI";
+                color: #0f172a;
+            }
+
+            QFrame#HeaderCard,
+            QFrame#DocumentCard,
+            QFrame#NoteCard {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 18px;
+            }
+
+            QLabel#PageTitle {
+                color: #0f172a;
+                font-size: 23pt;
+                font-weight: 950;
+            }
+
+            QLabel#PageSubtitle {
+                color: #64748b;
+                font-size: 10pt;
+                font-weight: 650;
+            }
+
+            QLabel#DocumentTitle {
+                color: #0f172a;
+                font-size: 16pt;
+                font-weight: 950;
+            }
+
+            QLabel#SectionTitle {
+                color: #0f172a;
+                font-size: 12.5pt;
+                font-weight: 950;
+                margin-top: 8px;
+            }
+
+            QLabel#ParagraphText {
+                color: #334155;
+                font-size: 10.5pt;
+                font-weight: 620;
+                line-height: 150%;
+            }
+
+            QLabel#FormulaText {
+                background: #f8fafc;
+                color: #0f172a;
+                border: 1px solid #e2e8f0;
+                border-radius: 12px;
+                padding: 12px 14px;
+                font-size: 10.5pt;
+                font-weight: 850;
+            }
+
+            QLabel#BadgeBlue {
+                background: #eff6ff;
+                color: #1d4ed8;
+                border: 1px solid #bfdbfe;
+                border-radius: 13px;
+                padding: 7px 12px;
+                font-size: 8.8pt;
+                font-weight: 950;
+            }
+
+            QLabel#BadgeGreen {
+                background: #ecfdf5;
+                color: #047857;
+                border: 1px solid #a7f3d0;
+                border-radius: 13px;
+                padding: 7px 12px;
+                font-size: 8.8pt;
+                font-weight: 950;
+            }
+
+            QLabel#FooterNote {
+                color: #64748b;
+                font-size: 9.5pt;
+                font-weight: 650;
+            }
+
+            QPushButton#CopyButton {
+                background: #2563eb;
+                color: #ffffff;
+                border: none;
+                border-radius: 12px;
+                padding: 10px 16px;
+                font-size: 9.5pt;
+                font-weight: 950;
+                min-height: 28px;
+            }
+
+            QPushButton#CopyButton:hover {
+                background: #1d4ed8;
+            }
+            """
+        )
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(18)
+
+        root.addWidget(self._header_card())
+        root.addWidget(self._document_card())
+        root.addWidget(self._note_card())
+        root.addStretch()
+
+    def _header_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("HeaderCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(10)
+
+        top = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title_box.setSpacing(6)
+
+        title = QLabel("Factory Out Date Logic")
+        title.setObjectName("PageTitle")
+        subtitle = QLabel(
+            "View-only English logic note for the shipment item receive-date and final shipment factory-out-date calculation."
+        )
+        subtitle.setObjectName("PageSubtitle")
+        subtitle.setWordWrap(True)
+
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
+        top.addLayout(title_box, 1)
+
+        copy_btn = QPushButton("Copy Text")
+        copy_btn.setObjectName("CopyButton")
+        copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy_btn.clicked.connect(self._copy_logic_text)
+        top.addWidget(copy_btn)
+
+        top.addWidget(self._badge("VIEW ONLY", "BadgeBlue"))
+        top.addWidget(self._badge("APPROVED ITEMS ONLY", "BadgeGreen"))
+        layout.addLayout(top)
+
+        return card
+
+    def _document_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("DocumentCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(26, 24, 26, 26)
+        layout.setSpacing(14)
+
+        title = QLabel("Business Logic Description")
+        title.setObjectName("DocumentTitle")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        self._add_section(
+            layout,
+            "Shipment Item Selection",
+            "When a manager searches for a shipment item, the application must read the item from the approved SMDS/master-data source. Only items with Planning Manager Approval Status = Approved are allowed to enter the shipment order cart. Pending or Rejected items must be blocked from the cart until they are approved through the correct approval workflow.",
+        )
+        self._add_section(
+            layout,
+            "Cart Quantity and Item Receive Date",
+            "After an approved item is selected, the manager enters the required quantity and saves that item into the cart. At this item-save point, the application should calculate and display the receive date for that item only. The full shipment order is not completed at this stage; it becomes a completed shipment order only after the manager clicks Save Shipment.",
+        )
+        self._add_section(
+            layout,
+            "Stock Allocation Before Production",
+            "Before any production planning is started, the application must check whether the selected item has finished stock that has not already been allocated to another open shipment. That unallocated stock must be assigned to the shipment item first. Only the balance quantity that cannot be covered by stock should be sent to production planning.",
+        )
+        self._add_section(
+            layout,
+            "Production Resource Availability",
+            "For the balance production quantity, the application must check mold availability, casing availability and line/cavity availability. Casing availability is checked only when the SMDS item requires a casing. If the casing type is No Casing, the casing check is skipped. The allocated cavity count is limited by the available mold, casing and line/cavity resources.",
+        )
+        self._add_section(
+            layout,
+            "SMDS Capacity Meaning",
+            "The SMDS Day Plan, Night Plan and Total Plan values represent the quantity that can be produced for that item using one mold, one casing and one cavity. For the factory-out-date calculation, the application should use SMDS Total Plan as the daily per-cavity capacity. The output shown to the user only needs to be the date; showing the shift is not required.",
+        )
+
+        formula = QLabel(
+            "Daily Capacity = SMDS Total Plan × Allocated Cavity Count\n"
+            "Required Production Days = ceil(Balance Production Quantity ÷ Daily Capacity)"
+        )
+        formula.setObjectName("FormulaText")
+        formula.setWordWrap(True)
+        layout.addWidget(formula)
+
+        self._add_section(
+            layout,
+            "Final Shipment Receive Date",
+            "A single shipment can contain many items. Each cart item should have its own calculated receive date after its quantity is saved. The final shipment receive date, also called the factory out date, is the latest receive date among all items in that shipment. When Save Shipment is clicked, the complete shipment order is saved with that final date.",
+        )
+
+        return card
+
+    def _note_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("NoteCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(22, 16, 22, 16)
+        layout.setSpacing(6)
+
+        note = QLabel(
+            "Current implementation: Shipment Entry now calculates item receive dates and the final shipment factory-out date using this business logic. This page remains a copyable business-logic reference note. Use the Copy Text button to copy this logic note for planning or update work."
+        )
+        note.setObjectName("FooterNote")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        return card
+
+    def _add_section(self, layout: QVBoxLayout, title: str, body: str) -> None:
+        title_label = QLabel(title)
+        title_label.setObjectName("SectionTitle")
+        title_label.setWordWrap(True)
+
+        body_label = QLabel(body)
+        body_label.setObjectName("ParagraphText")
+        body_label.setWordWrap(True)
+        body_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        layout.addWidget(title_label)
+        layout.addWidget(body_label)
+
+    def _badge(self, text: str, object_name: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName(object_name)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        return label
+
+    def _copy_logic_text(self) -> None:
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(LOGIC_TEXT)
+
+        QMessageBox.information(
+            self,
+            "Copied",
+            "Factory out date logic text copied to clipboard.",
+        )

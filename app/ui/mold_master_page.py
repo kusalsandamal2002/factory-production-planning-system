@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -201,9 +201,6 @@ class MoldDialog(QDialog):
         self.casing_type_input = QLineEdit(str(self.mold.get("casing_type", "")))
         self.casing_type_input.setPlaceholderText("Example: B2 / B5 / No Casing")
 
-        self.casing_count_input = QSpinBox()
-        self.casing_count_input.setRange(0, 100000)
-        self.casing_count_input.setValue(int(self.mold.get("casing_count", 0) or 0))
 
         self.status_input = QComboBox()
         self.status_input.addItems(["Active", "Inactive"])
@@ -215,7 +212,6 @@ class MoldDialog(QDialog):
         form.addRow("Mold Key Code", self.key_input)
         form.addRow("Mold Count", self.mold_count_input)
         form.addRow("Casing Type", self.casing_type_input)
-        form.addRow("Casing Count", self.casing_count_input)
         form.addRow("Status", self.status_input)
         form.addRow("Remarks", self.remarks_input)
 
@@ -235,7 +231,7 @@ class MoldDialog(QDialog):
             "mold_key_code": self.key_input.text().strip(),
             "mold_count": int(self.mold_count_input.value()),
             "casing_type": casing_type,
-            "casing_count": int(self.casing_count_input.value()),
+            "casing_count": int(self.mold.get("casing_count", 0) or 0),
             "status": self.status_input.currentText(),
             "remarks": self.remarks_input.toPlainText().strip(),
         }
@@ -405,7 +401,6 @@ class MoldMasterPage(QWidget):
 
         self.total_keys_value = self._metric_card(layout, "Mold Keys")
         self.total_molds_value = self._metric_card(layout, "Total Molds")
-        self.total_casings_value = self._metric_card(layout, "Total Casings")
         self.active_keys_value = self._metric_card(layout, "Active Keys")
 
         return layout
@@ -439,12 +434,11 @@ class MoldMasterPage(QWidget):
         layout.setContentsMargins(18, 16, 18, 18)
         layout.setSpacing(12)
 
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels([
             "Mold Key Code",
             "Mold Count",
             "Casing Type",
-            "Casing Count",
             "Status",
             "Action",
         ])
@@ -458,13 +452,11 @@ class MoldMasterPage(QWidget):
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
 
         self.table.setColumnWidth(1, 110)
-        self.table.setColumnWidth(2, 150)
+        self.table.setColumnWidth(2, 170)
         self.table.setColumnWidth(3, 120)
-        self.table.setColumnWidth(4, 120)
-        self.table.setColumnWidth(5, 180)
+        self.table.setColumnWidth(4, 180)
 
         layout.addWidget(self.table, 1)
         return card
@@ -479,7 +471,6 @@ class MoldMasterPage(QWidget):
 
         self.total_keys_value.setText(str(stats.get("total_keys", 0)))
         self.total_molds_value.setText(str(stats.get("total_molds", 0)))
-        self.total_casings_value.setText(str(stats.get("total_casings", 0)))
         self.active_keys_value.setText(str(stats.get("active_keys", 0)))
 
         self.table.setRowCount(len(rows))
@@ -490,7 +481,6 @@ class MoldMasterPage(QWidget):
             self._set_item(row_index, 0, mold.get("mold_key_code", ""))
             self._set_item(row_index, 1, mold.get("mold_count", 0), center=True)
             self._set_item(row_index, 2, mold.get("casing_type", ""))
-            self._set_item(row_index, 3, mold.get("casing_count", 0), center=True)
 
             status_combo = QComboBox()
             status_combo.addItems(["Active", "Inactive"])
@@ -500,7 +490,7 @@ class MoldMasterPage(QWidget):
             status_combo.currentTextChanged.connect(
                 lambda status, mold_id=mold["id"]: self.update_status(mold_id, status)
             )
-            self.table.setCellWidget(row_index, 4, status_combo)
+            self.table.setCellWidget(row_index, 3, status_combo)
 
             action_widget = QWidget()
             action_layout = QHBoxLayout(action_widget)
@@ -518,7 +508,7 @@ class MoldMasterPage(QWidget):
             action_layout.addWidget(edit_button)
             action_layout.addWidget(delete_button)
 
-            self.table.setCellWidget(row_index, 5, action_widget)
+            self.table.setCellWidget(row_index, 4, action_widget)
 
     def _set_item(self, row: int, col: int, value, center: bool = False) -> None:
         item = QTableWidgetItem(str(value if value is not None else ""))

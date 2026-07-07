@@ -319,6 +319,11 @@ def create_admin_control_page(open_callback=None) -> ModuleHubPage:
                 action_key="audit_log",
             ),
             ModuleCard(
+                title="Factory Out Date Logic",
+                description="View shipment item receive-date and final factory-out-date calculation logic before scheduler automation is connected.",
+                action_key="factory_out_date_logic",
+            ),
+            ModuleCard(
                 title="Database Viewer",
                 description="View PostgreSQL tables safely with lazy loading, search, pagination and CSV export.",
                 action_key="database_viewer",
