@@ -318,6 +318,11 @@ def create_admin_control_page(open_callback=None) -> ModuleHubPage:
                 description="Track who changed master data, stock, demand and schedule records.",
                 action_key="audit_log",
             ),
+            ModuleCard(
+                title="Database Viewer",
+                description="View PostgreSQL tables safely with lazy loading, search, pagination and CSV export.",
+                action_key="database_viewer",
+            ),
         ],
         open_callback=open_callback,
     )

@@ -49,6 +49,7 @@ from app.ui.cavities_master_page import CavitiesMasterPage
 from app.ui.mold_master_page import MoldMasterPage
 from app.ui.casing_master_page import CasingMasterPage
 from app.ui.tyre_item_master_page import TyreItemMasterPage
+from app.ui.admin_database_viewer_page import AdminDatabaseViewerPage
 
 
 def _resolve_page_class(module_path: str, candidates: list[str]):
@@ -1063,7 +1064,32 @@ class MainWindow(QMainWindow):
         )
         self.show_placeholder(title, subtitle)
 
+
+    def _show_admin_database_viewer_page(self) -> None:
+        if not hasattr(self, "admin_database_viewer_page"):
+            self.admin_database_viewer_page = None
+
+        if not hasattr(self, "admin_database_viewer_container"):
+            self.admin_database_viewer_container = None
+
+        if self.admin_database_viewer_page is None:
+            self.admin_database_viewer_page = AdminDatabaseViewerPage(self.current_user)
+            self.admin_database_viewer_container = self._wrap_scroll(
+                self.admin_database_viewer_page
+            )
+            self.stack.addWidget(self.admin_database_viewer_container)
+
+        self.stack.setCurrentWidget(self.admin_database_viewer_container)
+
+        if hasattr(self.admin_database_viewer_page, "load_tables_once"):
+            self.admin_database_viewer_page.load_tables_once()
+
+
     def open_module_action(self, action_key: str) -> None:
+        if action_key == "database_viewer":
+            self._show_admin_database_viewer_page()
+            return
+
         if self.monthly_stock_only_mode:
             self.navigate(self.MONTHLY_STOCK_COUNT_INDEX)
             return
