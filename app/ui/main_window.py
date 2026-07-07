@@ -27,7 +27,6 @@ from app.ui.bead_master_page import BeadMasterPage
 from app.ui.bom_master_page import BomMasterPage
 from app.ui.compound_master_page import CompoundMasterPage
 from app.ui.dashboard_page import DashboardPage
-from app.ui.details.shipment_details_page import ShipmentDetailsPage
 from app.ui.module_hub_page import (
     create_admin_control_page,
     create_factory_data_center_page,
@@ -35,6 +34,7 @@ from app.ui.module_hub_page import (
 )
 from app.ui.monthly_stock_count_page import MonthlyStockCountPage
 from app.ui.order_entry_page import OrderEntryPage
+from app.ui.shipment_orders_page import ShipmentDetailsPage
 from app.ui.product_master_page import ProductMasterPage
 from app.ui.production_line_master_page import ProductionLineMasterPage
 from app.ui.schedule_page import SchedulePage
@@ -438,6 +438,7 @@ class MainWindow(QMainWindow):
 
         self._add_caption(layout, "Orders")
         self._add_nav_button(layout, "Shipment Orders", self.ORDER_ENTRY_INDEX)
+        self._add_nav_button(layout, "Shipment Details", self.SHIPMENT_DETAILS_INDEX)
 
         layout.addSpacing(8)
 
@@ -529,7 +530,7 @@ class MainWindow(QMainWindow):
             open_item_detail_callback=self.open_stock_item_detail
         )
 
-        self.shipment_details_page = ShipmentDetailsPage()
+        self.shipment_details_page = ShipmentDetailsPage(self.current_user)
 
         self.tire_details_page = PlaceholderPage(
             "Archived Legacy Module",
@@ -1122,4 +1123,5 @@ class MainWindow(QMainWindow):
         )
 
         self.navigate(self.PLACEHOLDER_INDEX)
+
 

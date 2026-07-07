@@ -1,19 +1,16 @@
 ﻿from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, timedelta
-from math import ceil
+from datetime import date
 
-from PySide6.QtCore import QDate, Qt, QStringListModel
+from PySide6.QtCore import QDate, Qt
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QCalendarWidget,
     QCompleter,
     QDateEdit,
     QFrame,
     QGridLayout,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -25,210 +22,242 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from sqlalchemy import text
+
+from app.database import engine
+from app.services.shipment_entry_sync_service import ensure_shipment_entry_detail_table
 
 
-@dataclass(frozen=True)
-class DemoItem:
-    code: str
-    description: str
-    tyre_type: str
-    line: str
-    mold: str
-    casing: str
-
-
-class CustomerOrderEntryPage(QWidget):
-    def __init__(self, current_user=None):
+class OrderEntryPage(QWidget):
+    def __init__(self, current_user=None, *args, **kwargs):
         super().__init__()
+
         self.current_user = current_user
-        self.order_items: list[dict[str, object]] = []
-        self.plan_date_enabled = True
+        self.current_items: list[dict] = []
+        self.master_items: list[dict] = []
+        self.current_shipment_id: int | None = None
 
-        self.shipments = {
-            "ABC Tyres Shipment": [
-                ("SHP-00021", "2026-07-12", "12 items", "Completed"),
-                ("SHP-00018", "2026-06-29", "8 items", "Delivered"),
-                ("SHP-00011", "2026-06-04", "15 items", "Completed"),
-            ],
-            "Lanka Industrial Shipment": [
-                ("SHP-00034", "2026-07-20", "9 items", "In Planning"),
-                ("SHP-00028", "2026-06-16", "11 items", "Delivered"),
-            ],
-            "Ceylon Forklift Shipment": [
-                ("SHP-00041", "2026-07-25", "6 items", "Completed"),
-                ("SHP-00030", "2026-06-21", "10 items", "Delivered"),
-            ],
-            "Global Material Handling Shipment": [
-                ("SHP-00038", "2026-07-22", "14 items", "Completed"),
-            ],
-        }
+        self.shipment_name_input = QLineEdit()
+        self.shipment_name_input.setPlaceholderText("Type shipment name / shipment no")
+        self.shipment_name_input.textChanged.connect(self.load_previous_shipments)
 
-        self.demo_items = [
-            DemoItem("SAP00123", "6.00-9 Resilient Standard Quick 2L NM", "Resilient Tyre", "400T", "M-400-018", "B2"),
-            DemoItem("SAP00124", "6.00-9 Resilient Standard Normal 2L Grey", "Resilient Tyre", "400T", "M-400-019", "B2"),
-            DemoItem("SAP00125", "7.00-12 Resilient Ultima Quick 3L Black", "Resilient Tyre", "800T", "M-800-044", "B5"),
-            DemoItem("SAP00388", "6.00-9 Press-On Standard NM", "Press-On Tyre", "200T", "M-200-012", "Mono"),
-            DemoItem("SAP00410", "8.15-15 Press-On Ultima Black", "Press-On Tyre", "400T", "M-400-072", "B3"),
-            DemoItem("SAP00520", "10x5x6.5 Cured-On NM", "Cured-On Tyre", "200T", "M-200-031", "Mono"),
-            DemoItem("SAP00630", "SuperSolid Industrial Tyre Black", "SuperSolid", "SuperSolid", "Special", "No restriction"),
-        ]
+        self.customer_input = QLineEdit()
+        self.customer_input.setPlaceholderText("Customer / destination / note")
 
-        self.item_lookup = {self._item_display(item): item for item in self.demo_items}
+        self.plan_date_input = QDateEdit()
+        self.plan_date_input.setCalendarPopup(True)
+        self.plan_date_input.setDate(QDate.currentDate().addDays(7))
+        self.plan_date_input.dateChanged.connect(self.recalculate_actual_date)
 
-        self._build_styles()
+        self.actual_date_input = QLineEdit()
+        self.actual_date_input.setReadOnly(True)
+        self.actual_date_input.setText("Pending")
+
+        self.remarks_input = QTextEdit()
+        self.remarks_input.setPlaceholderText("Remarks / special instructions")
+        self.remarks_input.setMinimumHeight(72)
+
+        self.item_search_input = QLineEdit()
+        self.item_search_input.setPlaceholderText("Search SAP code or tyre description from master data...")
+        self.item_search_input.textChanged.connect(self.update_item_preview)
+
+        self.quantity_input = QSpinBox()
+        self.quantity_input.setRange(1, 999999999)
+        self.quantity_input.setValue(1)
+
+        self.add_item_btn = QPushButton("Add Item")
+        self.add_item_btn.setObjectName("PrimaryButton")
+        self.add_item_btn.clicked.connect(self.add_item)
+
+        self.save_btn = QPushButton("Save Shipment")
+        self.save_btn.setObjectName("PrimaryButton")
+        self.save_btn.clicked.connect(self.save_shipment)
+
+        self.clear_btn = QPushButton("Clear Form")
+        self.clear_btn.setObjectName("SecondaryButton")
+        self.clear_btn.clicked.connect(self.clear_form)
+
+        self.refresh_btn = QPushButton("Refresh Master Data")
+        self.refresh_btn.setObjectName("SecondaryButton")
+        self.refresh_btn.clicked.connect(self.refresh_master_items)
+
+        self.preview_code_label = QLabel("No item selected.")
+        self.preview_desc_label = QLabel("Search SAP code or tyre description to preview item details.")
+        self.preview_available_label = QLabel("")
+
+        self.items_table = QTableWidget(0, 4)
+        self.items_table.setHorizontalHeaderLabels(["SAP Code", "Description", "Qty", "Action"])
+
+        self.previous_table = QTableWidget(0, 4)
+        self.previous_table.setHorizontalHeaderLabels(["Shipment No", "Date", "Items", "Status"])
+
+        self.summary_items_value = QLabel("0")
+        self.summary_qty_value = QLabel("0")
+        self.summary_shipment_label = QLabel("Shipment: -")
+        self.summary_plan_date_label = QLabel("Plan To Receive Date: -")
+        self.summary_actual_date_label = QLabel("Shipment Can Receive Actual Date: Pending")
+
+        self._apply_styles()
         self._build_ui()
-        self._setup_autocomplete()
-        self._refresh_previous_shipments()
-        self._refresh_summary()
+        self._setup_tables()
 
-    def _build_styles(self) -> None:
+        self.ensure_tables()
+        ensure_shipment_entry_detail_table()
+        self.refresh_master_items()
+        self.load_previous_shipments()
+        self.recalculate_actual_date()
+
+    def _apply_styles(self) -> None:
         self.setStyleSheet(
             """
-            QFrame#HeaderCard, QFrame#PanelCard, QFrame#SummaryCard, QFrame#PreviewCard {
+            QWidget {
+                font-family: "Segoe UI";
+            }
+
+            QFrame#HeaderCard,
+            QFrame#FormCard,
+            QFrame#TableCard,
+            QFrame#SummaryCard,
+            QFrame#PreviewCard {
                 background: #ffffff;
                 border: 1px solid #e2e8f0;
-                border-radius: 18px;
+                border-radius: 16px;
             }
 
             QLabel#PageTitle {
                 color: #0f172a;
-                font-size: 24pt;
+                font-size: 22pt;
                 font-weight: 950;
             }
 
-            QLabel#PageSubtitle {
+            QLabel#PageHint,
+            QLabel#Hint {
                 color: #64748b;
-                font-size: 10pt;
+                font-size: 9.5pt;
                 font-weight: 650;
             }
 
             QLabel#SectionTitle {
                 color: #0f172a;
-                font-size: 14pt;
+                font-size: 17pt;
                 font-weight: 950;
             }
 
             QLabel#FieldLabel {
                 color: #334155;
                 font-size: 9pt;
-                font-weight: 900;
-            }
-
-            QLabel#HintText {
-                color: #64748b;
-                font-size: 9pt;
-                font-weight: 650;
+                font-weight: 850;
             }
 
             QLabel#PreviewTitle {
                 color: #0f172a;
-                font-size: 11.5pt;
+                font-size: 11pt;
                 font-weight: 950;
             }
 
-            QLabel#PreviewLine {
-                color: #334155;
-                font-size: 9pt;
-                font-weight: 750;
-            }
-
-            QLabel#SummaryValue {
-                color: #020617;
-                font-size: 20pt;
-                font-weight: 950;
-            }
-
-            QLabel#SummaryLabel {
-                color: #64748b;
-                font-size: 9pt;
-                font-weight: 800;
-            }
-
-            QLabel#StatusBadge {
-                background: #eff6ff;
-                color: #1d4ed8;
-                border: 1px solid #bfdbfe;
-                border-radius: 12px;
-                padding: 9px 12px;
-                font-size: 9pt;
-                font-weight: 900;
-            }
-
-            QLineEdit, QDateEdit, QSpinBox, QTextEdit {
-                background: #ffffff;
-                border: 1px solid #cbd5e1;
-                border-radius: 10px;
-                padding: 8px 10px;
-                color: #0f172a;
+            QLabel#PreviewText {
+                color: #475569;
                 font-size: 9.5pt;
                 font-weight: 650;
             }
 
-            QLineEdit:read-only {
-                background: #f8fafc;
+            QLabel#MetricValue {
                 color: #0f172a;
+                font-size: 24pt;
+                font-weight: 950;
             }
 
-            QLineEdit:focus, QDateEdit:focus, QSpinBox:focus, QTextEdit:focus {
+            QLabel#MetricLabel {
+                color: #64748b;
+                font-size: 9pt;
+                font-weight: 850;
+            }
+
+            QLineEdit, QDateEdit, QTextEdit, QSpinBox {
+                background: #ffffff;
+                color: #0f172a;
+                border: 1px solid #cbd5e1;
+                border-radius: 10px;
+                padding: 9px 12px;
+                font-size: 10pt;
+                font-weight: 650;
+                min-height: 24px;
+            }
+
+            QLineEdit:focus, QDateEdit:focus, QTextEdit:focus, QSpinBox:focus {
                 border: 1px solid #2563eb;
+            }
+
+            QLineEdit:read-only {
+                background: #f8fafc;
+                color: #1d4ed8;
             }
 
             QPushButton#PrimaryButton {
                 background: #2563eb;
                 color: #ffffff;
                 border: none;
-                border-radius: 11px;
+                border-radius: 10px;
                 padding: 10px 18px;
-                font-size: 9.5pt;
                 font-weight: 950;
+                min-height: 26px;
             }
 
             QPushButton#PrimaryButton:hover {
                 background: #1d4ed8;
             }
 
-            QPushButton#SoftButton {
-                background: #dbeafe;
-                color: #1d4ed8;
+            QPushButton#SecondaryButton {
+                background: #e2e8f0;
+                color: #0f172a;
                 border: none;
                 border-radius: 10px;
-                padding: 8px 14px;
-                font-size: 9pt;
-                font-weight: 900;
+                padding: 10px 18px;
+                font-weight: 950;
+                min-height: 26px;
             }
 
-            QPushButton#SoftButton:hover {
-                background: #bfdbfe;
+            QPushButton#SecondaryButton:hover {
+                background: #cbd5e1;
             }
 
             QPushButton#DangerButton {
                 background: #fee2e2;
-                color: #b91c1c;
+                color: #991b1b;
                 border: none;
                 border-radius: 9px;
-                padding: 7px 10px;
-                font-size: 8.5pt;
-                font-weight: 900;
+                padding: 8px 14px;
+                font-weight: 950;
+            }
+
+            QPushButton#DangerButton:hover {
+                background: #fecaca;
             }
 
             QTableWidget {
                 background: #ffffff;
-                border: 1px solid #e2e8f0;
-                border-radius: 14px;
-                gridline-color: #e2e8f0;
                 color: #0f172a;
-                font-size: 9pt;
-                font-weight: 650;
+                border: 1px solid #e2e8f0;
+                border-radius: 12px;
+                gridline-color: #e2e8f0;
+                alternate-background-color: #f8fafc;
+                selection-background-color: #dbeafe;
+                selection-color: #0f172a;
+            }
+
+            QTableWidget::item {
+                padding: 8px 10px;
+                border: none;
             }
 
             QHeaderView::section {
-                background: #f8fafc;
-                color: #334155;
+                background: #f1f5f9;
+                color: #1e293b;
                 border: none;
+                border-right: 1px solid #e2e8f0;
                 border-bottom: 1px solid #e2e8f0;
-                padding: 9px;
-                font-size: 8.8pt;
-                font-weight: 900;
+                padding: 10px;
+                font-weight: 950;
             }
             """
         )
@@ -236,220 +265,142 @@ class CustomerOrderEntryPage(QWidget):
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(14)
+        root.setSpacing(16)
 
-        root.addWidget(self._build_header())
-        root.addWidget(self._build_shipment_header())
+        root.addWidget(self._header_card())
+        root.addWidget(self._shipment_form_card())
 
         middle = QHBoxLayout()
-        middle.setSpacing(14)
-        middle.addWidget(self._build_add_item_panel(), 3)
-        middle.addWidget(self._build_previous_shipments_panel(), 2)
+        middle.setSpacing(16)
+        middle.addWidget(self._add_item_card(), 2)
+        middle.addWidget(self._previous_shipments_card(), 1)
         root.addLayout(middle)
 
         bottom = QHBoxLayout()
-        bottom.setSpacing(14)
-        bottom.addWidget(self._build_items_table_panel(), 4)
-        bottom.addWidget(self._build_summary_panel(), 2)
+        bottom.setSpacing(16)
+        bottom.addWidget(self._items_card(), 2)
+        bottom.addWidget(self._summary_card(), 1)
         root.addLayout(bottom, 1)
 
-    def _build_header(self) -> QFrame:
+    def _header_card(self) -> QFrame:
         card = QFrame()
         card.setObjectName("HeaderCard")
 
-        layout = QVBoxLayout(card)
+        layout = QHBoxLayout(card)
         layout.setContentsMargins(22, 18, 22, 18)
-        layout.setSpacing(6)
+        layout.setSpacing(14)
+
+        title_box = QVBoxLayout()
+        title_box.setSpacing(5)
 
         title = QLabel("Shipment Entry")
         title.setObjectName("PageTitle")
 
-        subtitle = QLabel(
-            "Enter shipment details, add tyre items, and preview the actual date the shipment can be received."
+        hint = QLabel(
+            "Enter shipment details and add tyre items directly from Master Data / SAP Stock Master. No dummy tyre data is used."
         )
-        subtitle.setObjectName("PageSubtitle")
-        subtitle.setWordWrap(True)
+        hint.setObjectName("PageHint")
+        hint.setWordWrap(True)
 
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
+        title_box.addWidget(title)
+        title_box.addWidget(hint)
+
+        layout.addLayout(title_box, 1)
+        layout.addWidget(self.refresh_btn)
+        layout.addWidget(self.clear_btn)
+        layout.addWidget(self.save_btn)
+
         return card
 
-    def _build_shipment_header(self) -> QFrame:
+    def _shipment_form_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("PanelCard")
+        card.setObjectName("FormCard")
 
         layout = QGridLayout(card)
-        layout.setContentsMargins(18, 14, 18, 16)
+        layout.setContentsMargins(18, 16, 18, 18)
         layout.setHorizontalSpacing(14)
-        layout.setVerticalSpacing(9)
+        layout.setVerticalSpacing(12)
 
-        self.shipment_name_input = QLineEdit()
-        self.shipment_name_input.setPlaceholderText("Type shipment name")
+        self._add_field(layout, 0, 0, "Shipment Name", self.shipment_name_input)
+        self._add_field(layout, 0, 1, "Customer / Destination", self.customer_input)
+        self._add_field(layout, 0, 2, "Plan To Receive Date", self.plan_date_input)
+        self._add_field(layout, 0, 3, "Shipment Can Receive Actual Date", self.actual_date_input)
 
-        self.plan_date_input = QDateEdit()
-        self.plan_date_input.setCalendarPopup(True)
-        self.plan_date_input.setDisplayFormat("yyyy-MM-dd")
-        self.plan_date_input.setDate(QDate.currentDate().addDays(7))
-        self.plan_date_input.setEnabled(True)
-        self.plan_date_input.setCalendarWidget(self._build_calendar())
+        remarks_label = QLabel("Remarks")
+        remarks_label.setObjectName("FieldLabel")
+        layout.addWidget(remarks_label, 2, 0)
+        layout.addWidget(self.remarks_input, 3, 0, 1, 4)
 
-        self.auto_date_button = QPushButton("Auto Earliest")
-        self.auto_date_button.setObjectName("SoftButton")
-        self.auto_date_button.setToolTip(
-            "Ignore plan to receive date and calculate the earliest possible actual receive date."
-        )
-
-        self.actual_receive_date_display = QLineEdit()
-        self.actual_receive_date_display.setReadOnly(True)
-        self.actual_receive_date_display.setPlaceholderText("Auto calculated")
-
-        self.remarks_input = QTextEdit()
-        self.remarks_input.setPlaceholderText("Remarks / special instructions")
-        self.remarks_input.setFixedHeight(58)
-
-        layout.addWidget(self._label("Shipment Name"), 0, 0)
-        layout.addWidget(self.shipment_name_input, 1, 0)
-
-        layout.addWidget(self._label("Plan To Receive Date"), 0, 1)
-
-        plan_date_row = QHBoxLayout()
-        plan_date_row.setSpacing(8)
-        plan_date_row.addWidget(self.plan_date_input, 1)
-        plan_date_row.addWidget(self.auto_date_button)
-        layout.addLayout(plan_date_row, 1, 1)
-
-        layout.addWidget(self._label("Shipment Can Receive Actual Date"), 0, 2)
-        layout.addWidget(self.actual_receive_date_display, 1, 2)
-
-        layout.addWidget(self._label("Remarks"), 2, 0)
-        layout.addWidget(self.remarks_input, 3, 0, 1, 3)
-
-        self.plan_date_input.dateChanged.connect(self._on_plan_date_changed)
-        self.auto_date_button.clicked.connect(self._use_auto_earliest_date)
+        for col in range(4):
+            layout.setColumnStretch(col, 1)
 
         return card
 
-    def _build_calendar(self) -> QCalendarWidget:
-        calendar = QCalendarWidget()
-        calendar.setGridVisible(True)
-        calendar.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
-        calendar.setStyleSheet(
-            """
-            QCalendarWidget {
-                background: #ffffff;
-                color: #0f172a;
-                border: 1px solid #cbd5e1;
-                border-radius: 12px;
-            }
-
-            QCalendarWidget QWidget {
-                background: #ffffff;
-                color: #0f172a;
-            }
-
-            QCalendarWidget QToolButton {
-                background: #eff6ff;
-                color: #1d4ed8;
-                border: 1px solid #bfdbfe;
-                border-radius: 8px;
-                padding: 6px;
-                font-weight: 900;
-            }
-
-            QCalendarWidget QToolButton:hover {
-                background: #dbeafe;
-            }
-
-            QCalendarWidget QMenu {
-                background: #ffffff;
-                color: #0f172a;
-                border: 1px solid #cbd5e1;
-            }
-
-            QCalendarWidget QSpinBox {
-                background: #ffffff;
-                color: #0f172a;
-                border: 1px solid #cbd5e1;
-                border-radius: 6px;
-                padding: 4px;
-            }
-
-            QCalendarWidget QAbstractItemView {
-                background: #ffffff;
-                color: #0f172a;
-                selection-background-color: #2563eb;
-                selection-color: #ffffff;
-                border: none;
-                outline: none;
-                font-weight: 800;
-            }
-            """
-        )
-        return calendar
-
-    def _build_add_item_panel(self) -> QFrame:
+    def _add_item_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("PanelCard")
+        card.setObjectName("FormCard")
 
         layout = QVBoxLayout(card)
         layout.setContentsMargins(18, 16, 18, 18)
-        layout.setSpacing(12)
+        layout.setSpacing(14)
 
         title = QLabel("Add Shipment Item")
         title.setObjectName("SectionTitle")
 
-        form = QGridLayout()
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(8)
-
-        self.item_input = QLineEdit()
-        self.item_input.setPlaceholderText("Type item code or description")
-
-        self.qty_input = QSpinBox()
-        self.qty_input.setRange(1, 1_000_000)
-        self.qty_input.setValue(1)
-
-        add_button = QPushButton("Add Item")
-        add_button.setObjectName("PrimaryButton")
-        add_button.clicked.connect(self._add_item)
-
-        form.addWidget(self._label("Item Code / Description"), 0, 0)
-        form.addWidget(self._label("Quantity"), 0, 1)
-        form.addWidget(self.item_input, 1, 0)
-        form.addWidget(self.qty_input, 1, 1)
-        form.addWidget(add_button, 1, 2)
-
-        self.item_preview = QFrame()
-        self.item_preview.setObjectName("PreviewCard")
-
-        preview_layout = QVBoxLayout(self.item_preview)
-        preview_layout.setContentsMargins(14, 12, 14, 12)
-        preview_layout.setSpacing(5)
-
-        preview_title = QLabel("Selected Item Preview")
-        preview_title.setObjectName("PreviewTitle")
-
-        self.preview_description = QLabel("No item selected.")
-        self.preview_description.setObjectName("PreviewLine")
-        self.preview_description.setWordWrap(True)
-
-        self.preview_details = QLabel("Type an item code or description to preview item details.")
-        self.preview_details.setObjectName("HintText")
-        self.preview_details.setWordWrap(True)
-
-        preview_layout.addWidget(preview_title)
-        preview_layout.addWidget(self.preview_description)
-        preview_layout.addWidget(self.preview_details)
+        hint = QLabel("Items are loaded from Master Data. Search using SAP code or tyre description.")
+        hint.setObjectName("Hint")
 
         layout.addWidget(title)
+        layout.addWidget(hint)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+
+        item_label = QLabel("Item Code / Description")
+        item_label.setObjectName("FieldLabel")
+
+        qty_label = QLabel("Quantity")
+        qty_label.setObjectName("FieldLabel")
+
+        form.addWidget(item_label, 0, 0)
+        form.addWidget(qty_label, 0, 1)
+        form.addWidget(self.item_search_input, 1, 0)
+        form.addWidget(self.quantity_input, 1, 1)
+        form.addWidget(self.add_item_btn, 1, 2)
+
+        form.setColumnStretch(0, 1)
+
         layout.addLayout(form)
-        layout.addWidget(self.item_preview)
+        layout.addWidget(self._preview_card())
 
         return card
 
-    def _build_previous_shipments_panel(self) -> QFrame:
+    def _preview_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("PanelCard")
+        card.setObjectName("PreviewCard")
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(5)
+
+        title = QLabel("Selected Item Preview")
+        title.setObjectName("PreviewTitle")
+
+        self.preview_code_label.setObjectName("PreviewText")
+        self.preview_desc_label.setObjectName("PreviewText")
+        self.preview_available_label.setObjectName("PreviewText")
+
+        layout.addWidget(title)
+        layout.addWidget(self.preview_code_label)
+        layout.addWidget(self.preview_desc_label)
+        layout.addWidget(self.preview_available_label)
+
+        return card
+
+    def _previous_shipments_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("TableCard")
 
         layout = QVBoxLayout(card)
         layout.setContentsMargins(18, 16, 18, 18)
@@ -458,30 +409,19 @@ class CustomerOrderEntryPage(QWidget):
         title = QLabel("Previous Shipments")
         title.setObjectName("SectionTitle")
 
-        self.previous_shipments_hint = QLabel("Type or select a shipment name to view previous shipments.")
-        self.previous_shipments_hint.setObjectName("HintText")
-        self.previous_shipments_hint.setWordWrap(True)
-
-        self.previous_shipments_table = QTableWidget()
-        self.previous_shipments_table.setColumnCount(4)
-        self.previous_shipments_table.setHorizontalHeaderLabels(
-            ["Shipment No", "Date", "Items", "Status"]
-        )
-        self.previous_shipments_table.verticalHeader().setVisible(False)
-        self.previous_shipments_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.previous_shipments_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.previous_shipments_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.previous_shipments_table.setMinimumHeight(170)
+        hint = QLabel("Saved shipments from database. Double-click to load the shipment into this entry form.")
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
 
         layout.addWidget(title)
-        layout.addWidget(self.previous_shipments_hint)
-        layout.addWidget(self.previous_shipments_table, 1)
+        layout.addWidget(hint)
+        layout.addWidget(self.previous_table, 1)
 
         return card
 
-    def _build_items_table_panel(self) -> QFrame:
+    def _items_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("PanelCard")
+        card.setObjectName("TableCard")
 
         layout = QVBoxLayout(card)
         layout.setContentsMargins(18, 16, 18, 18)
@@ -490,380 +430,632 @@ class CustomerOrderEntryPage(QWidget):
         title = QLabel("Shipment Items")
         title.setObjectName("SectionTitle")
 
-        self.items_table = QTableWidget()
-        self.items_table.setColumnCount(4)
-        self.items_table.setHorizontalHeaderLabels(
-            ["Item Code", "Description", "Qty", "Action"]
-        )
-        self.items_table.verticalHeader().setVisible(False)
-        self.items_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.items_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.items_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        hint = QLabel("Items selected for this shipment. Remove and re-add if you need to correct an item before saving.")
+        hint.setObjectName("Hint")
 
         layout.addWidget(title)
+        layout.addWidget(hint)
         layout.addWidget(self.items_table, 1)
 
         return card
 
-    def _build_summary_panel(self) -> QFrame:
+    def _summary_card(self) -> QFrame:
         card = QFrame()
         card.setObjectName("SummaryCard")
 
         layout = QVBoxLayout(card)
         layout.setContentsMargins(18, 16, 18, 18)
-        layout.setSpacing(12)
+        layout.setSpacing(16)
 
         title = QLabel("Shipment Summary")
         title.setObjectName("SectionTitle")
 
-        self.shipment_summary_label = QLabel("Shipment: -")
-        self.shipment_summary_label.setObjectName("HintText")
-        self.shipment_summary_label.setWordWrap(True)
+        self.summary_shipment_label.setObjectName("Hint")
 
-        metric_row = QHBoxLayout()
-        metric_row.setSpacing(12)
+        metrics = QHBoxLayout()
+        metrics.setSpacing(12)
 
-        self.total_items_box = self._summary_metric("0", "Total Items")
-        self.total_qty_box = self._summary_metric("0", "Total Qty")
-
-        metric_row.addWidget(self.total_items_box)
-        metric_row.addWidget(self.total_qty_box)
+        metrics.addWidget(self._metric_box(self.summary_items_value, "Total Items"))
+        metrics.addWidget(self._metric_box(self.summary_qty_value, "Total Qty"))
 
         result_title = QLabel("Calculated Planning Result")
-        result_title.setObjectName("PreviewTitle")
+        result_title.setObjectName("SectionTitle")
 
-        self.priority_mode_label = QLabel("Priority Mode: Plan to receive date")
-        self.priority_mode_label.setObjectName("PreviewLine")
-        self.priority_mode_label.setWordWrap(True)
-
-        self.plan_date_label = QLabel("Plan To Receive Date: -")
-        self.plan_date_label.setObjectName("PreviewLine")
-        self.plan_date_label.setWordWrap(True)
-
-        self.actual_date_label = QLabel("Shipment Can Receive Actual Date: Pending")
-        self.actual_date_label.setObjectName("PreviewLine")
-        self.actual_date_label.setWordWrap(True)
-
-        self.planning_status_label = QLabel("Planning Status: Add items to calculate actual receive date.")
-        self.planning_status_label.setObjectName("StatusBadge")
-        self.planning_status_label.setWordWrap(True)
-
-        save_button = QPushButton("Save Shipment Draft")
-        save_button.setObjectName("PrimaryButton")
-        save_button.clicked.connect(self._save_draft_preview)
-
-        clear_button = QPushButton("Clear Shipment")
-        clear_button.setObjectName("SoftButton")
-        clear_button.clicked.connect(self._clear_shipment)
+        self.summary_plan_date_label.setObjectName("Hint")
+        self.summary_actual_date_label.setObjectName("Hint")
 
         layout.addWidget(title)
-        layout.addWidget(self.shipment_summary_label)
-        layout.addLayout(metric_row)
-        layout.addSpacing(8)
+        layout.addWidget(self.summary_shipment_label)
+        layout.addLayout(metrics)
         layout.addWidget(result_title)
-        layout.addWidget(self.priority_mode_label)
-        layout.addWidget(self.plan_date_label)
-        layout.addWidget(self.actual_date_label)
-        layout.addWidget(self.planning_status_label)
+        layout.addWidget(self.summary_plan_date_label)
+        layout.addWidget(self.summary_actual_date_label)
         layout.addStretch()
-        layout.addWidget(save_button)
-        layout.addWidget(clear_button)
 
         return card
 
-    def _summary_metric(self, value: str, label: str) -> QFrame:
-        box = QFrame()
-        box.setObjectName("PreviewCard")
+    def _metric_box(self, value_label: QLabel, label_text: str) -> QFrame:
+        card = QFrame()
+        card.setObjectName("PreviewCard")
 
-        layout = QVBoxLayout(box)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(2)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 12, 14, 12)
 
-        value_label = QLabel(value)
-        value_label.setObjectName("SummaryValue")
+        value_label.setObjectName("MetricValue")
 
-        label_widget = QLabel(label)
-        label_widget.setObjectName("SummaryLabel")
-
-        if label == "Total Items":
-            self.total_items_value = value_label
-        if label == "Total Qty":
-            self.total_qty_value = value_label
+        label = QLabel(label_text)
+        label.setObjectName("MetricLabel")
 
         layout.addWidget(value_label)
-        layout.addWidget(label_widget)
-        return box
+        layout.addWidget(label)
 
-    def _label(self, text: str) -> QLabel:
-        label = QLabel(text)
+        return card
+
+    def _add_field(self, grid: QGridLayout, row: int, col: int, label_text: str, widget: QWidget) -> None:
+        label = QLabel(label_text)
         label.setObjectName("FieldLabel")
-        return label
+        grid.addWidget(label, row * 2, col)
+        grid.addWidget(widget, row * 2 + 1, col)
 
-    def _setup_autocomplete(self) -> None:
-        shipment_model = QStringListModel(sorted(self.shipments.keys()))
-        self.shipment_completer = QCompleter(shipment_model, self)
-        self.shipment_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self.shipment_completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        self.shipment_name_input.setCompleter(self.shipment_completer)
+    def _setup_tables(self) -> None:
+        self.items_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.items_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.items_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.items_table.verticalHeader().setVisible(False)
+        self.items_table.verticalHeader().setDefaultSectionSize(44)
+        self.items_table.setAlternatingRowColors(True)
 
-        self.shipment_completer.activated.connect(self._on_shipment_selected)
-        self.shipment_name_input.textChanged.connect(self._on_shipment_text_changed)
+        items_header = self.items_table.horizontalHeader()
+        items_header.setSectionResizeMode(0, items_header.ResizeMode.Fixed)
+        items_header.setSectionResizeMode(1, items_header.ResizeMode.Stretch)
+        items_header.setSectionResizeMode(2, items_header.ResizeMode.Fixed)
+        items_header.setSectionResizeMode(3, items_header.ResizeMode.Fixed)
 
-        item_names = [self._item_display(item) for item in self.demo_items]
-        item_model = QStringListModel(item_names)
+        self.items_table.setColumnWidth(0, 150)
+        self.items_table.setColumnWidth(2, 110)
+        self.items_table.setColumnWidth(3, 130)
 
-        self.item_completer = QCompleter(item_model, self)
-        self.item_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self.item_completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        self.item_input.setCompleter(self.item_completer)
+        self.previous_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.previous_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.previous_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.previous_table.verticalHeader().setVisible(False)
+        self.previous_table.verticalHeader().setDefaultSectionSize(40)
+        self.previous_table.setAlternatingRowColors(True)
+        self.previous_table.itemDoubleClicked.connect(lambda *_: self.load_selected_previous_shipment())
 
-        self.item_completer.activated.connect(self._on_item_selected)
-        self.item_input.textChanged.connect(self._on_item_text_changed)
+        previous_header = self.previous_table.horizontalHeader()
+        previous_header.setSectionResizeMode(0, previous_header.ResizeMode.Stretch)
+        previous_header.setSectionResizeMode(1, previous_header.ResizeMode.Fixed)
+        previous_header.setSectionResizeMode(2, previous_header.ResizeMode.Fixed)
+        previous_header.setSectionResizeMode(3, previous_header.ResizeMode.Fixed)
 
-    def _item_display(self, item: DemoItem) -> str:
-        return f"{item.code} | {item.description}"
+        self.previous_table.setColumnWidth(1, 105)
+        self.previous_table.setColumnWidth(2, 70)
+        self.previous_table.setColumnWidth(3, 100)
 
-    def _on_plan_date_changed(self) -> None:
-        self.plan_date_enabled = True
-        self._refresh_summary()
+    def ensure_tables(self) -> None:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS mpps_shipments (
+                        id SERIAL PRIMARY KEY,
+                        shipment_no VARCHAR(100) NOT NULL UNIQUE,
+                        customer_name VARCHAR(255) NOT NULL,
+                        shipment_date DATE NOT NULL,
+                        status VARCHAR(50) NOT NULL DEFAULT 'Planned',
+                        note TEXT,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+            )
 
-    def _use_auto_earliest_date(self) -> None:
-        self.plan_date_enabled = False
-        self._refresh_summary()
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS mpps_shipment_items (
+                        id SERIAL PRIMARY KEY,
+                        shipment_id INTEGER NOT NULL REFERENCES mpps_shipments(id) ON DELETE CASCADE,
+                        sap_code VARCHAR(100) NOT NULL,
+                        item_description TEXT NOT NULL,
+                        quantity INTEGER NOT NULL DEFAULT 0,
+                        start_date DATE,
+                        end_date DATE,
+                        item_status VARCHAR(50) NOT NULL DEFAULT 'Pending',
+                        note TEXT,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+            )
 
-    def _on_shipment_selected(self, name: str) -> None:
-        self.shipment_name_input.setText(name)
-        self._refresh_previous_shipments()
-        self._refresh_summary()
+    def refresh_master_items(self) -> None:
+        self.master_items = self.load_master_items()
 
-    def _on_shipment_text_changed(self) -> None:
-        self._refresh_previous_shipments()
-        self._refresh_summary()
+        completer_values = [
+            f"{item['sap_code']} - {item['tyre_description']}"
+            for item in self.master_items
+        ]
 
-    def _on_item_selected(self, display_text: str) -> None:
-        self.item_input.setText(display_text)
-        self._refresh_item_preview()
+        completer = QCompleter(completer_values)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.item_search_input.setCompleter(completer)
 
-    def _on_item_text_changed(self) -> None:
-        self._refresh_item_preview()
+        if not self.master_items:
+            QMessageBox.warning(
+                self,
+                "Master Data Missing",
+                "No tyre items were found in mpps_sap_stock_items.\n\n"
+                "Open Master Data > Stock Master > Final Tyre Stock and sync tyres from master first.",
+            )
 
-    def _find_shipment_key(self) -> str | None:
-        typed = self.shipment_name_input.text().strip().lower()
-        if not typed:
+    def load_master_items(self) -> list[dict]:
+        try:
+            with engine.begin() as connection:
+                rows = connection.execute(
+                    text(
+                        """
+                        SELECT
+                            sap_code,
+                            tyre_description,
+                            fg_stock,
+                            qc_stock,
+                            scrap_stock,
+                            blocked_stock,
+                            (fg_stock + qc_stock - scrap_stock - blocked_stock) AS available_stock
+                        FROM mpps_sap_stock_items
+                        WHERE is_active = TRUE
+                        ORDER BY sap_code ASC;
+                        """
+                    )
+                ).mappings().all()
+
+            return [dict(row) for row in rows]
+
+        except Exception:
+            return []
+
+    def update_item_preview(self) -> None:
+        item = self.find_master_item(self.item_search_input.text().strip())
+
+        if not item:
+            self.preview_code_label.setText("No item selected.")
+            self.preview_desc_label.setText("Search SAP code or tyre description to preview item details.")
+            self.preview_available_label.setText("")
+            return
+
+        self.preview_code_label.setText(f"SAP Code: {item['sap_code']}")
+        self.preview_desc_label.setText(f"Description: {item['tyre_description']}")
+        self.preview_available_label.setText(f"Available Stock: {self._format_int(item.get('available_stock'))}")
+
+    def find_master_item(self, value: str) -> dict | None:
+        if not value:
             return None
 
-        for shipment_name in self.shipments:
-            if shipment_name.lower() == typed:
-                return shipment_name
+        search = value.strip().lower()
+        sap_from_combo = value.split(" - ", 1)[0].strip().lower()
 
-        for shipment_name in self.shipments:
-            if typed in shipment_name.lower():
-                return shipment_name
+        for item in self.master_items:
+            sap_code = str(item["sap_code"]).lower()
+            desc = str(item["tyre_description"]).lower()
 
-        return None
+            if sap_code == sap_from_combo or sap_code == search:
+                return item
 
-    def _refresh_previous_shipments(self) -> None:
-        shipment_key = self._find_shipment_key()
-        shipments = self.shipments.get(shipment_key, []) if shipment_key else []
+        for item in self.master_items:
+            sap_code = str(item["sap_code"]).lower()
+            desc = str(item["tyre_description"]).lower()
 
-        self.previous_shipments_table.setRowCount(len(shipments))
-
-        for row, shipment in enumerate(shipments):
-            for col, value in enumerate(shipment):
-                self.previous_shipments_table.setItem(row, col, QTableWidgetItem(str(value)))
-
-        if shipment_key:
-            self.previous_shipments_hint.setText(f"Showing previous shipments for {shipment_key}.")
-        elif self.shipment_name_input.text().strip():
-            self.previous_shipments_hint.setText("No previous shipments found. This can be saved as a new shipment.")
-        else:
-            self.previous_shipments_hint.setText("Type or select a shipment name to view previous shipments.")
-
-    def _find_item(self) -> DemoItem | None:
-        typed = self.item_input.text().strip().lower()
-        if not typed:
-            return None
-
-        exact = self.item_lookup.get(self.item_input.text().strip())
-        if exact is not None:
-            return exact
-
-        for item in self.demo_items:
-            display = self._item_display(item).lower()
-            if typed == item.code.lower() or typed in display:
+            if search in sap_code or search in desc:
                 return item
 
         return None
 
-    def _refresh_item_preview(self) -> None:
-        item = self._find_item()
+    def add_item(self) -> None:
+        item = self.find_master_item(self.item_search_input.text().strip())
 
-        if item is None:
-            self.preview_description.setText("No item selected.")
-            self.preview_details.setText("Type an item code or description to preview item details.")
+        if not item:
+            QMessageBox.warning(self, "Item Not Found", "Please select a valid SAP tyre item from master data.")
+            self.item_search_input.setFocus()
             return
 
-        self.preview_description.setText(f"{item.code} | {item.description}")
-        self.preview_details.setText(
-            "Item selected. Final planning will check stock, line, mold, casing, cavity and schedule availability."
-        )
+        qty = self.quantity_input.value()
+        sap_code = str(item["sap_code"])
 
-    def _add_item(self) -> None:
-        item = self._find_item()
-        qty = int(self.qty_input.value())
-
-        if not self.shipment_name_input.text().strip():
-            QMessageBox.warning(self, "Shipment Name Required", "Please enter shipment name before adding items.")
-            return
-
-        if item is None:
-            QMessageBox.warning(self, "Item Required", "Please select a valid item from the suggestions.")
-            return
-
-        for existing in self.order_items:
-            if existing["code"] == item.code:
-                existing["qty"] = int(existing["qty"]) + qty
-                self._refresh_items_table()
-                self._refresh_summary()
-                self.item_input.clear()
-                self.qty_input.setValue(1)
+        for existing in self.current_items:
+            if existing["sap_code"] == sap_code:
+                existing["quantity"] += qty
+                self.refresh_items_table()
+                self.recalculate_actual_date()
+                self.item_search_input.clear()
+                self.quantity_input.setValue(1)
                 return
 
-        self.order_items.append(
+        self.current_items.append(
             {
-                "code": item.code,
-                "description": item.description,
-                "qty": qty,
+                "sap_code": sap_code,
+                "item_description": str(item["tyre_description"]),
+                "quantity": qty,
             }
         )
 
-        self._refresh_items_table()
-        self._refresh_summary()
-        self.item_input.clear()
-        self.qty_input.setValue(1)
+        self.refresh_items_table()
+        self.recalculate_actual_date()
+        self.item_search_input.clear()
+        self.quantity_input.setValue(1)
 
-    def _refresh_items_table(self) -> None:
-        self.items_table.setRowCount(len(self.order_items))
+    def refresh_items_table(self) -> None:
+        self.items_table.setRowCount(0)
 
-        for row, item in enumerate(self.order_items):
+        for row_index, item in enumerate(self.current_items):
+            self.items_table.insertRow(row_index)
+
             values = [
-                item["code"],
-                item["description"],
-                item["qty"],
+                item["sap_code"],
+                item["item_description"],
+                self._format_int(item["quantity"]),
             ]
 
             for col, value in enumerate(values):
                 table_item = QTableWidgetItem(str(value))
+                table_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+
+                if col in {0, 2}:
+                    table_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
                 if col == 2:
-                    table_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    font = QFont("Segoe UI")
+                    font.setBold(True)
+                    table_item.setFont(font)
 
-                self.items_table.setItem(row, col, table_item)
+                self.items_table.setItem(row_index, col, table_item)
 
-            remove_button = QPushButton("Remove")
-            remove_button.setObjectName("DangerButton")
-            remove_button.clicked.connect(lambda checked=False, row_index=row: self._remove_item(row_index))
-            self.items_table.setCellWidget(row, 3, remove_button)
+            remove_btn = QPushButton("Remove")
+            remove_btn.setObjectName("DangerButton")
+            remove_btn.clicked.connect(lambda checked=False, code=item["sap_code"]: self.remove_item(code))
+            self.items_table.setCellWidget(row_index, 3, remove_btn)
 
         self.items_table.resizeRowsToContents()
+        self.update_summary()
 
-    def _remove_item(self, row_index: int) -> None:
-        if 0 <= row_index < len(self.order_items):
-            self.order_items.pop(row_index)
-            self._refresh_items_table()
-            self._refresh_summary()
+    def remove_item(self, sap_code: str) -> None:
+        self.current_items = [item for item in self.current_items if item["sap_code"] != sap_code]
+        self.refresh_items_table()
+        self.recalculate_actual_date()
 
-    def _refresh_summary(self) -> None:
-        shipment_name = self.shipment_name_input.text().strip() or "-"
-        total_items = len(self.order_items)
-        total_qty = sum(int(item["qty"]) for item in self.order_items)
-
-        self.shipment_summary_label.setText(f"Shipment: {shipment_name}")
-        self.total_items_value.setText(f"{total_items:,}")
-        self.total_qty_value.setText(f"{total_qty:,}")
-
-        if total_items == 0:
-            self.actual_receive_date_display.setText("Pending")
-            self.priority_mode_label.setText(
-                "Priority Mode: Plan to receive date" if self.plan_date_enabled else "Priority Mode: Auto earliest possible date"
-            )
-            self.plan_date_label.setText(
-                f"Plan To Receive Date: {self._selected_plan_date().strftime('%Y-%m-%d')}"
-                if self.plan_date_enabled
-                else "Plan To Receive Date: Not provided"
-            )
-            self.actual_date_label.setText("Shipment Can Receive Actual Date: Pending")
-            self.planning_status_label.setText("Planning Status: Add items to calculate actual receive date.")
-            return
-
-        plan_days = max(1, ceil(total_qty / 500))
-        earliest_ready_date = date.today() + timedelta(days=plan_days)
-
-        self.actual_receive_date_display.setText(earliest_ready_date.strftime("%Y-%m-%d"))
-        self.actual_date_label.setText(
-            f"Shipment Can Receive Actual Date: {earliest_ready_date.strftime('%Y-%m-%d')}"
-        )
-
-        if self.plan_date_enabled:
-            plan_date = self._selected_plan_date()
-
-            self.priority_mode_label.setText("Priority Mode: Plan to receive date")
-            self.plan_date_label.setText(f"Plan To Receive Date: {plan_date.strftime('%Y-%m-%d')}")
-
-            if earliest_ready_date <= plan_date:
-                self.planning_status_label.setText(
-                    "Planning Status: Plan to receive date can be achieved by current preview."
-                )
-            else:
-                delay_days = (earliest_ready_date - plan_date).days
-                self.planning_status_label.setText(
-                    f"Planning Status: Plan to receive date needs review. Actual receive date is {delay_days} day(s) later."
-                )
+    def recalculate_actual_date(self) -> None:
+        if not self.current_items:
+            self.actual_date_input.setText("Pending")
         else:
-            self.priority_mode_label.setText("Priority Mode: Auto earliest possible date")
-            self.plan_date_label.setText("Plan To Receive Date: Not provided")
-            self.planning_status_label.setText(
-                "Planning Status: No plan to receive date provided. System shows earliest possible actual receive date."
+            self.actual_date_input.setText(self.plan_date_input.date().toString("yyyy-MM-dd"))
+
+        self.update_summary()
+
+    def update_summary(self) -> None:
+        shipment_name = self.shipment_name_input.text().strip() or "-"
+        total_items = len(self.current_items)
+        total_qty = sum(int(item["quantity"] or 0) for item in self.current_items)
+
+        self.summary_shipment_label.setText(f"Shipment: {shipment_name}")
+        self.summary_items_value.setText(self._format_int(total_items))
+        self.summary_qty_value.setText(self._format_int(total_qty))
+        self.summary_plan_date_label.setText(f"Plan To Receive Date: {self.plan_date_input.date().toString('yyyy-MM-dd')}")
+        self.summary_actual_date_label.setText(f"Shipment Can Receive Actual Date: {self.actual_date_input.text()}")
+
+    def load_previous_shipments(self) -> None:
+        self.update_summary()
+
+        search = self.shipment_name_input.text().strip()
+
+        params = {"search": f"%{search}%"}
+        where = ""
+
+        if search:
+            where = """
+                WHERE s.shipment_no ILIKE :search
+                   OR s.customer_name ILIKE :search
+                   OR COALESCE(s.note, '') ILIKE :search
+            """
+
+        sql = f"""
+            SELECT
+                s.id,
+                s.shipment_no,
+                s.shipment_date,
+                s.status,
+                COUNT(i.id) AS item_count
+            FROM mpps_shipments s
+            LEFT JOIN mpps_shipment_items i ON s.id = i.shipment_id
+            {where}
+            GROUP BY s.id, s.shipment_no, s.shipment_date, s.status
+            ORDER BY s.shipment_date DESC, s.id DESC
+            LIMIT 30;
+        """
+
+        try:
+            with engine.begin() as connection:
+                rows = connection.execute(text(sql), params).mappings().all()
+        except Exception:
+            rows = []
+
+        self.previous_table.setRowCount(0)
+
+        for row_index, row in enumerate(rows):
+            self.previous_table.insertRow(row_index)
+
+            values = [
+                row["shipment_no"],
+                self._fmt_date(row["shipment_date"]),
+                self._format_int(row["item_count"]),
+                row["status"],
+            ]
+
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+
+                if col in {1, 2, 3}:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+                if col == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, int(row["id"]))
+
+                self.previous_table.setItem(row_index, col, item)
+
+        self.previous_table.resizeRowsToContents()
+
+    def load_selected_previous_shipment(self) -> None:
+        selected = self.previous_table.selectedItems()
+
+        if not selected:
+            return
+
+        row = selected[0].row()
+        id_item = self.previous_table.item(row, 0)
+
+        if id_item is None:
+            return
+
+        shipment_id = id_item.data(Qt.ItemDataRole.UserRole)
+
+        if not shipment_id:
+            return
+
+        self.load_shipment(int(shipment_id))
+
+    def load_shipment(self, shipment_id: int) -> None:
+        with engine.begin() as connection:
+            shipment = connection.execute(
+                text("SELECT * FROM mpps_shipments WHERE id = :id LIMIT 1;"),
+                {"id": shipment_id},
+            ).mappings().first()
+
+            items = connection.execute(
+                text(
+                    """
+                    SELECT sap_code, item_description, quantity
+                    FROM mpps_shipment_items
+                    WHERE shipment_id = :id
+                    ORDER BY id ASC;
+                    """
+                ),
+                {"id": shipment_id},
+            ).mappings().all()
+
+        if not shipment:
+            return
+
+        self.current_shipment_id = int(shipment["id"])
+        self.shipment_name_input.setText(str(shipment["shipment_no"]))
+        self.customer_input.setText(str(shipment["customer_name"] or ""))
+
+        shipment_date = shipment["shipment_date"]
+
+        if hasattr(shipment_date, "year"):
+            self.plan_date_input.setDate(QDate(shipment_date.year, shipment_date.month, shipment_date.day))
+
+        self.remarks_input.setPlainText(str(shipment["note"] or ""))
+
+        self.current_items = [
+            {
+                "sap_code": str(row["sap_code"]),
+                "item_description": str(row["item_description"]),
+                "quantity": int(row["quantity"] or 0),
+            }
+            for row in items
+        ]
+
+        self.refresh_items_table()
+        self.recalculate_actual_date()
+
+    def save_shipment(self) -> None:
+        shipment_no = self.shipment_name_input.text().strip()
+        customer = self.customer_input.text().strip() or shipment_no
+        plan_date = self.plan_date_input.date().toPython()
+        note = self.remarks_input.toPlainText().strip()
+
+        if not shipment_no:
+            QMessageBox.warning(self, "Shipment Required", "Please enter shipment name / shipment no.")
+            self.shipment_name_input.setFocus()
+            return
+
+        if not self.current_items:
+            QMessageBox.warning(self, "Items Required", "Please add at least one tyre item from master data.")
+            self.item_search_input.setFocus()
+            return
+
+        try:
+            with engine.begin() as connection:
+                existing_id = connection.execute(
+                    text("SELECT id FROM mpps_shipments WHERE shipment_no = :shipment_no LIMIT 1;"),
+                    {"shipment_no": shipment_no},
+                ).scalar()
+
+                if existing_id:
+                    shipment_id = int(existing_id)
+                    connection.execute(
+                        text(
+                            """
+                            UPDATE mpps_shipments
+                            SET
+                                customer_name = :customer_name,
+                                shipment_date = :shipment_date,
+                                status = 'Planned',
+                                note = :note,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE id = :id;
+                            """
+                        ),
+                        {
+                            "id": shipment_id,
+                            "customer_name": customer,
+                            "shipment_date": plan_date,
+                            "note": note,
+                        },
+                    )
+
+                    connection.execute(
+                        text("DELETE FROM mpps_shipment_items WHERE shipment_id = :id;"),
+                        {"id": shipment_id},
+                    )
+                else:
+                    shipment_id = int(
+                        connection.execute(
+                            text(
+                                """
+                                INSERT INTO mpps_shipments
+                                    (shipment_no, customer_name, shipment_date, status, note, updated_at)
+                                VALUES
+                                    (:shipment_no, :customer_name, :shipment_date, 'Planned', :note, CURRENT_TIMESTAMP)
+                                RETURNING id;
+                                """
+                            ),
+                            {
+                                "shipment_no": shipment_no,
+                                "customer_name": customer,
+                                "shipment_date": plan_date,
+                                "note": note,
+                            },
+                        ).scalar_one()
+                    )
+
+                for item in self.current_items:
+                    connection.execute(
+                        text(
+                            """
+                            INSERT INTO mpps_shipment_items
+                                (
+                                    shipment_id,
+                                    sap_code,
+                                    item_description,
+                                    quantity,
+                                    start_date,
+                                    end_date,
+                                    item_status,
+                                    note,
+                                    updated_at
+                                )
+                            VALUES
+                                (
+                                    :shipment_id,
+                                    :sap_code,
+                                    :item_description,
+                                    :quantity,
+                                    :start_date,
+                                    :end_date,
+                                    'Pending',
+                                    '',
+                                    CURRENT_TIMESTAMP
+                                );
+                            """
+                        ),
+                        {
+                            "shipment_id": shipment_id,
+                            "sap_code": item["sap_code"],
+                            "item_description": item["item_description"],
+                            "quantity": item["quantity"],
+                            "start_date": plan_date,
+                            "end_date": plan_date,
+                        },
+                    )
+
+            self.current_shipment_id = shipment_id
+
+            QMessageBox.information(
+                self,
+                "Shipment Saved",
+                "Shipment saved successfully. The entry form is now ready for the next shipment.",
             )
 
-    def _selected_plan_date(self) -> date:
-        qdate = self.plan_date_input.date()
-        return date(qdate.year(), qdate.month(), qdate.day())
+            self.clear_after_successful_save()
 
-    def _save_draft_preview(self) -> None:
-        if not self.shipment_name_input.text().strip():
-            QMessageBox.warning(self, "Shipment Name Required", "Please enter shipment name.")
-            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Failed", str(exc))
 
-        if not self.order_items:
-            QMessageBox.warning(self, "Shipment Items Required", "Please add at least one shipment item.")
-            return
-
-        QMessageBox.information(
-            self,
-            "Draft Ready",
-            "Frontend shipment draft is ready. Database saving will be connected in the backend step.",
-        )
-
-    def _clear_shipment(self) -> None:
+    def clear_form(self) -> None:
+        self.current_shipment_id = None
         self.shipment_name_input.clear()
-        self.plan_date_enabled = True
+        self.customer_input.clear()
         self.plan_date_input.setDate(QDate.currentDate().addDays(7))
+        self.actual_date_input.setText("Pending")
         self.remarks_input.clear()
-        self.item_input.clear()
-        self.qty_input.setValue(1)
-        self.order_items.clear()
-        self._refresh_previous_shipments()
-        self._refresh_items_table()
-        self._refresh_summary()
+        self.item_search_input.clear()
+        self.quantity_input.setValue(1)
+        self.current_items.clear()
+        self.refresh_items_table()
+        self.load_previous_shipments()
+        self.recalculate_actual_date()
+
+    def clear_after_successful_save(self) -> None:
+        """
+        Professional post-save reset.
+
+        Saved data remains in database and Previous Shipments.
+        Entry fields and the unsaved item table are cleared for the next shipment.
+        """
+
+        self.current_shipment_id = None
+
+        self.shipment_name_input.blockSignals(True)
+        self.shipment_name_input.clear()
+        self.shipment_name_input.blockSignals(False)
+
+        self.customer_input.clear()
+        self.plan_date_input.setDate(QDate.currentDate().addDays(7))
+        self.actual_date_input.setText("Pending")
+        self.remarks_input.clear()
+
+        self.item_search_input.clear()
+        self.quantity_input.setValue(1)
+
+        self.current_items.clear()
+        self.refresh_items_table()
+
+        self.load_previous_shipments()
+        self.recalculate_actual_date()
+
+        self.shipment_name_input.setFocus()
+
+    def _fmt_date(self, value) -> str:
+        if value is None:
+            return "-"
+
+        if hasattr(value, "strftime"):
+            return value.strftime("%Y-%m-%d")
+
+        return str(value)
+
+    def _format_int(self, value) -> str:
+        try:
+            return f"{int(value or 0):,}"
+        except Exception:
+            return "0"
 
 
-OrderEntryPage = CustomerOrderEntryPage
-
-
-class ShipmentDemandPage(CustomerOrderEntryPage):
-    """Compatibility wrapper for old pages still importing ShipmentDemandPage."""
-
-    def __init__(self, *args, **kwargs):
-        current_user = kwargs.pop("current_user", None)
+class ShipmentDemandPage(OrderEntryPage):
+    def __init__(self, current_user=None, *args, **kwargs):
         super().__init__(current_user=current_user)
