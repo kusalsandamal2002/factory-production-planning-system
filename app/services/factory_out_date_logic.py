@@ -266,8 +266,9 @@ class FactoryOutDateCalculator:
             )
 
         resource = self._allocated_cavity_count(conn, mold_key, casing_type, line)
-        cavities = int(resource["allocated_cavity_count"])
-        if cavities <= 0:
+        available_cavities = int(resource["allocated_cavity_count"])
+
+        if available_cavities <= 0:
             return FactoryOutItemResult(
                 sap_code=sap_code,
                 description=description,
@@ -285,6 +286,11 @@ class FactoryOutDateCalculator:
                 line=line,
                 smds_total_plan=total_plan,
             )
+
+        # Allocate only the cavities required for this item's production quantity.
+        # Example: qty 1 and total_plan 2 means only 1 cavity is needed, not all free cavities.
+        required_cavities = max(1, int(ceil(balance_qty / total_plan)))
+        cavities = min(available_cavities, required_cavities)
 
         daily_capacity = max(0, total_plan * cavities)
         if daily_capacity <= 0:
@@ -428,18 +434,35 @@ class FactoryOutDateCalculator:
     def _available_mold_count(self, conn, mold_key: str) -> int:
         if not mold_key or self._norm(mold_key) in {"", "-"}:
             return 0
+
         if not self.table_exists(conn, "mold_master"):
             return 0
+
         try:
             value = conn.execute(text("""
-                SELECT COALESCE(SUM(mold_count), 0)
+                SELECT COALESCE(SUM(GREATEST(
+                    COALESCE(mold_count, 0)
+                    - COALESCE(production_mold_count, 0)
+                    - COALESCE(breakdown_mold_count, 0),
+                    0
+                )), 0)
                 FROM mold_master
                 WHERE LOWER(TRIM(mold_key_code)) = LOWER(TRIM(:mold_key))
                   AND LOWER(COALESCE(status, 'Active')) = 'active'
             """), {"mold_key": mold_key}).scalar()
             return max(0, self._int(value, 0))
         except Exception:
-            return 0
+            # Fallback for older databases before production/breakdown columns existed.
+            try:
+                value = conn.execute(text("""
+                    SELECT COALESCE(SUM(mold_count), 0)
+                    FROM mold_master
+                    WHERE LOWER(TRIM(mold_key_code)) = LOWER(TRIM(:mold_key))
+                      AND LOWER(COALESCE(status, 'Active')) = 'active'
+                """), {"mold_key": mold_key}).scalar()
+                return max(0, self._int(value, 0))
+            except Exception:
+                return 0
 
     def _available_casing_count(self, conn, casing_type: str) -> int:
         if not self._casing_required(casing_type):
