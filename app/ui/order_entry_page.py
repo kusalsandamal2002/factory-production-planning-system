@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 from sqlalchemy import text
 
 from app.database import engine
-from app.services.factory_out_date_logic import FactoryOutDateCalculator
+from app.services.factory_planning_engine import FactoryPlanningEngine
 
 
 LINE_DISPLAY_NAMES = [
@@ -246,11 +246,13 @@ class ShipmentApprovalDialog(QDialog):
 
 
 class OrderEntryPage(QWidget):
-    def __init__(self, current_user=None, *args, **kwargs):
+    def __init__(self, current_user=None, on_shipment_saved=None, *args, **kwargs):
         super().__init__()
+        self.on_shipment_saved = on_shipment_saved
         self.current_user = current_user
         self.current_items: list[dict] = []
         self.master_items: list[dict] = []
+        self.planner = FactoryPlanningEngine(start_date=date.today())
         self.current_shipment_id: int | None = None
         self.smds_columns: SmdsColumnMap | None = None
 
@@ -599,7 +601,6 @@ class OrderEntryPage(QWidget):
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS stock_allocated_qty INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS production_required_qty INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS allocated_cavity_count INTEGER NOT NULL DEFAULT 0",
-                "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS daily_capacity INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS production_days INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS item_receive_date DATE",
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS schedule_reason TEXT NOT NULL DEFAULT ''",
@@ -798,58 +799,90 @@ class OrderEntryPage(QWidget):
             connection.execute(text(sql), params)
 
     def recalculate_item(self, item: dict) -> None:
-        """Recalculate one visible cart item using the central factory-out planning calculator."""
-        extra_item = None if item in self.current_items else item
-        self.recalculate_all_cart_items(extra_item=extra_item)
+        self.planner.ensure_schema()
+        qty = int(item.get("quantity") or 0)
+        smds = item.get("smds") or self.find_master_item(item.get("sap_code", "")) or {}
+        item["smds"] = smds
 
-    def recalculate_all_cart_items(self, extra_item: dict | None = None) -> None:
-        """Use the same API planning logic as Shipment Details / Factory Out calculation.
-
-        This prevents Order Entry from using old local rules and keeps stock, mold,
-        casing and line/cavity allocation consistent across the app.
-        """
-        original_items = list(self.current_items)
-        if extra_item is not None:
-            original_items.append(extra_item)
-
-        if not original_items:
+        if not item.get("sap_code"):
+            self._set_pending(item, "SAP code is required")
             return
-
-        source_items = []
-        for item in original_items:
-            source_items.append({
-                "sap_code": item.get("sap_code", ""),
-                "item_description": item.get("item_description", ""),
-                "quantity": int(item.get("quantity") or 0),
-            })
 
         try:
-            calculator = FactoryOutDateCalculator(start_date=date.today())
-            calculated_items = calculator.calculate_cart_items(
-                source_items,
-                exclude_shipment_id=self.current_shipment_id,
-            )
-        except Exception as exc:
-            QMessageBox.warning(self, "Planning Calculation Failed", str(exc))
+            preview_items = [{
+                "sap_code": item.get("sap_code", ""),
+                "item_description": item.get("item_description", ""),
+                "quantity": qty,
+            }]
+            result = self.planner.calculate_cart_items(preview_items)[0]
+            item["stock_allocated_qty"] = int(result.get("stock_allocated_qty") or 0)
+            item["production_required_qty"] = int(result.get("production_required_qty") or 0)
+            item["allocated_cavity_count"] = int(result.get("allocated_cavity_count") or 0)
+            item["production_days"] = int(result.get("production_days") or 0)
+            item["item_receive_date"] = result.get("receive_date") or result.get("item_receive_date")
+            item["schedule_reason"] = result.get("reason") or result.get("schedule_reason") or ""
+            item["item_description"] = result.get("item_description") or item.get("item_description", "")
+            item["quantity"] = int(result.get("quantity") or qty)
+            item["status"] = result.get("status", "")
+            return
+        except Exception:
+            pass
+
+        stock_allocated = min(qty, self.get_unallocated_stock(item["sap_code"]))
+        balance_qty = max(0, qty - stock_allocated)
+        item["stock_allocated_qty"] = stock_allocated
+        item["production_required_qty"] = balance_qty
+
+        if balance_qty <= 0:
+            item["allocated_cavity_count"] = 0
+            item["production_days"] = 0
+            item["item_receive_date"] = date.today()
+            item["schedule_reason"] = "Covered by unallocated stock"
             return
 
-        for original, calculated in zip(original_items, calculated_items):
-            original["stock_allocated_qty"] = int(calculated.get("stock_allocated_qty") or 0)
-            original["production_required_qty"] = int(calculated.get("production_required_qty") or 0)
-            original["allocated_cavity_count"] = int(calculated.get("allocated_cavity_count") or 0)
-            original["daily_capacity"] = int(calculated.get("daily_capacity") or 0)
-            original["production_days"] = int(calculated.get("production_days") or 0)
+        total_plan = _to_int(smds.get("total_plan"))
+        if total_plan <= 0:
+            self._set_pending(item, "SMDS Total Plan missing")
+            return
 
-            receive_date = calculated.get("receive_date")
-            if isinstance(receive_date, str) and receive_date:
-                try:
-                    receive_date = date.fromisoformat(receive_date[:10])
-                except Exception:
-                    pass
+        mold_count = self.get_available_mold_count(smds.get("key_code", ""))
+        if mold_count <= 0:
+            self._set_pending(item, "Mold not available")
+            return
 
-            original["item_receive_date"] = receive_date
-            original["schedule_reason"] = calculated.get("reason") or calculated.get("status") or ""
-            original["item_status"] = calculated.get("status") or "Pending"
+        casing_type = _clean(smds.get("casing_type", ""))
+        casing_required = casing_type and casing_type.lower() not in {"no casing", "-", "n/a", "na"}
+        casing_count = 999999 if not casing_required else self.get_available_casing_count(casing_type)
+        if casing_required and casing_count <= 0:
+            self._set_pending(item, "Casing not available")
+            return
+
+        line_count = self.get_available_line_cavity_count(smds.get("line", ""))
+        if line_count <= 0:
+            self._set_pending(item, "No free line/cavity")
+            return
+
+        allocated_cavities = max(0, min(mold_count, casing_count, line_count))
+        if allocated_cavities <= 0:
+            self._set_pending(item, "No allocatable cavity")
+            return
+
+        daily_capacity = total_plan * allocated_cavities
+        if daily_capacity <= 0:
+            self._set_pending(item, "Daily capacity is zero")
+            return
+
+        production_days = max(1, int(math.ceil(balance_qty / daily_capacity)))
+        receive_date = date.today() + timedelta(days=production_days - 1)
+        item["allocated_cavity_count"] = allocated_cavities
+        item["production_days"] = production_days
+        item["item_receive_date"] = receive_date
+        item["schedule_reason"] = "Stock {stock}; production {prod}; {cap}/day using {cav} cavity".format(
+            stock=stock_allocated,
+            prod=balance_qty,
+            cap=daily_capacity,
+            cav=allocated_cavities,
+        )
 
     def _set_pending(self, item: dict, reason: str) -> None:
         item["allocated_cavity_count"] = 0
@@ -1007,15 +1040,14 @@ class OrderEntryPage(QWidget):
         total_items = len(self.current_items)
         total_qty = sum(int(item.get("quantity") or 0) for item in self.current_items)
         dates = [item.get("item_receive_date") for item in self.current_items if item.get("item_receive_date") is not None]
-        final_date = max(dates) if dates else None
+        final_date = self.planner.final_shipment_date(self.current_items)
         self.summary_shipment_label.setText("Shipment: " + shipment_name)
         self.summary_items_value.setText(_format_int(total_items))
         self.summary_qty_value.setText(_format_int(total_qty))
         self.summary_factory_out_value.setText(_fmt_date(final_date))
 
     def get_factory_out_date(self):
-        dates = [item.get("item_receive_date") for item in self.current_items if item.get("item_receive_date") is not None]
-        return max(dates) if dates else None
+        return self.planner.final_shipment_date(self.current_items)
 
     def load_previous_shipments(self) -> None:
         self.update_summary()
@@ -1121,6 +1153,8 @@ class OrderEntryPage(QWidget):
             QMessageBox.warning(self, "Items Required", "Please add at least one approved SMDS item.")
             self.item_search_input.setFocus()
             return
+        for item in self.current_items:
+            self.recalculate_item(item)
         factory_out_date = self.get_factory_out_date()
         if factory_out_date is None:
             answer = QMessageBox.question(
@@ -1198,6 +1232,8 @@ class OrderEntryPage(QWidget):
                     })
             QMessageBox.information(self, "Shipment Saved", "Shipment saved successfully with factory out date: " + _fmt_date(factory_out_date))
             self.clear_after_successful_save()
+            if callable(self.on_shipment_saved):
+                self.on_shipment_saved(shipment_id)
         except Exception as exc:
             QMessageBox.critical(self, "Save Failed", str(exc))
 

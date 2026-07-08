@@ -525,7 +525,7 @@ class MainWindow(QMainWindow):
             return content
 
         self.dashboard_page = self._create_dashboard_page()
-        self.order_entry_page = OrderEntryPage(self.current_user)
+        self.order_entry_page = OrderEntryPage(self.current_user, on_shipment_saved=self.open_saved_shipment_details)
         self.schedule_page = SchedulePage(self.current_user)
 
         self.stock_planning_page = StockPlanningPage(
@@ -1045,6 +1045,16 @@ class MainWindow(QMainWindow):
 
     def open_shipment_details_page(self) -> None:
         self.navigate(self.SHIPMENT_DETAILS_INDEX)
+
+    def open_saved_shipment_details(self, shipment_id: int) -> None:
+        self.navigate(self.SHIPMENT_DETAILS_INDEX)
+        page = getattr(self, "shipment_details_page", None)
+        if page is None:
+            return
+        try:
+            page.open_shipment_detail(int(shipment_id))
+        except Exception as exc:
+            QMessageBox.warning(self, "Shipment Open Failed", str(exc))
 
     def open_stock_planning_page(self) -> None:
         self.navigate(self.STOCK_PLANNING_INDEX)

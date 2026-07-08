@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 from sqlalchemy import text
 
 from app.database import engine
-from app.services.factory_out_date_logic import FactoryOutDateCalculator
+from app.services.factory_planning_engine import FactoryPlanningEngine
 
 
 def _to_int(value, default: int = 0) -> int:
@@ -280,6 +280,7 @@ class ShipmentOrdersPage(QWidget):
         super().__init__()
         self.current_user = current_user
         self.selected_shipment_id: int | None = None
+        self.planner = FactoryPlanningEngine(start_date=date.today())
         self.current_shipment_id: int | None = None
         self.selected_item_id: int | None = None
 
@@ -365,6 +366,9 @@ class ShipmentOrdersPage(QWidget):
         self.refresh_btn.clicked.connect(self.refresh_list)
         top.addLayout(title_box, 1)
         top.addWidget(self.new_btn)
+        top.addWidget(self.edit_btn)
+        top.addWidget(self.move_back_btn)
+        top.addWidget(self.move_forward_btn)
         top.addWidget(self.refresh_btn)
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search shipment ID, customer, status, note or SAP code...")
@@ -393,10 +397,10 @@ class ShipmentOrdersPage(QWidget):
         table_title.setObjectName("SectionTitle")
         table_hint = QLabel("Double-click a shipment row to open full item-level factory-out details.")
         table_hint.setObjectName("Hint")
-        self.list_table = QTableWidget(0, 8)
+        self.list_table = QTableWidget(0, 11)
         self.list_table.setHorizontalHeaderLabels([
-            "Order / Priority Date", "Factory Out Date", "Shipment ID", "Customer",
-            "Items", "Total Qty", "Status", "Note"
+            "Order / Shipment Name", "Target / Plan Date", "Factory Can Receive Date", "Delivery Status",
+            "Delay / Early Days", "Total Qty", "Completed Qty", "Progress %", "Planning Note", "Shipment ID", "Customer"
         ])
         self._setup_list_table()
         table_layout.addWidget(table_title)
@@ -436,16 +440,12 @@ class ShipmentOrdersPage(QWidget):
         self.delete_item_btn = QPushButton("Delete Item")
         self.delete_item_btn.setObjectName("DangerButton")
         self.delete_item_btn.clicked.connect(self.delete_selected_item)
-        self.delete_shipment_btn = QPushButton("Delete Shipment")
-        self.delete_shipment_btn.setObjectName("DangerButton")
-        self.delete_shipment_btn.clicked.connect(self.delete_current_shipment)
         top.addLayout(title_box, 1)
         top.addWidget(self.back_btn)
         top.addWidget(self.edit_header_btn)
         top.addWidget(self.add_item_btn)
         top.addWidget(self.edit_item_btn)
         top.addWidget(self.delete_item_btn)
-        top.addWidget(self.delete_shipment_btn)
 
         info = QGridLayout()
         info.setHorizontalSpacing(16)
@@ -475,7 +475,7 @@ class ShipmentOrdersPage(QWidget):
         self.detail_factory_out_value = QLabel("-")
         stats.addWidget(self._metric_card(self.detail_items_value, "Items"))
         stats.addWidget(self._metric_card(self.detail_qty_value, "Total Quantity"))
-        stats.addWidget(self._metric_card(self.detail_first_value, "Priority Date"))
+        stats.addWidget(self._metric_card(self.detail_first_value, "First Item Date"))
         stats.addWidget(self._metric_card(self.detail_factory_out_value, "Factory Out Date"))
         layout.addLayout(stats)
 
@@ -487,10 +487,10 @@ class ShipmentOrdersPage(QWidget):
         table_title.setObjectName("SectionTitle")
         table_hint = QLabel("Select a row before editing or deleting. Item Receive Date is saved in the database.")
         table_hint.setObjectName("Hint")
-        self.detail_table = QTableWidget(0, 9)
+        self.detail_table = QTableWidget(0, 13)
         self.detail_table.setHorizontalHeaderLabels([
-            "SAP Code", "Item Description", "Qty", "Stock Allocated",
-            "Allocated Cavity Count", "Daily Plan Production Capacity", "Item Receive Date", "Reason", "Item ID"
+            "SAP Code", "Item Description", "Qty", "Stock Allocated", "Produced", "Completed",
+            "Remaining", "Cavities", "Daily Capacity", "Receive Date", "Progress %", "Status", "Reason / Note"
         ])
         self._setup_detail_table()
         table_layout.addWidget(table_title)
@@ -522,22 +522,13 @@ class ShipmentOrdersPage(QWidget):
         self.list_table.verticalHeader().setVisible(False)
         self.list_table.verticalHeader().setDefaultSectionSize(42)
         self.list_table.itemSelectionChanged.connect(self.on_list_selection_changed)
-        self.list_table.itemDoubleClicked.connect(lambda *_: self.open_selected_shipment())
+        self.list_table.cellDoubleClicked.connect(self.on_list_cell_double_clicked)
         header = self.list_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
-        self.list_table.setColumnWidth(0, 155)
-        self.list_table.setColumnWidth(1, 150)
-        self.list_table.setColumnWidth(2, 170)
-        self.list_table.setColumnWidth(4, 80)
-        self.list_table.setColumnWidth(5, 110)
-        self.list_table.setColumnWidth(6, 115)
+        for col in range(0, 9):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)
 
     def _setup_detail_table(self) -> None:
         self.detail_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -547,22 +538,25 @@ class ShipmentOrdersPage(QWidget):
         self.detail_table.verticalHeader().setVisible(False)
         self.detail_table.verticalHeader().setDefaultSectionSize(42)
         self.detail_table.itemSelectionChanged.connect(self.on_detail_selection_changed)
-        self.detail_table.itemDoubleClicked.connect(lambda *_: self.edit_selected_item())
+        self.detail_table.cellDoubleClicked.connect(self.on_detail_cell_double_clicked)
         header = self.detail_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for col in range(2, 7):
+        for col in range(2, 12):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(12, QHeaderView.ResizeMode.Stretch)
         self.detail_table.setColumnWidth(0, 115)
-        self.detail_table.setColumnWidth(2, 90)
-        self.detail_table.setColumnWidth(3, 120)
-        self.detail_table.setColumnWidth(4, 160)
-        self.detail_table.setColumnWidth(5, 205)
-        self.detail_table.setColumnWidth(6, 135)
-        self.detail_table.setColumnWidth(7, 135)
-        self.detail_table.setColumnHidden(8, True)
+        self.detail_table.setColumnWidth(2, 75)
+        self.detail_table.setColumnWidth(3, 110)
+        self.detail_table.setColumnWidth(4, 80)
+        self.detail_table.setColumnWidth(5, 80)
+        self.detail_table.setColumnWidth(6, 80)
+        self.detail_table.setColumnWidth(7, 80)
+        self.detail_table.setColumnWidth(8, 110)
+        self.detail_table.setColumnWidth(9, 130)
+        self.detail_table.setColumnWidth(10, 90)
+        self.detail_table.setColumnWidth(11, 95)
 
     def ensure_tables(self) -> None:
         with engine.begin() as connection:
@@ -600,7 +594,6 @@ class ShipmentOrdersPage(QWidget):
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS stock_allocated_qty INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS production_required_qty INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS allocated_cavity_count INTEGER NOT NULL DEFAULT 0",
-                "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS daily_capacity INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS production_days INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS item_receive_date DATE",
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS schedule_reason TEXT NOT NULL DEFAULT ''",
@@ -630,6 +623,7 @@ class ShipmentOrdersPage(QWidget):
         """))
 
     def recalculate_shipment_factory_out_date(self, shipment_id: int) -> None:
+        self.planner.ensure_schema()
         with engine.begin() as connection:
             connection.execute(text("""
                 UPDATE mpps_shipments s
@@ -639,6 +633,18 @@ class ShipmentOrdersPage(QWidget):
                     s.shipment_date,
                     CURRENT_DATE
                 ),
+                factory_can_receive_date = COALESCE(
+                    (SELECT MAX(COALESCE(i.item_receive_date, i.end_date, i.start_date)) FROM mpps_shipment_items i WHERE i.shipment_id = s.id),
+                    s.manager_order_date,
+                    s.shipment_date,
+                    CURRENT_DATE
+                ),
+                delivery_status = CASE
+                    WHEN s.manager_order_date IS NULL THEN 'Flexible / No Target Date'
+                    WHEN COALESCE((SELECT MAX(COALESCE(i.item_receive_date, i.end_date, i.start_date)) FROM mpps_shipment_items i WHERE i.shipment_id = s.id), s.manager_order_date, s.shipment_date, CURRENT_DATE) < s.manager_order_date THEN 'Can Deliver Early'
+                    WHEN COALESCE((SELECT MAX(COALESCE(i.item_receive_date, i.end_date, i.start_date)) FROM mpps_shipment_items i WHERE i.shipment_id = s.id), s.manager_order_date, s.shipment_date, CURRENT_DATE) = s.manager_order_date THEN 'On Time'
+                    ELSE 'Delayed'
+                END,
                 updated_at = CURRENT_TIMESTAMP
                 WHERE s.id = :shipment_id
             """), {"shipment_id": shipment_id})
@@ -729,76 +735,7 @@ class ShipmentOrdersPage(QWidget):
         if self.selected_shipment_id:
             self.open_shipment_detail(int(self.selected_shipment_id))
 
-
-    def refresh_shipment_item_planning(self, shipment_id: int) -> None:
-        """Recalculate stock, production qty, allocated cavities and daily capacity for the opened shipment."""
-        try:
-            shipment = self.get_shipment(shipment_id)
-            if not shipment:
-                return
-
-            start_date = (
-                shipment.get("manager_order_date")
-                or shipment.get("shipment_date")
-                or date.today()
-            )
-
-            with engine.begin() as connection:
-                source_items = [
-                    dict(row)
-                    for row in connection.execute(text("""
-                        SELECT id, sap_code, item_description, quantity
-                        FROM mpps_shipment_items
-                        WHERE shipment_id = :shipment_id
-                        ORDER BY id ASC;
-                    """), {"shipment_id": shipment_id}).mappings().all()
-                ]
-
-            if not source_items:
-                return
-
-            calculator = FactoryOutDateCalculator(start_date=start_date)
-            calculated_items = calculator.calculate_cart_items(
-                source_items,
-                exclude_shipment_id=shipment_id,
-            )
-
-            with engine.begin() as connection:
-                for item in calculated_items:
-                    connection.execute(text("""
-                        UPDATE mpps_shipment_items
-                        SET item_description = :item_description,
-                            stock_allocated_qty = :stock_allocated_qty,
-                            production_required_qty = :production_required_qty,
-                            allocated_cavity_count = :allocated_cavity_count,
-                            daily_capacity = :daily_capacity,
-                            production_days = :production_days,
-                            item_receive_date = :receive_date,
-                            receive_date = :receive_date,
-                            end_date = :receive_date,
-                            item_status = :status,
-                            schedule_reason = :reason,
-                            factory_out_reason = :reason,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE id = :id;
-                    """), {
-                        "id": item.get("id"),
-                        "item_description": item.get("item_description") or item.get("description") or "",
-                        "stock_allocated_qty": int(item.get("stock_allocated_qty") or 0),
-                        "production_required_qty": int(item.get("production_required_qty") or 0),
-                        "allocated_cavity_count": int(item.get("allocated_cavity_count") or 0),
-                        "daily_capacity": int(item.get("daily_capacity") or 0),
-                        "production_days": int(item.get("production_days") or 0),
-                        "receive_date": item.get("receive_date"),
-                        "status": item.get("status") or "Pending",
-                        "reason": item.get("reason") or "",
-                    })
-
-        except Exception as exc:
-            QMessageBox.warning(self, "Planning Refresh Failed", str(exc))
-
     def open_shipment_detail(self, shipment_id: int) -> None:
-        self.refresh_shipment_item_planning(shipment_id)
         self.recalculate_shipment_factory_out_date(shipment_id)
         shipment = self.get_shipment(shipment_id)
         if not shipment:
@@ -826,7 +763,6 @@ class ShipmentOrdersPage(QWidget):
             rows = connection.execute(text("""
                 SELECT id, sap_code, item_description, quantity,
                        stock_allocated_qty, production_required_qty, allocated_cavity_count,
-                       daily_capacity,
                        production_days,
                        COALESCE(item_receive_date, end_date, start_date) AS item_receive_date,
                        COALESCE(NULLIF(schedule_reason, ''), note, '') AS schedule_reason,
@@ -837,7 +773,7 @@ class ShipmentOrdersPage(QWidget):
             """), {"shipment_id": shipment_id}).mappings().all()
         self.detail_items_value.setText(self._format_int(stats["items"] if stats else 0))
         self.detail_qty_value.setText(self._format_int(stats["qty"] if stats else 0))
-        self.detail_first_value.setText(self._fmt_date(order_date))
+        self.detail_first_value.setText(self._fmt_date(stats["first_item_date"] if stats else None))
         self.detail_factory_out_value.setText(self._fmt_date(factory_out or (stats["factory_out_date"] if stats else None)))
         self.detail_table.setRowCount(0)
         for row_index, row in enumerate(rows):
@@ -847,8 +783,9 @@ class ShipmentOrdersPage(QWidget):
                 row["item_description"],
                 self._format_int(row["quantity"]),
                 self._format_int(row["stock_allocated_qty"]),
+                self._format_int(row["production_required_qty"]),
                 self._format_int(row["allocated_cavity_count"]),
-                self._format_int(row["daily_capacity"]),
+                self._format_int(row["production_days"]),
                 self._fmt_date(row["item_receive_date"]),
                 row["schedule_reason"] or row["item_status"] or "",
                 row["id"],
@@ -857,7 +794,7 @@ class ShipmentOrdersPage(QWidget):
                 item = self._readonly_item(str(value))
                 if col in {0, 2, 3, 4, 5, 6, 7}:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if col == 8:
+                if col == 9:
                     item.setData(Qt.ItemDataRole.UserRole, int(row["id"]))
                 self.detail_table.setItem(row_index, col, item)
         self.detail_table.resizeRowsToContents()
@@ -872,7 +809,7 @@ class ShipmentOrdersPage(QWidget):
         self.selected_item_id = None
         if row < 0:
             return
-        item = self.detail_table.item(row, 8)
+        item = self.detail_table.item(row, 9)
         if item is not None:
             self.selected_item_id = item.data(Qt.ItemDataRole.UserRole)
 
@@ -1060,48 +997,6 @@ class ShipmentOrdersPage(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "Delete Item Failed", str(exc))
 
-
-    def delete_current_shipment(self) -> None:
-        if not self.current_shipment_id:
-            QMessageBox.information(self, "Select Shipment", "No shipment is currently open.")
-            return
-
-        shipment_id = int(self.current_shipment_id)
-        shipment = self.get_shipment(shipment_id)
-        shipment_no = str(shipment.get("shipment_no") if shipment else shipment_id)
-
-        answer = QMessageBox.question(
-            self,
-            "Delete Shipment",
-            f"Delete shipment '{shipment_no}' and all its items?\n\nThis action cannot be undone.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-
-        try:
-            with engine.begin() as connection:
-                # Delete child rows first for old databases, then delete shipment header.
-                connection.execute(
-                    text("DELETE FROM mpps_shipment_items WHERE shipment_id = :shipment_id;"),
-                    {"shipment_id": shipment_id},
-                )
-                connection.execute(
-                    text("DELETE FROM mpps_shipments WHERE id = :shipment_id;"),
-                    {"shipment_id": shipment_id},
-                )
-
-            self.current_shipment_id = None
-            self.selected_shipment_id = None
-            self.selected_item_id = None
-            self.refresh_list()
-            self.stack.setCurrentWidget(self.list_page)
-
-        except Exception as exc:
-            QMessageBox.critical(self, "Delete Shipment Failed", str(exc))
-
     def get_shipment(self, shipment_id: int | None):
         if not shipment_id:
             return None
@@ -1150,6 +1045,55 @@ class ShipmentOrdersPage(QWidget):
             return f"{int(value or 0):,}"
         except Exception:
             return "0"
+
+    def on_list_cell_double_clicked(self, row: int, column: int) -> None:
+        if column == 1:
+            item = self.list_table.item(row, 9)
+            if item is not None:
+                shipment_id = item.data(Qt.ItemDataRole.UserRole)
+                if shipment_id:
+                    self.edit_target_date_for_shipment(int(shipment_id))
+            return
+        if column in {0, 9}:
+            item = self.list_table.item(row, 0)
+            if item is not None:
+                shipment_id = item.data(Qt.ItemDataRole.UserRole)
+                if shipment_id:
+                    self.open_shipment_detail(int(shipment_id))
+            return
+        self.open_selected_shipment()
+
+    def on_detail_cell_double_clicked(self, row: int, column: int) -> None:
+        self.edit_selected_item()
+
+    def edit_target_date_for_shipment(self, shipment_id: int) -> None:
+        shipment = self.get_shipment(shipment_id)
+        if not shipment:
+            return
+        current = shipment.get('target_date') or shipment.get('plan_date') or shipment.get('manager_order_date') or shipment.get('shipment_date') or date.today()
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Edit Target / Plan Date')
+        layout = QVBoxLayout(dialog)
+        editor = QDateEdit()
+        editor.setCalendarPopup(True)
+        editor.setDate(QDate(current.year, current.month, current.day) if hasattr(current, 'year') else QDate.currentDate())
+        layout.addWidget(QLabel(f"Shipment: {shipment.get('shipment_no') or shipment_id}"))
+        layout.addWidget(editor)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_date = editor.date().toPython()
+        try:
+            with engine.begin() as connection:
+                connection.execute(text('UPDATE mpps_shipments SET target_date = :d, plan_date = :d, updated_at = CURRENT_TIMESTAMP WHERE id = :id'), {'id': shipment_id, 'd': new_date})
+            self.planner.replan_single_shipment_preview(shipment_id)
+            self.refresh_list()
+            self.open_shipment_detail(shipment_id)
+        except Exception as exc:
+            QMessageBox.critical(self, 'Edit Target Date Failed', str(exc))
 
 
 class ShipmentDetailsPage(ShipmentOrdersPage):
