@@ -34,3 +34,7 @@ backups/v2_local_snapshots/
 
 backups/db/
 data/local_master/
+database_backups/
+actual_cavity_data_report.txt
+tools/build_database_v2.ps1
+tools/inspect_actual_cavity_data.ps1
