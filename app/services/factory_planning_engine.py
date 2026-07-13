@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
@@ -700,7 +700,7 @@ class FactoryPlanningEngine:
                 self._persist_item_result(conn, shipment, shipment_item_id, result, planning_version)
             return result
 
-        total_plan = max(0, int(smds.get("total_plan") or 0))
+        total_plan = max(0.0, float(smds.get("total_plan") or 0))
         if total_plan <= 0:
             result = ShipmentItemPlanResult(
                 shipment_id=int(shipment.get("id") or 0),
@@ -759,7 +759,7 @@ class FactoryPlanningEngine:
         smds: dict[str, Any],
         preview: bool = False,
     ) -> ShipmentItemPlanResult:
-        total_plan = max(0, int(smds.get("total_plan") or 0))
+        total_plan = max(0.0, float(smds.get("total_plan") or 0))
         mold_key = str(smds.get("key_code") or "").strip()
         casing_type = str(smds.get("casing_type") or "").strip()
         line_name = str(smds.get("line") or "").strip()
@@ -790,7 +790,7 @@ class FactoryPlanningEngine:
             allocation_total += daily_production_qty
             allocated_cavity_count = max(allocated_cavity_count, allocated_cavities)
             production_days += 1
-            daily_capacity = max(daily_capacity, allocated_cavities * total_plan)
+            daily_capacity = max(daily_capacity, int(ceil(allocated_cavities * total_plan)))
             receive_date = candidate_date + timedelta(days=1)
             self._reserve_resource(conn, run_id, planning_version, shipment, shipment_item_id, candidate_date, "mold", mold_key, allocated_cavities, daily_capacity, sap_code, description)
             self._reserve_resource(conn, run_id, planning_version, shipment, shipment_item_id, candidate_date, "line_cavity", line_name, allocated_cavities, daily_capacity, sap_code, description)
@@ -1041,3 +1041,4 @@ class FactoryPlanningEngine:
 
 
 FactoryOutDateCalculator = FactoryPlanningEngine
+
