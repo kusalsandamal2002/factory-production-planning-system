@@ -24,19 +24,32 @@ from PySide6.QtWidgets import (
 from sqlalchemy import text
 
 from app.database import engine
+from app.services.master_data_normalization import (
+    clean_text,
+    normalize_casing_type,
+    normalize_mold_key,
+)
 
 
-def _clean_display(value, *, no_casing: bool = False) -> str:
-    text_value = str(value or "").strip()
+def _clean_display(
+    value,
+    *,
+    no_casing: bool = False,
+) -> str:
+    if no_casing:
+        return normalize_casing_type(value)
 
-    if not text_value or text_value.upper() in {"NULL", "NONE", "N/A", "NA"}:
+    text_value = clean_text(value)
+    if not text_value:
         return "-"
 
-    normalized = text_value.lower().replace("-", " ").replace("_", " ")
-    normalized = " ".join(normalized.split())
-
-    if no_casing and normalized in {"no casing", "nocasing", "without casing", "without tyre casing"}:
-        return "No Casing"
+    if text_value.upper() in {
+        "NULL",
+        "NONE",
+        "N/A",
+        "NA",
+    }:
+        return "-"
 
     return text_value
 
@@ -106,8 +119,10 @@ class SmdsMoldCasingRepository:
                 text(
                     """
                     UPDATE smds
-                    SET key_code = '-'
-                    WHERE key_code IS NULL OR BTRIM(CAST(key_code AS TEXT)) = ''
+                    SET key_code =
+                        mpps_canonical_mold_key(
+                            key_code
+                        )
                     """
                 )
             )
@@ -116,13 +131,9 @@ class SmdsMoldCasingRepository:
                     """
                     UPDATE smds
                     SET casing_type =
-                        CASE
-                            WHEN casing_type IS NULL OR BTRIM(CAST(casing_type AS TEXT)) = '' THEN '-'
-                            WHEN LOWER(BTRIM(CAST(casing_type AS TEXT))) IN (
-                                'no casing', 'nocasing', 'no-casing', 'without casing'
-                            ) THEN 'No Casing'
-                            ELSE BTRIM(CAST(casing_type AS TEXT))
-                        END
+                        mpps_canonical_casing(
+                            casing_type
+                        )
                     """
                 )
             )
@@ -260,8 +271,12 @@ class SmdsMoldCasingRepository:
         return dict(row)
 
     def update_rule(self, row_id: int, mold_key_code: str, casing_type: str) -> None:
-        mold_key = _clean_display(mold_key_code)
-        casing = _clean_display(casing_type, no_casing=True)
+        mold_key = normalize_mold_key(
+            mold_key_code
+        )
+        casing = normalize_casing_type(
+            casing_type
+        )
 
         with engine.begin() as conn:
             conn.execute(
@@ -391,8 +406,12 @@ class SmdsMoldCasingDialog(QDialog):
 
     def data(self) -> dict:
         return {
-            "key_code": _clean_display(self.mold_key_input.text()),
-            "casing_type": _clean_display(self.casing_input.currentText(), no_casing=True),
+            "key_code": normalize_mold_key(
+                self.mold_key_input.text()
+            ),
+            "casing_type": normalize_casing_type(
+                self.casing_input.currentText()
+            ),
         }
 
 
@@ -778,3 +797,4 @@ class SmdsMoldCasingPage(QWidget):
             return
 
         self.refresh()
+

@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS smds (
     day_plan NUMERIC(14, 3),
     night_plan NUMERIC(14, 3),
     total_plan NUMERIC(14, 3),
+    planning_manager_approval_status TEXT NOT NULL DEFAULT 'Pending',
+    manager_approval_updated_at TIMESTAMP,
     source_file TEXT,
     source_sheet TEXT NOT NULL DEFAULT 'ALL',
     source_row_number INTEGER,
@@ -72,6 +74,8 @@ SMDS_ALTER_SQL = [
     "ALTER TABLE smds ADD COLUMN IF NOT EXISTS day_plan NUMERIC(14, 3)",
     "ALTER TABLE smds ADD COLUMN IF NOT EXISTS night_plan NUMERIC(14, 3)",
     "ALTER TABLE smds ADD COLUMN IF NOT EXISTS total_plan NUMERIC(14, 3)",
+    "ALTER TABLE smds ADD COLUMN IF NOT EXISTS planning_manager_approval_status TEXT NOT NULL DEFAULT 'Pending'",
+    "ALTER TABLE smds ADD COLUMN IF NOT EXISTS manager_approval_updated_at TIMESTAMP",
     "ALTER TABLE smds ADD COLUMN IF NOT EXISTS source_file TEXT",
     "ALTER TABLE smds ADD COLUMN IF NOT EXISTS source_sheet TEXT NOT NULL DEFAULT 'ALL'",
     "ALTER TABLE smds ADD COLUMN IF NOT EXISTS source_row_number INTEGER",
@@ -84,6 +88,7 @@ SMDS_INDEX_SQL = [
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_smds_sap_code ON smds (sap_code)",
     "CREATE INDEX IF NOT EXISTS ix_smds_key_code ON smds (key_code)",
     "CREATE INDEX IF NOT EXISTS ix_smds_casing_type ON smds (casing_type)",
+    "CREATE INDEX IF NOT EXISTS ix_smds_manager_approval ON smds (planning_manager_approval_status)",
     "CREATE INDEX IF NOT EXISTS ix_smds_material_description ON smds USING gin (to_tsvector('simple', material_description))",
 ]
 
@@ -169,19 +174,54 @@ def ensure_smds_table() -> None:
     """Create or upgrade the central SMDS table used by planning modules."""
     with engine.begin() as conn:
         conn.execute(text(SMDS_TABLE_SQL))
+
         for statement in SMDS_ALTER_SQL:
             conn.execute(text(statement))
+
+        conn.execute(
+            text(
+                """
+                ALTER TABLE smds
+                ALTER COLUMN planning_manager_approval_status
+                SET DEFAULT 'Pending'
+                """
+            )
+        )
+
+        conn.execute(
+            text(
+                """
+                UPDATE smds
+                SET planning_manager_approval_status = 'Pending'
+                WHERE planning_manager_approval_status IS NULL
+                   OR BTRIM(planning_manager_approval_status) = ''
+                """
+            )
+        )
+
+        conn.execute(
+            text(
+                """
+                ALTER TABLE smds
+                ALTER COLUMN planning_manager_approval_status
+                SET NOT NULL
+                """
+            )
+        )
+
         for statement in SMDS_INDEX_SQL:
             conn.execute(text(statement))
 
 
 def ensure_excel_foundation_tables() -> None:
-    """Create the legacy raw Excel viewer tables if this database was created before that migration."""
+    """Create legacy raw Excel viewer tables for older databases."""
     with engine.begin() as conn:
         for statement in EXCEL_FOUNDATION_SQL:
             conn.execute(text(statement))
+
         for statement in EXCEL_FOUNDATION_ALTER_SQL:
             conn.execute(text(statement))
+
         for statement in EXCEL_FOUNDATION_INDEX_SQL:
             conn.execute(text(statement))
 

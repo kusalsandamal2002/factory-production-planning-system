@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QDate, Qt
+from datetime import date
+from typing import Any
+
+from PySide6.QtCore import QDate, Qt, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QDateEdit,
+    QDoubleSpinBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -14,6 +18,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -21,185 +26,486 @@ from PySide6.QtWidgets import (
 )
 
 from app.database import get_session
-from app.services.material_requirement_service import PlanningAssumptions
-from app.services.oven_schedule_service import (
-    OvenScheduleRow,
-    OvenScheduleSummary,
-    calculate_daily_oven_plan,
+from app.services.cavity_daily_plan_service import (
+    BlockedDemand,
+    CavityPlanRow,
+    CavityPlanSettings,
+    CavityPlanSummary,
+    generate_cavity_plan,
+    load_latest_saved_plan,
+    save_cavity_plan,
 )
 from app.utils.reports_export import export_to_csv
 
 
-SCHEDULE_STATUSES = [
+OVEN_STATUS_OPTIONS = [
     "ALL",
-    "PLANNED",
-    "PARTIAL",
-    "UNPLANNED",
-    "MISSING CAPACITY",
-    "MISSING COMPATIBILITY",
-    "MISSING WEIGHT",
-    "MISSING DUE DATE",
+    "ASSIGNED",
+    "AVAILABLE / FREE",
+    "CURRENTLY ASSIGNED",
+    "BREAKDOWN",
+]
+
+TABLE_HEADERS = [
+    "Line Name",
+    "Oven No",
+    "Oven Status",
+    "Tyre Code",
+    "Description",
+    "HEEL",
+    "SOFT",
+    "Tred",
+    "Remark",
+    "Total To be produced",
+    "TODAY",
+    "Day Plan Pcs",
+    "Night Plan Pcs",
+    "CORE",
+    "NEXT DAY PLAN",
+    "Total",
+    "Weight per Tyre (Kg)",
+    "Day Plan Weight",
+    "Night Plan Weight",
+    "Total Plan",
+    "Balance",
+    "CASING TYPE",
+    "Mold Type",
+]
+
+COLUMN_WIDTHS = [
+    130,
+    170,
+    150,
+    110,
+    300,
+    110,
+    110,
+    140,
+    280,
+    145,
+    90,
+    110,
+    115,
+    90,
+    125,
+    95,
+    135,
+    125,
+    130,
+    105,
+    100,
+    125,
+    150,
 ]
 
 
 class SchedulePage(QWidget):
-    """Quantity/mould/day planning with no unverified minute logic."""
+    """Cavity-level daily production scheduling page."""
 
-    def __init__(self, current_user_id=None):
+    def __init__(self, current_user=None):
         super().__init__()
-        self.current_user = current_user_id
-        self.plan_rows: list[OvenScheduleRow] = []
-        self.visible_rows: list[OvenScheduleRow] = []
+        self.current_user = current_user
+        self.plan_rows: list[CavityPlanRow] = []
+        self.visible_rows: list[CavityPlanRow] = []
+        self.blocked_rows: list[BlockedDemand] = []
+        self.summary: CavityPlanSummary | None = None
+        self.current_run_id: int | None = None
+        self.preview_is_saved = False
+        self._auto_refresh_pending = False
 
         self.plan_date = QDateEdit()
         self.plan_date.setCalendarPopup(True)
         self.plan_date.setDisplayFormat("yyyy-MM-dd")
         self.plan_date.setDate(QDate.currentDate())
-        self.plan_date.dateChanged.connect(self.refresh)
+        self.plan_date.dateChanged.connect(
+            self._load_saved_or_preview
+        )
+
+        self.shift_selector = QComboBox()
+        self.shift_selector.addItem(
+            "ALL SHIFTS (07:00 - 07:00)",
+            "ALL",
+        )
+        self.shift_selector.addItem(
+            "DAY SHIFT (07:00 - 19:00)",
+            "DAY",
+        )
+        self.shift_selector.addItem(
+            "NIGHT SHIFT (19:00 - 07:00)",
+            "NIGHT",
+        )
+        self.shift_selector.setMinimumWidth(230)
+        self.shift_selector.setToolTip(
+            "Select the fixed factory shift to generate."
+        )
+        self.shift_selector.currentIndexChanged.connect(
+            self._on_shift_changed
+        )
+
+        self.changeover_minutes = QSpinBox()
+        self.changeover_minutes.setRange(0, 240)
+        self.changeover_minutes.setValue(0)
+        self.changeover_minutes.setSuffix(" min")
+
+        self.line_combo = QComboBox()
+        self.line_combo.addItem("ALL LINES")
+        self.line_combo.currentTextChanged.connect(
+            self.filter_table
+        )
+
+        self.status_combo = QComboBox()
+        self.status_combo.addItems(
+            OVEN_STATUS_OPTIONS
+        )
+        self.status_combo.currentTextChanged.connect(
+            self.filter_table
+        )
 
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText(
-            "Search material, description, oven, status, or risk..."
+            "Search line, oven, tyre code, description, "
+            "mold, casing or remark..."
         )
-        self.search_input.textChanged.connect(self.filter_table)
+        self.search_input.textChanged.connect(
+            self.filter_table
+        )
 
-        self.status_combo = QComboBox()
-        self.status_combo.addItems(SCHEDULE_STATUSES)
-        self.status_combo.currentTextChanged.connect(self.filter_table)
+        self.refresh_button = QPushButton(
+            "Refresh Saved"
+        )
+        self.refresh_button.setObjectName(
+            "SecondaryButton"
+        )
+        self.refresh_button.clicked.connect(
+            self._load_saved_or_preview
+        )
 
-        self.refresh_btn = QPushButton("Refresh")
-        self.refresh_btn.setObjectName("SecondaryButton")
-        self.refresh_btn.clicked.connect(self.refresh)
-        self.recalculate_btn = QPushButton("Recalculate Plan")
-        self.recalculate_btn.setObjectName("PrimaryButton")
-        self.recalculate_btn.clicked.connect(self.recalculate_plan)
-        self.export_btn = QPushButton("Export CSV")
-        self.export_btn.setObjectName("SecondaryButton")
-        self.export_btn.clicked.connect(self.export_csv)
+        self.recalculate_button = QPushButton(
+            "Recalculate Plan"
+        )
+        self.recalculate_button.setObjectName(
+            "PrimaryButton"
+        )
+        self.recalculate_button.clicked.connect(
+            self.recalculate_plan
+        )
+
+        self.save_button = QPushButton("Save Plan")
+        self.save_button.setObjectName("SuccessButton")
+        self.save_button.clicked.connect(
+            self.save_plan
+        )
+
+        self.export_button = QPushButton("Export CSV")
+        self.export_button.setObjectName(
+            "SecondaryButton"
+        )
+        self.export_button.clicked.connect(
+            self.export_csv
+        )
+
+        self.status_badge = QLabel("NO DATA")
+        self.status_badge.setObjectName("StatusBadge")
+        self.saved_badge = QLabel("PREVIEW")
+        self.saved_badge.setObjectName("PreviewBadge")
 
         self.metric_labels = {
+            "total_cavities": QLabel("0"),
+            "breakdown": QLabel("0"),
+            "currently_assigned": QLabel("0"),
+            "planned_cavities": QLabel("0"),
+            "free": QLabel("0"),
             "required": QLabel("0"),
-            "planned": QLabel("0"),
-            "unplanned": QLabel("0"),
-            "tons": QLabel("0.00"),
-            "missing_capacity": QLabel("0"),
-            "missing_compatibility": QLabel("0"),
-            "missing_due_date": QLabel("0"),
-            "missing_weight": QLabel("0"),
-            "warnings": QLabel("0"),
+            "today": QLabel("0"),
+            "next_day": QLabel("0"),
+            "balance": QLabel("0"),
+            "tons": QLabel("0.000"),
         }
-        self.capacity_status = QLabel("NO DATA")
-        self.capacity_status.setObjectName("StatusBadge")
-        self.assumption_note = QLabel("")
-        self.assumption_note.setObjectName("AssumptionNote")
-        self.assumption_note.setWordWrap(True)
 
-        self.table = QTableWidget(0, 16)
+        self.table = QTableWidget(
+            0,
+            len(TABLE_HEADERS),
+        )
         self.table.setHorizontalHeaderLabels(
+            TABLE_HEADERS
+        )
+
+        self.blocked_table = QTableWidget(0, 6)
+        self.blocked_table.setHorizontalHeaderLabels(
             [
-                "Material Code",
-                "Item Description",
+                "SAP Code",
+                "Description",
+                "Required Qty",
+                "Approval",
                 "Due Date",
-                "Demand Qty",
-                "Available Stock",
-                "Shortage Qty",
-                "Production Required Qty",
-                "Effective Daily Capacity",
-                "Planned Day Qty",
-                "Planned Night Qty",
-                "Selected Date Planned Qty",
-                "Remaining Qty After Selected Date",
-                "Planned Tons",
-                "Oven / Press",
-                "Status",
-                "Risk Reason",
+                "Reason",
             ]
         )
 
-        self._setup_table()
+        self._setup_tables()
         self._apply_styles()
         self._build_ui()
-        self.refresh()
+        self._load_saved_or_preview()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+
+        if self._auto_refresh_pending:
+            return
+
+        self._auto_refresh_pending = True
+
+        QTimer.singleShot(
+            0,
+            self._auto_refresh_on_open,
+        )
+
+    def _auto_refresh_on_open(self) -> None:
+        try:
+            if not self.isVisible():
+                return
+
+            settings = self._settings()
+
+            with get_session() as session:
+                rows, summary, blocked = (
+                    generate_cavity_plan(
+                        session,
+                        settings=settings,
+                    )
+                )
+
+            self.current_run_id = None
+            self.preview_is_saved = False
+
+            self._apply_result(
+                rows,
+                summary,
+                blocked,
+            )
+
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Automatic Production Refresh",
+                (
+                    "Could not refresh the live "
+                    "production plan.\n\n"
+                    f"{exc}"
+                ),
+            )
+
+        finally:
+            self._auto_refresh_pending = False
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(16)
+        root.setSpacing(14)
 
-        metrics = QGridLayout()
-        metrics.setHorizontalSpacing(12)
-        metrics.setVerticalSpacing(12)
-        cards = [
-            ("Production Required Qty", "required"),
-            ("Selected Date Planned Qty", "planned"),
-            ("Remaining Qty After Selected Date", "unplanned"),
-            ("Planned Tons", "tons"),
-            ("Missing Capacity Items", "missing_capacity"),
-            ("Missing Compatibility Items", "missing_compatibility"),
-            ("Missing Due Date Items", "missing_due_date"),
-            ("Missing Weight Items", "missing_weight"),
-            ("Warning Items", "warnings"),
-        ]
-        for index, (title, key) in enumerate(cards):
-            metrics.addWidget(
-                self._metric_card(title, self.metric_labels[key]),
-                index // 3,
-                index % 3,
-            )
-        root.addLayout(metrics)
-
-        controls = QFrame()
-        controls.setObjectName("Card")
-        controls_layout = QVBoxLayout(controls)
-        controls_layout.setContentsMargins(18, 16, 18, 18)
-        controls_layout.setSpacing(12)
-
-        heading = QHBoxLayout()
-        title_box = QVBoxLayout()
-        title = QLabel("Daily Quantity-Based Oven Plan")
-        title.setObjectName("SectionTitle")
-        hint = QLabel(
-            "Uses shipment shortage, mould/day capacity, and historical active "
-            "oven compatibility. Imported mpps_oven_plan rows remain read-only."
+        header_card = QFrame()
+        header_card.setObjectName("Card")
+        header_layout = QVBoxLayout(header_card)
+        header_layout.setContentsMargins(
+            20,
+            18,
+            20,
+            18,
         )
-        hint.setObjectName("SectionHint")
-        hint.setWordWrap(True)
-        title_box.addWidget(title)
-        title_box.addWidget(hint)
-        heading.addLayout(title_box, 1)
-        heading.addWidget(self.capacity_status)
-        heading.addWidget(self.refresh_btn)
-        heading.addWidget(self.recalculate_btn)
-        heading.addWidget(self.export_btn)
-        controls_layout.addLayout(heading)
+        header_layout.setSpacing(12)
+
+        heading_row = QHBoxLayout()
+        title_area = QVBoxLayout()
+        title = QLabel(
+            "Cavity-Level Daily Production Plan"
+        )
+        title.setObjectName("PageTitle")
+        subtitle = QLabel(
+            "Displays every factory cavity. Automatic "
+            "allocation uses approved SMDS data, shipment "
+            "shortage, SAP stock, line compatibility, mold "
+            "and casing concurrency, curing time, handling "
+            "time and cavity operating status. Fixed shifts: "
+            "DAY 07:00-19:00 and NIGHT 19:00-07:00."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setObjectName("PageSubtitle")
+        title_area.addWidget(title)
+        title_area.addWidget(subtitle)
+
+        heading_row.addLayout(title_area, 1)
+        heading_row.addWidget(self.saved_badge)
+        heading_row.addWidget(self.status_badge)
+        heading_row.addWidget(self.refresh_button)
+        heading_row.addWidget(
+            self.recalculate_button
+        )
+        heading_row.addWidget(self.save_button)
+        heading_row.addWidget(self.export_button)
+        header_layout.addLayout(heading_row)
+
+        planning_controls = QHBoxLayout()
+        planning_controls.setSpacing(9)
+        planning_controls.addWidget(
+            QLabel("Planning Date")
+        )
+        planning_controls.addWidget(self.plan_date)
+        planning_controls.addWidget(
+            QLabel("Shift")
+        )
+        planning_controls.addWidget(
+            self.shift_selector
+        )
+        planning_controls.addWidget(
+            QLabel("Tyre Changeover")
+        )
+        planning_controls.addWidget(
+            self.changeover_minutes
+        )
+        planning_controls.addStretch()
+        header_layout.addLayout(planning_controls)
 
         filters = QHBoxLayout()
-        filters.addWidget(QLabel("Planning Date"))
-        filters.addWidget(self.plan_date)
+        filters.setSpacing(9)
+        filters.addWidget(QLabel("Line"))
+        filters.addWidget(self.line_combo)
+        filters.addWidget(QLabel("Oven Status"))
+        filters.addWidget(self.status_combo)
         filters.addWidget(QLabel("Search"))
         filters.addWidget(self.search_input, 1)
-        filters.addWidget(QLabel("Status"))
-        filters.addWidget(self.status_combo)
-        controls_layout.addLayout(filters)
-        controls_layout.addWidget(self.assumption_note)
-        root.addWidget(controls)
+        header_layout.addLayout(filters)
+
+        note = QLabel(
+            "Oven Status: BREAKDOWN = unavailable; "
+            "CURRENTLY ASSIGNED = operational assignment "
+            "already exists; ASSIGNED = generated plan; "
+            "AVAILABLE / FREE = active cavity with no generated allocation. "
+            "The same oven appears on multiple rows when its "
+            "remaining daily time can produce another tyre type."
+        )
+        note.setWordWrap(True)
+        note.setObjectName("AssumptionNote")
+        header_layout.addWidget(note)
+        root.addWidget(header_card)
+
+        metric_layout = QGridLayout()
+        metric_layout.setHorizontalSpacing(10)
+        metric_layout.setVerticalSpacing(10)
+        metrics = [
+            ("Total Cavities", "total_cavities"),
+            ("Breakdown", "breakdown"),
+            (
+                "Currently Assigned",
+                "currently_assigned",
+            ),
+            ("Planned Cavities", "planned_cavities"),
+            ("Free Cavities", "free"),
+            ("Production Required", "required"),
+            ("TODAY Planned", "today"),
+            ("NEXT DAY Planned", "next_day"),
+            ("Remaining Balance", "balance"),
+            ("TODAY Planned Tons", "tons"),
+        ]
+        for index, (label, key) in enumerate(
+            metrics
+        ):
+            metric_layout.addWidget(
+                self._metric_card(
+                    label,
+                    self.metric_labels[key],
+                ),
+                index // 5,
+                index % 5,
+            )
+        root.addLayout(metric_layout)
 
         table_card = QFrame()
         table_card.setObjectName("Card")
         table_layout = QVBoxLayout(table_card)
-        table_layout.setContentsMargins(18, 16, 18, 18)
-        table_layout.setSpacing(10)
-        table_title = QLabel("Day / Night Quantity Allocation and Risk")
+        table_layout.setContentsMargins(
+            16,
+            14,
+            16,
+            16,
+        )
+        table_layout.setSpacing(8)
+
+        table_header = QHBoxLayout()
+        table_title = QLabel(
+            "Factory Cavity / Oven Allocation"
+        )
         table_title.setObjectName("SectionTitle")
-        table_layout.addWidget(table_title)
+        self.row_count_label = QLabel("0 rows")
+        self.row_count_label.setObjectName(
+            "SectionBadge"
+        )
+        table_header.addWidget(table_title)
+        table_header.addStretch()
+        table_header.addWidget(
+            self.row_count_label
+        )
+
+        table_hint = QLabel(
+            "The grid always contains every cavity. "
+            "Multiple sequential allocations for one oven "
+            "are shown as additional rows using the same "
+            "Line Name and Oven No."
+        )
+        table_hint.setObjectName("SectionHint")
+        table_hint.setWordWrap(True)
+
+        table_layout.addLayout(table_header)
+        table_layout.addWidget(table_hint)
         table_layout.addWidget(self.table, 1)
         root.addWidget(table_card, 1)
 
-    def _metric_card(self, title_text: str, value_label: QLabel) -> QFrame:
+        blocked_card = QFrame()
+        blocked_card.setObjectName("Card")
+        blocked_layout = QVBoxLayout(blocked_card)
+        blocked_layout.setContentsMargins(
+            16,
+            14,
+            16,
+            16,
+        )
+        blocked_layout.setSpacing(8)
+
+        blocked_header = QHBoxLayout()
+        blocked_title = QLabel(
+            "Unallocated / Blocked Production Demand"
+        )
+        blocked_title.setObjectName("SectionTitle")
+        self.blocked_count_label = QLabel(
+            "0 items"
+        )
+        self.blocked_count_label.setObjectName(
+            "WarningBadge"
+        )
+        blocked_header.addWidget(blocked_title)
+        blocked_header.addStretch()
+        blocked_header.addWidget(
+            self.blocked_count_label
+        )
+        blocked_layout.addLayout(blocked_header)
+        blocked_layout.addWidget(
+            self.blocked_table
+        )
+        root.addWidget(blocked_card)
+
+    def _metric_card(
+        self,
+        title_text: str,
+        value_label: QLabel,
+    ) -> QFrame:
         card = QFrame()
         card.setObjectName("MetricCard")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setContentsMargins(
+            14,
+            10,
+            14,
+            10,
+        )
         title = QLabel(title_text)
         title.setObjectName("MetricTitle")
         value_label.setObjectName("MetricValue")
@@ -207,210 +513,906 @@ class SchedulePage(QWidget):
         layout.addWidget(value_label)
         return card
 
-    def _setup_table(self) -> None:
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(44)
+    def _setup_tables(self) -> None:
+        self.table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.table.setSelectionBehavior(
+            QAbstractItemView
+            .SelectionBehavior
+            .SelectRows
+        )
+        self.table.setSelectionMode(
+            QAbstractItemView
+            .SelectionMode
+            .SingleSelection
+        )
         self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(
+            44
+        )
+        self.table.setMinimumHeight(500)
+        self.table.setSortingEnabled(False)
+
         header = self.table.horizontalHeader()
-        for column in range(self.table.columnCount()):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(15, QHeaderView.ResizeMode.Stretch)
-        widths = [
-            120,
-            220,
-            95,
-            90,
-            100,
-            90,
-            115,
-            130,
-            105,
-            110,
-            110,
-            120,
-            95,
-            130,
-            145,
-            260,
-        ]
-        for index, width in enumerate(widths):
-            self.table.setColumnWidth(index, width)
+        header.setDefaultAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        for column, width in enumerate(
+            COLUMN_WIDTHS
+        ):
+            header.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.Fixed,
+            )
+            self.table.setColumnWidth(
+                column,
+                width,
+            )
+
+        self.blocked_table.setEditTriggers(
+            QAbstractItemView
+            .EditTrigger
+            .NoEditTriggers
+        )
+        self.blocked_table.setSelectionBehavior(
+            QAbstractItemView
+            .SelectionBehavior
+            .SelectRows
+        )
+        self.blocked_table.verticalHeader().setVisible(
+            False
+        )
+        self.blocked_table.setAlternatingRowColors(
+            True
+        )
+        self.blocked_table.setMaximumHeight(190)
+        blocked_header = (
+            self.blocked_table.horizontalHeader()
+        )
+        blocked_header.setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive
+        )
+        self.blocked_table.setColumnWidth(0, 110)
+        self.blocked_table.setColumnWidth(1, 300)
+        self.blocked_table.setColumnWidth(2, 110)
+        self.blocked_table.setColumnWidth(3, 110)
+        self.blocked_table.setColumnWidth(4, 110)
+        blocked_header.setSectionResizeMode(
+            5,
+            QHeaderView.ResizeMode.Stretch,
+        )
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
             """
-            QFrame#Card, QFrame#MetricCard {
-                background:#ffffff; border:1px solid #e2e8f0; border-radius:14px;
+            QFrame#Card,
+            QFrame#MetricCard {
+                background: #ffffff;
+                border: 1px solid #dbe4f0;
+                border-radius: 15px;
             }
-            QLabel#MetricTitle { color:#64748b; font-size:8.5pt; font-weight:800; }
-            QLabel#MetricValue { color:#0f172a; font-size:18pt; font-weight:900; }
-            QLabel#SectionTitle { color:#0f172a; font-size:15pt; font-weight:900; }
-            QLabel#SectionHint, QLabel#AssumptionNote { color:#64748b; font-size:9pt; }
+
+            QLabel#PageTitle {
+                color: #0f172a;
+                font-size: 20pt;
+                font-weight: 950;
+            }
+
+            QLabel#PageSubtitle,
+            QLabel#SectionHint,
+            QLabel#AssumptionNote {
+                color: #64748b;
+                font-size: 9pt;
+                font-weight: 650;
+            }
+
+            QLabel#SectionTitle {
+                color: #0f172a;
+                font-size: 14pt;
+                font-weight: 950;
+            }
+
+            QLabel#MetricTitle {
+                color: #64748b;
+                font-size: 8pt;
+                font-weight: 850;
+            }
+
+            QLabel#MetricValue {
+                color: #0f172a;
+                font-size: 17pt;
+                font-weight: 950;
+            }
+
+            QLabel#StatusBadge,
+            QLabel#PreviewBadge,
+            QLabel#SectionBadge,
+            QLabel#WarningBadge {
+                border-radius: 9px;
+                padding: 8px 11px;
+                font-weight: 950;
+            }
+
             QLabel#StatusBadge {
-                background:#e2e8f0; color:#0f172a; border-radius:10px;
-                padding:8px 12px; font-weight:900;
+                background: #e2e8f0;
+                color: #0f172a;
             }
-            QPushButton#PrimaryButton {
-                background:#2563eb; color:white; border:0; border-radius:9px;
-                padding:9px 15px; font-weight:900;
+
+            QLabel#PreviewBadge {
+                background: #fef3c7;
+                color: #92400e;
             }
+
+            QLabel#SectionBadge {
+                background: #dbeafe;
+                color: #1d4ed8;
+            }
+
+            QLabel#WarningBadge {
+                background: #fee2e2;
+                color: #991b1b;
+            }
+
+            QPushButton#PrimaryButton,
+            QPushButton#SuccessButton,
             QPushButton#SecondaryButton {
-                background:#e2e8f0; color:#0f172a; border:0; border-radius:9px;
-                padding:9px 15px; font-weight:900;
+                border: none;
+                border-radius: 9px;
+                padding: 10px 14px;
+                font-weight: 900;
             }
-            QLineEdit, QComboBox, QDateEdit {
-                background:white; color:#0f172a; border:1px solid #cbd5e1;
-                border-radius:8px; padding:7px 10px; min-height:24px;
+
+            QPushButton#PrimaryButton {
+                background: #2563eb;
+                color: white;
             }
+
+            QPushButton#PrimaryButton:hover {
+                background: #1d4ed8;
+            }
+
+            QPushButton#SuccessButton {
+                background: #16a34a;
+                color: white;
+            }
+
+            QPushButton#SuccessButton:hover {
+                background: #15803d;
+            }
+
+            QPushButton#SecondaryButton {
+                background: #e2e8f0;
+                color: #0f172a;
+            }
+
+            QPushButton#SecondaryButton:hover {
+                background: #cbd5e1;
+            }
+
+            QLineEdit,
+            QComboBox,
+            QDateEdit,
+            QDoubleSpinBox,
+            QSpinBox {
+                background: #ffffff;
+                color: #0f172a;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                padding: 7px 9px;
+                min-height: 25px;
+            }
+
             QTableWidget {
-                background:white; color:#0f172a; border:1px solid #e2e8f0;
-                border-radius:10px; gridline-color:#e2e8f0;
-                alternate-background-color:#f8fafc;
-                selection-background-color:#dbeafe; selection-color:#0f172a;
+                background: #ffffff;
+                color: #0f172a;
+                border: 1px solid #dbe4f0;
+                border-radius: 9px;
+                gridline-color: #dbe4f0;
+                alternate-background-color: #f8fafc;
+                selection-background-color: #dbeafe;
+                selection-color: #0f172a;
             }
+
             QHeaderView::section {
-                background:#f1f5f9; color:#1e293b; border:0;
-                border-right:1px solid #e2e8f0; padding:9px; font-weight:900;
+                background: #eef3f9;
+                color: #172033;
+                border: none;
+                border-right: 1px solid #dbe4f0;
+                border-bottom: 1px solid #dbe4f0;
+                padding: 9px 6px;
+                font-weight: 950;
             }
             """
         )
 
-    def refresh(self, *args) -> None:
-        self._load_plan(show_message=False)
+    def _on_shift_changed(self, *args) -> None:
+        QTimer.singleShot(
+            0,
+            self._refresh_selected_shift_preview,
+        )
+
+    def _refresh_selected_shift_preview(self) -> None:
+        if not self.isVisible():
+            return
+
+        try:
+            settings = self._settings()
+            with get_session() as session:
+                rows, summary, blocked = generate_cavity_plan(
+                    session,
+                    settings=settings,
+                )
+
+            self.current_run_id = None
+            self.preview_is_saved = False
+            self._apply_result(rows, summary, blocked)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Shift Plan Refresh",
+                str(exc),
+            )
+
+    def _settings(self) -> CavityPlanSettings:
+        planning_date = self.plan_date.date().toPython()
+        if not isinstance(planning_date, date):
+            planning_date = date(
+                planning_date.year,
+                planning_date.month,
+                planning_date.day,
+            )
+
+        shift_mode = str(
+            self.shift_selector.currentData() or "ALL"
+        ).upper()
+        if shift_mode not in {"ALL", "DAY", "NIGHT"}:
+            shift_mode = "ALL"
+
+        day_minutes = 720 if shift_mode in {"ALL", "DAY"} else 0
+        night_minutes = 720 if shift_mode in {"ALL", "NIGHT"} else 0
+
+        return CavityPlanSettings(
+            planning_date=planning_date,
+            day_shift_minutes=day_minutes,
+            night_shift_minutes=night_minutes,
+            changeover_minutes=max(
+                0,
+                int(self.changeover_minutes.value()),
+            ),
+        )
+
+    def _load_saved_or_preview(
+        self,
+        *args,
+    ) -> None:
+        try:
+            settings = self._settings()
+            with get_session() as session:
+                saved = load_latest_saved_plan(
+                    session,
+                    planning_date=(
+                        settings.planning_date
+                    ),
+                )
+                if saved:
+                    (
+                        rows,
+                        summary,
+                        blocked,
+                        saved_settings,
+                        run_id,
+                    ) = saved
+                    self._set_shift_controls(
+                        saved_settings
+                    )
+                    self.current_run_id = run_id
+                    self.preview_is_saved = True
+                else:
+                    (
+                        rows,
+                        summary,
+                        blocked,
+                    ) = generate_cavity_plan(
+                        session,
+                        settings=settings,
+                    )
+                    self.current_run_id = None
+                    self.preview_is_saved = False
+
+            self._apply_result(
+                rows,
+                summary,
+                blocked,
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Production Planning",
+                "Could not load the cavity-level "
+                f"production plan.\n\n{exc}",
+            )
 
     def recalculate_plan(self, *args) -> None:
-        self._load_plan(show_message=True)
+        try:
+            settings = self._settings()
+            with get_session() as session:
+                rows, summary, blocked = (
+                    generate_cavity_plan(
+                        session,
+                        settings=settings,
+                    )
+                )
+            self.current_run_id = None
+            self.preview_is_saved = False
+            self._apply_result(
+                rows,
+                summary,
+                blocked,
+            )
+            QMessageBox.information(
+                self,
+                "Plan Recalculated",
+                (
+                    f"Generated {len(rows):,} display rows "
+                    f"for {summary.total_cavities:,} "
+                    "factory cavities.\n\n"
+                    "No plan was saved yet. Click Save Plan "
+                    "after reviewing the allocation."
+                ),
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Recalculate Plan",
+                str(exc),
+            )
 
-    def _load_plan(self, *, show_message: bool) -> None:
+    def save_plan(self, *args) -> None:
+        if not self.plan_rows or self.summary is None:
+            QMessageBox.warning(
+                self,
+                "Save Plan",
+                "There is no generated plan to save.",
+            )
+            return
+
+        try:
+            settings = self._settings()
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Invalid Shift Settings",
+                str(exc),
+            )
+            return
+
+        confirmation = QMessageBox.question(
+            self,
+            "Save Cavity Plan",
+            (
+                "Save this cavity-level plan as the latest "
+                f"plan for {settings.planning_date}"
+                "?\n\nA new version will be created; older "
+                "saved versions are retained."
+            ),
+            (
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No
+            ),
+            QMessageBox.StandardButton.No,
+        )
+        if (
+            confirmation
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+
         try:
             with get_session() as session:
-                rows, summary = calculate_daily_oven_plan(
+                run_id = save_cavity_plan(
                     session,
-                    planning_date=self.plan_date.date().toPython(),
-                    assumptions=PlanningAssumptions(),
+                    settings=settings,
+                    rows=self.plan_rows,
+                    summary=self.summary,
+                    blocked=self.blocked_rows,
+                    created_by=self._current_user_name(),
                 )
-            self._set_plan(rows, summary)
-            if show_message:
-                QMessageBox.information(
-                    self,
-                    "Plan Recalculated",
-                    "Quantity-based plan recalculated in memory. Imported Excel plan "
-                    "rows and all source data were not overwritten.",
-                )
+            self.current_run_id = run_id
+            self.preview_is_saved = True
+            self._update_saved_badge()
+            QMessageBox.information(
+                self,
+                "Plan Saved",
+                (
+                    "Cavity-level production plan saved "
+                    f"successfully.\n\nRun ID: {run_id}"
+                ),
+            )
         except Exception as exc:
-            QMessageBox.critical(self, "Daily Oven Schedule", str(exc))
+            QMessageBox.critical(
+                self,
+                "Save Plan Failed",
+                str(exc),
+            )
 
-    def _set_plan(
+    def _apply_result(
         self,
-        rows: list[OvenScheduleRow],
-        summary: OvenScheduleSummary,
+        rows: list[CavityPlanRow],
+        summary: CavityPlanSummary,
+        blocked: list[BlockedDemand],
     ) -> None:
         self.plan_rows = rows
+        self.summary = summary
+        self.blocked_rows = blocked
+        self._update_metrics(summary)
+        self._update_saved_badge()
+        self._refresh_line_filter()
+        self.filter_table()
+        self._populate_blocked_table()
+
+    def _update_metrics(
+        self,
+        summary: CavityPlanSummary,
+    ) -> None:
         values = {
-            "required": summary.production_required_qty,
-            "planned": summary.planned_qty,
-            "unplanned": summary.unplanned_qty,
-            "missing_capacity": summary.missing_capacity_items,
-            "missing_compatibility": summary.missing_compatibility_items,
-            "missing_due_date": summary.missing_due_date_items,
-            "missing_weight": summary.missing_weight_items,
-            "warnings": summary.risk_warning_count,
+            "total_cavities": (
+                summary.total_cavities
+            ),
+            "breakdown": (
+                summary.breakdown_cavities
+            ),
+            "currently_assigned": (
+                summary.currently_assigned_cavities
+            ),
+            "planned_cavities": (
+                summary.planned_cavities
+            ),
+            "free": summary.free_cavities,
+            "required": (
+                summary.production_required_qty
+            ),
+            "today": summary.today_planned_qty,
+            "next_day": (
+                summary.next_day_planned_qty
+            ),
+            "balance": (
+                summary.remaining_balance_qty
+            ),
         }
         for key, value in values.items():
-            self.metric_labels[key].setText(f"{value:,}")
-        self.metric_labels["tons"].setText(f"{summary.planned_tons:,.2f}")
-        self.capacity_status.setText(summary.capacity_status)
-        self.assumption_note.setText(summary.assumption_note)
-        self.filter_table()
+            self.metric_labels[key].setText(
+                f"{value:,}"
+            )
+        self.metric_labels["tons"].setText(
+            f"{summary.planned_tons:,.3f}"
+        )
+        self.status_badge.setText(
+            summary.status_text
+        )
+
+        status_styles = {
+            "TWO-DAY PLAN COMPLETE": (
+                "#dcfce7",
+                "#166534",
+            ),
+            "PARTIALLY PLANNED": (
+                "#fef3c7",
+                "#92400e",
+            ),
+            "PARTIALLY BLOCKED": (
+                "#ffedd5",
+                "#9a3412",
+            ),
+            "UNPLANNED": (
+                "#fee2e2",
+                "#991b1b",
+            ),
+        }
+        background, foreground = (
+            status_styles.get(
+                summary.status_text,
+                ("#e2e8f0", "#0f172a"),
+            )
+        )
+        self.status_badge.setStyleSheet(
+            f"background:{background};"
+            f"color:{foreground};"
+            "border-radius:9px;"
+            "padding:8px 11px;"
+            "font-weight:950;"
+        )
+
+    def _update_saved_badge(self) -> None:
+        if self.preview_is_saved:
+            text = (
+                f"SAVED RUN #{self.current_run_id}"
+                if self.current_run_id
+                else "SAVED"
+            )
+            self.saved_badge.setText(text)
+            self.saved_badge.setStyleSheet(
+                "background:#dcfce7;"
+                "color:#166534;"
+                "border-radius:9px;"
+                "padding:8px 11px;"
+                "font-weight:950;"
+            )
+        else:
+            self.saved_badge.setText(
+                "UNSAVED PREVIEW"
+            )
+            self.saved_badge.setStyleSheet(
+                "background:#fef3c7;"
+                "color:#92400e;"
+                "border-radius:9px;"
+                "padding:8px 11px;"
+                "font-weight:950;"
+            )
+
+    def _set_shift_controls(
+        self,
+        settings: CavityPlanSettings,
+    ) -> None:
+        day_enabled = settings.day_shift_minutes > 0
+        night_enabled = settings.night_shift_minutes > 0
+
+        if day_enabled and night_enabled:
+            shift_mode = "ALL"
+        elif day_enabled:
+            shift_mode = "DAY"
+        elif night_enabled:
+            shift_mode = "NIGHT"
+        else:
+            shift_mode = "ALL"
+
+        index = self.shift_selector.findData(shift_mode)
+        self.shift_selector.blockSignals(True)
+        self.shift_selector.setCurrentIndex(max(0, index))
+        self.shift_selector.blockSignals(False)
+        self.changeover_minutes.setValue(
+            settings.changeover_minutes
+        )
+
+    def _refresh_line_filter(self) -> None:
+        current = self.line_combo.currentText()
+        lines = sorted(
+            {
+                row.line_name
+                for row in self.plan_rows
+                if row.line_name
+            }
+        )
+        self.line_combo.blockSignals(True)
+        self.line_combo.clear()
+        self.line_combo.addItem("ALL LINES")
+        self.line_combo.addItems(lines)
+        index = self.line_combo.findText(current)
+        self.line_combo.setCurrentIndex(
+            index if index >= 0 else 0
+        )
+        self.line_combo.blockSignals(False)
 
     def filter_table(self, *args) -> None:
-        search = self.search_input.text().strip().lower()
-        status = self.status_combo.currentText()
-        self.visible_rows = []
+        search = (
+            self.search_input.text()
+            .strip()
+            .lower()
+        )
+        selected_line = (
+            self.line_combo.currentText()
+        )
+        selected_status = (
+            self.status_combo.currentText()
+        )
+
+        visible: list[CavityPlanRow] = []
         for row in self.plan_rows:
-            if status != "ALL" and row.status != status:
+            if (
+                selected_line != "ALL LINES"
+                and row.line_name != selected_line
+            ):
                 continue
+            if (
+                selected_status != "ALL"
+                and row.oven_status
+                != selected_status
+            ):
+                continue
+
             searchable = " ".join(
                 [
-                    row.material_code,
-                    row.item_description,
-                    row.oven_code,
-                    row.line_category,
-                    row.status,
+                    row.line_name,
+                    row.oven_no,
+                    row.oven_status,
+                    row.tyre_code,
+                    row.description,
+                    row.heel,
+                    row.soft,
+                    row.tred,
+                    row.remark,
+                    row.core,
+                    row.casing_type,
+                    row.mold_type,
                     row.risk_reason,
                 ]
             ).lower()
             if search and search not in searchable:
                 continue
-            self.visible_rows.append(row)
+            visible.append(row)
+
+        self.visible_rows = visible
         self._populate_table()
+        self.row_count_label.setText(
+            f"{len(visible):,} rows / "
+            f"{len(self.plan_rows):,} total"
+        )
 
     def _populate_table(self) -> None:
         self.table.setRowCount(0)
-        for row_index, row in enumerate(self.visible_rows):
+
+        for row_index, row in enumerate(
+            self.visible_rows
+        ):
             self.table.insertRow(row_index)
             values = [
-                row.material_code,
-                row.item_description,
-                row.due_date.isoformat() if row.due_date else "MISSING",
-                f"{row.demand_qty:,}",
-                f"{row.available_stock:,}",
-                f"{row.shortage_qty:,}",
-                f"{row.production_required_qty:,}",
-                f"{row.effective_daily_capacity:,.2f}",
-                f"{row.day_qty:,}",
-                f"{row.night_qty:,}",
-                f"{row.total_planned_qty:,}",
-                f"{row.remaining_qty:,}",
-                f"{row.planned_tons:,.3f}",
-                row.oven_code,
-                row.status,
-                row.risk_reason or "-",
+                row.line_name,
+                row.oven_no,
+                row.oven_status,
+                row.tyre_code or "-",
+                row.description or "-",
+                row.heel,
+                row.soft,
+                row.tred,
+                row.remark,
+                f"{row.total_to_be_produced:,}",
+                f"{row.today_qty:,}",
+                f"{row.day_plan_pcs:,}",
+                f"{row.night_plan_pcs:,}",
+                row.core,
+                f"{row.next_day_plan:,}",
+                f"{row.total:,}",
+                f"{row.weight_per_tyre_kg:,.3f}",
+                f"{row.day_plan_weight:,.3f}",
+                f"{row.night_plan_weight:,.3f}",
+                f"{row.total_plan:,}",
+                f"{row.balance:,}",
+                row.casing_type,
+                row.mold_type,
+            ]
+
+            tooltip = self._row_tooltip(row)
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsEnabled
+                )
+                item.setToolTip(tooltip)
+
+                if column not in {
+                    0,
+                    1,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    13,
+                    21,
+                    22,
+                }:
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignCenter
+                    )
+
+                if column == 2:
+                    self._style_oven_status(
+                        item,
+                        row.oven_status,
+                    )
+
+                self.table.setItem(
+                    row_index,
+                    column,
+                    item,
+                )
+
+    def _populate_blocked_table(self) -> None:
+        self.blocked_table.setRowCount(
+            len(self.blocked_rows)
+        )
+        self.blocked_count_label.setText(
+            f"{len(self.blocked_rows):,} items"
+        )
+
+        for row_index, row in enumerate(
+            self.blocked_rows
+        ):
+            values = [
+                row.sap_code,
+                row.description,
+                f"{row.required_qty:,}",
+                row.approval_status,
+                (
+                    row.due_date.isoformat()
+                    if row.due_date
+                    else "-"
+                ),
+                row.reason,
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
-                item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
-                if column not in {1, 15}:
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if column == 14:
-                    self._style_status(item, row.status)
-                if column == 15:
-                    item.setToolTip(row.risk_reason)
-                self.table.setItem(row_index, column, item)
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsEnabled
+                )
+                if column in {0, 2, 3, 4}:
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignCenter
+                    )
+                if column == 3:
+                    status = (
+                        row.approval_status
+                        .strip()
+                        .lower()
+                    )
+                    if status == "approved":
+                        item.setBackground(
+                            QColor("#dcfce7")
+                        )
+                        item.setForeground(
+                            QColor("#166534")
+                        )
+                    else:
+                        item.setBackground(
+                            QColor("#fef3c7")
+                        )
+                        item.setForeground(
+                            QColor("#92400e")
+                        )
+                self.blocked_table.setItem(
+                    row_index,
+                    column,
+                    item,
+                )
 
-    def _style_status(self, item: QTableWidgetItem, status: str) -> None:
+    def _style_oven_status(
+        self,
+        item: QTableWidgetItem,
+        status: str,
+    ) -> None:
         colors = {
-            "PLANNED": ("#166534", "#dcfce7"),
-            "PARTIAL": ("#92400e", "#fef3c7"),
-            "UNPLANNED": ("#991b1b", "#fee2e2"),
-            "MISSING CAPACITY": ("#991b1b", "#fee2e2"),
-            "MISSING COMPATIBILITY": ("#991b1b", "#fee2e2"),
-            "MISSING WEIGHT": ("#92400e", "#fef3c7"),
-            "MISSING DUE DATE": ("#1d4ed8", "#dbeafe"),
+            "ASSIGNED": (
+                "#1d4ed8",
+                "#dbeafe",
+            ),
+            "AVAILABLE / FREE": (
+                "#166534",
+                "#dcfce7",
+            ),
+            "CURRENTLY ASSIGNED": (
+                "#7c2d12",
+                "#ffedd5",
+            ),
+            "BREAKDOWN": (
+                "#991b1b",
+                "#fee2e2",
+            ),
         }
-        foreground, background = colors.get(status, ("#475569", "#f1f5f9"))
+        foreground, background = colors.get(
+            status,
+            ("#475569", "#f1f5f9"),
+        )
         item.setForeground(QColor(foreground))
         item.setBackground(QColor(background))
+        item.setTextAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+
+    def _row_tooltip(
+        self,
+        row: CavityPlanRow,
+    ) -> str:
+        schedule = "-"
+        if row.end_minute > row.start_minute:
+            schedule = (
+                f"{self._format_minute(row.start_minute)}"
+                f" - "
+                f"{self._format_minute(row.end_minute)}"
+            )
+        return (
+            f"Line: {row.line_name}\n"
+            f"Oven: {row.oven_no}\n"
+            f"Status: {row.oven_status}\n"
+            f"Sequence: {row.sequence_no}\n"
+            f"Schedule: {schedule}\n"
+            f"Shift: {row.shift_name or '-'}\n"
+            f"Reason: {row.risk_reason or '-'}"
+        )
 
     def export_csv(self) -> None:
         if not self.visible_rows:
-            QMessageBox.warning(self, "Export CSV", "There are no visible plan rows.")
+            QMessageBox.warning(
+                self,
+                "Export CSV",
+                "There are no visible cavity plan rows.",
+            )
             return
-        headers = [
-            self.table.horizontalHeaderItem(column).text()
-            for column in range(self.table.columnCount())
-        ]
-        data = [
-            [
-                self.table.item(row, column).text()
-                if self.table.item(row, column) is not None
-                else ""
-                for column in range(self.table.columnCount())
-            ]
-            for row in range(self.table.rowCount())
-        ]
-        path = export_to_csv(headers, data, "daily_oven_schedule")
-        QMessageBox.information(self, "Export Complete", f"CSV exported to:\n\n{path}")
+
+        data = []
+        for row in range(self.table.rowCount()):
+            data.append(
+                [
+                    (
+                        self.table
+                        .item(row, column)
+                        .text()
+                        if self.table.item(
+                            row,
+                            column,
+                        )
+                        is not None
+                        else ""
+                    )
+                    for column in range(
+                        self.table.columnCount()
+                    )
+                ]
+            )
+
+        path = export_to_csv(
+            TABLE_HEADERS,
+            data,
+            (
+                "cavity_level_production_plan_"
+                + self._settings()
+                .planning_date
+                .isoformat()
+            ),
+        )
+        QMessageBox.information(
+            self,
+            "Export Complete",
+            f"CSV exported to:\n\n{path}",
+        )
+
+    def _current_user_name(self) -> str:
+        user = self.current_user
+        if user is None:
+            return ""
+        if isinstance(user, dict):
+            for key in (
+                "username",
+                "name",
+                "email",
+                "full_name",
+            ):
+                value = user.get(key)
+                if value:
+                    return str(value)
+            return ""
+        for attribute in (
+            "username",
+            "name",
+            "email",
+            "full_name",
+        ):
+            value: Any = getattr(
+                user,
+                attribute,
+                None,
+            )
+            if value:
+                return str(value)
+        return str(user)
+
+    @staticmethod
+    def _format_minute(value: int) -> str:
+        minute = (420 + max(0, int(value))) % 1440
+        return (
+            f"{minute // 60:02d}:"
+            f"{minute % 60:02d}"
+        )

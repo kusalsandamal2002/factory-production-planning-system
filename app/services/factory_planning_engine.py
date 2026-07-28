@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
@@ -8,6 +8,15 @@ from typing import Any
 from sqlalchemy import Date, bindparam, text
 
 from app.database import engine
+from app.services.master_data_normalization import (
+    is_no_casing,
+    normalize_casing_type,
+    normalize_line_name,
+    normalize_mold_key,
+    normalize_sap_code,
+    resource_identity,
+    resource_key as canonical_resource_key,
+)
 
 OPEN_SHIPMENT_STATUSES = {"planned", "pending", "open", "saved", "in progress", "processing", ""}
 CLOSED_SHIPMENT_STATUSES = {"cancelled", "canceled", "closed", "complete", "completed", "shipped", "done"}
@@ -69,6 +78,8 @@ class FactoryPlanningEngine:
         self.start_date = start_date or date.today()
         self.planning_horizon_days = planning_horizon_days
         self._resource_usage: dict[tuple[date, str, str], int] = {}
+        self._preview_mode = False
+        self._ignore_database_reservations = False
 
     def ensure_schema(self) -> None:
         with engine.begin() as conn:
@@ -134,6 +145,8 @@ class FactoryPlanningEngine:
                     customer_name VARCHAR(255) NOT NULL DEFAULT '',
                     shipment_date DATE NOT NULL,
                     target_date DATE,
+                    target_date_is_manual BOOLEAN NOT NULL DEFAULT FALSE,
+                    target_date_source VARCHAR(80) NOT NULL DEFAULT 'Automatic Factory Receive',
                     plan_date DATE,
                     factory_can_receive_date DATE,
                     factory_out_date DATE,
@@ -187,6 +200,8 @@ class FactoryPlanningEngine:
 
             for sql in [
                 "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS target_date DATE",
+                "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS target_date_is_manual BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS target_date_source VARCHAR(80) NOT NULL DEFAULT 'Automatic Factory Receive'",
                 "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS plan_date DATE",
                 "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS factory_can_receive_date DATE",
                 "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS factory_out_date DATE",
@@ -359,6 +374,8 @@ class FactoryPlanningEngine:
         self.ensure_schema()
         planning_version = int(datetime.utcnow().timestamp() * 1000)
         self._resource_usage.clear()
+        self._preview_mode = False
+        self._ignore_database_reservations = True
         with engine.begin() as conn:
             conn.execute(text("SET LOCAL lock_timeout = '5s'"))
             conn.execute(text("SET LOCAL statement_timeout = '30s'"))
@@ -372,10 +389,17 @@ class FactoryPlanningEngine:
             conn.execute(text("DELETE FROM shipment_stock_allocations"))
 
             open_shipments = conn.execute(text("""
-                SELECT id, shipment_no, shipment_name, customer_name, shipment_date, target_date, plan_date, status, created_at, note, COALESCE(shipment_name, '') AS shipment_label
+                SELECT id, shipment_no, shipment_name, customer_name, shipment_date, target_date, plan_date, status, created_at, note, COALESCE(shipment_name, '') AS shipment_label,
+                       COALESCE(target_date_is_manual, FALSE) AS target_date_is_manual
                 FROM mpps_shipments
                 WHERE COALESCE(LOWER(status), 'planned') NOT IN ('cancelled', 'canceled', 'closed', 'complete', 'completed', 'shipped', 'done')
-                ORDER BY CASE WHEN target_date IS NULL THEN 1 ELSE 0 END, COALESCE(target_date, DATE '9999-12-31') ASC, COALESCE(created_at, CURRENT_TIMESTAMP) ASC, id ASC
+                ORDER BY
+                    CASE WHEN COALESCE(target_date_is_manual, FALSE) THEN 0 ELSE 1 END,
+                    CASE WHEN COALESCE(target_date_is_manual, FALSE)
+                         THEN COALESCE(target_date, DATE '9999-12-31')
+                         ELSE DATE '9999-12-31' END,
+                    COALESCE(created_at, CURRENT_TIMESTAMP),
+                    id
             """))
             shipment_rows = [dict(row) for row in open_shipments.mappings().all()]
 
@@ -402,14 +426,17 @@ class FactoryPlanningEngine:
 
                 for item in items:
                     item_id = int(item["id"])
-                    sap_code = str(item.get("sap_code") or "").strip()
+                    sap_code = normalize_sap_code(
+                        item.get("sap_code")
+                    )
                     order_qty = max(0, int(item.get("quantity") or 0))
                     produced_qty = max(0, int(item.get("produced_qty") or 0))
                     total_qty += order_qty
                     if sap_code not in stock_remaining_by_sap:
                         stock_remaining_by_sap[sap_code] = self._get_available_stock(conn, sap_code)
 
-                    stock_allocated_qty = min(order_qty, max(0, stock_remaining_by_sap[sap_code]))
+                    stock_need = max(order_qty - produced_qty, 0)
+                    stock_allocated_qty = min(stock_need, max(0, stock_remaining_by_sap[sap_code]))
                     stock_remaining_by_sap[sap_code] = max(0, stock_remaining_by_sap[sap_code] - stock_allocated_qty)
                     planned_item = self._plan_shipment_item(
                         conn=conn,
@@ -433,24 +460,29 @@ class FactoryPlanningEngine:
                 factory_can_receive_date = latest_item_date or shipment.get("shipment_date") or shipment.get("plan_date") or shipment.get("target_date") or self.start_date
                 if not item_results:
                     factory_can_receive_date = shipment.get("shipment_date") or self.start_date
-                shipment_status = self._evaluate_shipment_status(item_statuses, shipment.get("target_date"))
+
+                manual_target = bool(shipment.get("target_date_is_manual"))
+                effective_target_date = (
+                    shipment.get("target_date")
+                    if manual_target
+                    else factory_can_receive_date
+                )
+                shipment_status = self._evaluate_shipment_status(item_statuses, effective_target_date)
                 planning_status = shipment_status
-                delivery_status = self._evaluate_delivery_status(shipment.get("target_date"), factory_can_receive_date)
-                if shipment.get("target_date") is None:
-                    delivery_status = "Flexible / No Target Date"
+                delivery_status = self._evaluate_delivery_status(effective_target_date, factory_can_receive_date)
                 delay_days = 0
                 early_days = 0
-                if shipment.get("target_date") is not None:
+                if effective_target_date is not None:
                     if factory_can_receive_date is None:
                         delay_days = 0
                         early_days = 0
-                    elif factory_can_receive_date < shipment.get("target_date"):
-                        early_days = (shipment.get("target_date") - factory_can_receive_date).days
-                    elif factory_can_receive_date > shipment.get("target_date"):
-                        delay_days = (factory_can_receive_date - shipment.get("target_date")).days
+                    elif factory_can_receive_date < effective_target_date:
+                        early_days = (effective_target_date - factory_can_receive_date).days
+                    elif factory_can_receive_date > effective_target_date:
+                        delay_days = (factory_can_receive_date - effective_target_date).days
 
                 progress_pct = round((completed_qty / total_qty * 100) if total_qty else 0.0, 2)
-                planning_note = "; ".join(shipment_note_parts) if shipment_note_parts else "Planned within available capacity."
+                planning_note = "; ".join(shipment_note_parts) if shipment_note_parts else "Planned within cumulative shipment priority and available capacity."
 
                 stmt = text("""
                     UPDATE mpps_shipments
@@ -479,9 +511,9 @@ class FactoryPlanningEngine:
                 )
                 conn.execute(stmt, {
                     "shipment_id": shipment_id,
-                    "target_date": shipment.get("target_date"),
-                    "plan_date": shipment.get("plan_date"),
-                    "plan_date_fallback": shipment.get("target_date") or shipment.get("shipment_date"),
+                    "target_date": effective_target_date,
+                    "plan_date": effective_target_date,
+                    "plan_date_fallback": effective_target_date or shipment.get("shipment_date"),
                     "factory_can_receive_date": factory_can_receive_date,
                     "factory_out_date": factory_can_receive_date,
                     "delivery_status": delivery_status,
@@ -499,8 +531,8 @@ class FactoryPlanningEngine:
                     shipment_id=shipment_id,
                     shipment_no=str(shipment.get("shipment_no") or ""),
                     shipment_name=str(shipment.get("shipment_name") or shipment.get("shipment_no") or ""),
-                    target_date=shipment.get("target_date"),
-                    plan_date=shipment.get("plan_date") or shipment.get("target_date"),
+                    target_date=effective_target_date,
+                    plan_date=effective_target_date,
                     factory_can_receive_date=factory_can_receive_date,
                     delivery_status=delivery_status,
                     delay_days=delay_days,
@@ -518,6 +550,7 @@ class FactoryPlanningEngine:
                 "message": f"Planned {len(shipment_results)} shipments.",
             })
 
+        self._ignore_database_reservations = False
         return PlanningRunResult(planning_run_id=run_id, planning_version=planning_version, status="Completed", message="Planning completed", shipments=shipment_results)
 
     def replan_single_shipment_preview(self, shipment_id: int) -> ShipmentPlanResult:
@@ -528,51 +561,195 @@ class FactoryPlanningEngine:
                 return shipment
         raise ValueError(f"Shipment {shipment_id} was not found in planning output.")
 
-    def calculate_cart_items(self, cart_items: list[dict[str, Any]], target_date: date | None = None, exclude_shipment_id: int | None = None) -> list[dict[str, Any]]:
+    def calculate_cart_items(
+        self,
+        cart_items: list[dict[str, Any]],
+        target_date: date | None = None,
+        exclude_shipment_id: int | None = None,
+        target_date_is_manual: bool | None = None,
+        draft_created_at: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Preview a draft inside the complete active shipment queue."""
         self.ensure_schema()
-        results: list[dict[str, Any]] = []
-        with engine.begin() as conn:
-            stock_remaining_by_sap: dict[str, int] = {}
-            for source_item in cart_items:
-                sap_code = str(source_item.get("sap_code") or "").strip()
-                order_qty = max(0, int(source_item.get("quantity") or 0))
-                description = str(source_item.get("item_description") or "")
-                if sap_code not in stock_remaining_by_sap:
-                    stock_remaining_by_sap[sap_code] = self._get_available_stock(conn, sap_code, exclude_shipment_id=exclude_shipment_id)
-                stock_allocated_qty = min(order_qty, max(0, stock_remaining_by_sap[sap_code]))
-                stock_remaining_by_sap[sap_code] = max(0, stock_remaining_by_sap[sap_code] - stock_allocated_qty)
-                result = self._plan_shipment_item(
-                    conn=conn,
-                    run_id=None,
-                    planning_version=0,
-                    shipment={"id": 0, "target_date": target_date, "shipment_no": "", "shipment_name": "", "shipment_date": self.start_date},
-                    shipment_item_id=None,
-                    sap_code=sap_code,
-                    description=description,
-                    order_qty=order_qty,
-                    stock_allocated_qty=stock_allocated_qty,
-                    produced_qty=0,
-                    preview=True,
-                )
-                enriched = dict(source_item)
-                enriched.update({
-                    "sap_code": sap_code,
-                    "description": result.description,
-                    "order_qty": result.order_qty,
-                    "stock_allocated_qty": result.stock_allocated_qty,
-                    "production_required_qty": result.remaining_qty,
-                    "allocated_cavity_count": result.allocated_cavity_count,
-                    "daily_capacity": result.daily_capacity,
-                    "production_days": result.production_days,
-                    "receive_date": result.item_receive_date,
-                    "item_receive_date": result.item_receive_date,
-                    "status": result.item_status,
-                    "reason": result.schedule_reason or result.factory_out_reason,
-                    "item_description": result.description or description,
-                    "quantity": result.order_qty,
+        manual_target = (
+            bool(target_date_is_manual)
+            if target_date_is_manual is not None
+            else target_date is not None
+        )
+        self._resource_usage.clear()
+        previous_preview_mode = self._preview_mode
+        previous_ignore_mode = self._ignore_database_reservations
+        self._preview_mode = True
+        self._ignore_database_reservations = True
+        try:
+            with engine.begin() as conn:
+                params: dict[str, Any] = {}
+                exclude_sql = ""
+                if exclude_shipment_id:
+                    params["exclude_shipment_id"] = int(exclude_shipment_id)
+                    exclude_sql = "AND shipment.id <> :exclude_shipment_id"
+
+                existing_rows = conn.execute(text(f"""
+                    SELECT
+                        shipment.id,
+                        shipment.shipment_no,
+                        shipment.shipment_name,
+                        shipment.customer_name,
+                        shipment.shipment_date,
+                        shipment.target_date,
+                        shipment.plan_date,
+                        shipment.status,
+                        shipment.created_at,
+                        shipment.note,
+                        COALESCE(
+                            shipment.target_date_is_manual,
+                            CASE
+                                WHEN shipment.target_date IS NOT NULL
+                                 AND (
+                                    shipment.factory_can_receive_date IS NULL
+                                    OR shipment.target_date <> shipment.factory_can_receive_date
+                                 )
+                                THEN TRUE
+                                ELSE FALSE
+                            END
+                        ) AS target_date_is_manual
+                    FROM mpps_shipments shipment
+                    WHERE COALESCE(LOWER(shipment.status), 'planned') NOT IN (
+                        'cancelled', 'canceled', 'closed', 'complete',
+                        'completed', 'shipped', 'done'
+                    )
+                    {exclude_sql}
+                """), params).mappings().all()
+
+                queue: list[dict[str, Any]] = []
+                for raw_shipment in existing_rows:
+                    shipment = dict(raw_shipment)
+                    items = conn.execute(text("""
+                        SELECT id, sap_code, item_description, quantity, produced_qty
+                        FROM mpps_shipment_items
+                        WHERE shipment_id = :shipment_id
+                        ORDER BY id
+                    """), {"shipment_id": int(shipment["id"])}).mappings().all()
+                    shipment["_items"] = [dict(item) for item in items]
+                    shipment["_is_draft"] = False
+                    queue.append(shipment)
+
+                queue.append({
+                    "id": 0,
+                    "shipment_no": "DRAFT",
+                    "shipment_name": "Current Draft",
+                    "customer_name": "",
+                    "shipment_date": self.start_date,
+                    "target_date": target_date if manual_target else None,
+                    "plan_date": target_date if manual_target else None,
+                    "status": "Planned",
+                    "created_at": (
+                        draft_created_at
+                        or datetime.max
+                    ),
+                    "note": "",
+                    "target_date_is_manual": manual_target,
+                    "_items": [
+                        {
+                            "id": None,
+                            "sap_code": normalize_sap_code(
+                                item.get("sap_code")
+                            ),
+                            "item_description": str(
+                                item.get("item_description")
+                                or item.get("description")
+                                or ""
+                            ),
+                            "quantity": max(0, int(item.get("quantity") or item.get("order_qty") or 0)),
+                            "produced_qty": max(
+                                0,
+                                int(
+                                    item.get(
+                                        "produced_qty"
+                                    )
+                                    or 0
+                                ),
+                            ),
+                            "_source": item,
+                        }
+                        for item in cart_items
+                    ],
+                    "_is_draft": True,
                 })
-                results.append(enriched)
-        return results
+                queue.sort(key=self._shipment_priority_sort_key)
+
+                stock_remaining_by_sap: dict[str, int] = {}
+                draft_results: list[dict[str, Any]] = []
+                for shipment in queue:
+                    for item in shipment["_items"]:
+                        sap_code = normalize_sap_code(
+                            item.get("sap_code")
+                        )
+                        order_qty = max(0, int(item.get("quantity") or 0))
+                        produced_qty = max(0, int(item.get("produced_qty") or 0))
+                        if sap_code not in stock_remaining_by_sap:
+                            stock_remaining_by_sap[sap_code] = self._get_available_stock(conn, sap_code)
+                        stock_need = max(order_qty - produced_qty, 0)
+                        stock_allocated_qty = min(
+                            stock_need,
+                            max(0, stock_remaining_by_sap[sap_code]),
+                        )
+                        stock_remaining_by_sap[sap_code] = max(
+                            0,
+                            stock_remaining_by_sap[sap_code] - stock_allocated_qty,
+                        )
+                        result = self._plan_shipment_item(
+                            conn=conn,
+                            run_id=None,
+                            planning_version=0,
+                            shipment=shipment,
+                            shipment_item_id=(int(item["id"]) if item.get("id") is not None else None),
+                            sap_code=sap_code,
+                            description=str(item.get("item_description") or ""),
+                            order_qty=order_qty,
+                            stock_allocated_qty=stock_allocated_qty,
+                            produced_qty=produced_qty,
+                            preview=True,
+                        )
+                        if not shipment["_is_draft"]:
+                            continue
+                        source_item = dict(item.get("_source") or {})
+                        source_item.update({
+                            "sap_code": sap_code,
+                            "description": result.description,
+                            "item_description": result.description or str(item.get("item_description") or ""),
+                            "order_qty": result.order_qty,
+                            "quantity": result.order_qty,
+                            "stock_allocated_qty": result.stock_allocated_qty,
+                            "production_required_qty": result.remaining_qty,
+                            "allocated_cavity_count": result.allocated_cavity_count,
+                            "daily_capacity": result.daily_capacity,
+                            "production_days": result.production_days,
+                            "receive_date": result.item_receive_date,
+                            "item_receive_date": result.item_receive_date,
+                            "status": result.item_status,
+                            "item_status": result.item_status,
+                            "reason": result.schedule_reason or result.factory_out_reason,
+                            "schedule_reason": result.schedule_reason or result.factory_out_reason,
+                            "priority_preview": True,
+                        })
+                        draft_results.append(source_item)
+                return draft_results
+        finally:
+            self._preview_mode = previous_preview_mode
+            self._ignore_database_reservations = previous_ignore_mode
+
+    def _shipment_priority_sort_key(
+        self,
+        shipment: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        manual = bool(shipment.get("target_date_is_manual"))
+        target = shipment.get("target_date")
+        created = shipment.get("created_at") or datetime.max
+        shipment_id = int(shipment.get("id") or 0)
+        if manual:
+            return (0, target or date.max, created, shipment_id)
+        return (1, date.max, created, shipment_id)
 
     def final_shipment_date(self, cart_items: list[dict[str, Any]]) -> date | None:
         dates = []
@@ -760,10 +937,21 @@ class FactoryPlanningEngine:
         preview: bool = False,
     ) -> ShipmentItemPlanResult:
         total_plan = max(0.0, float(smds.get("total_plan") or 0))
-        mold_key = str(smds.get("key_code") or "").strip()
-        casing_type = str(smds.get("casing_type") or "").strip()
-        line_name = str(smds.get("line") or "").strip()
-        casing_required = casing_type.lower() not in NO_CASING_VALUES
+        mold_key = normalize_mold_key(
+            smds.get("key_code"),
+        )
+        casing_type = normalize_casing_type(
+            smds.get("casing_type"),
+        )
+        line_name = normalize_line_name(
+            smds.get("line"),
+        )
+        sap_code = normalize_sap_code(
+            sap_code
+        )
+        casing_required = not is_no_casing(
+            casing_type
+        )
 
         current_date = self.start_date
         allocation_total = 0
@@ -772,12 +960,71 @@ class FactoryPlanningEngine:
         daily_capacity = 0
         receive_date = None
         reason = ""
-        for day_offset in range(self.planning_horizon_days + 1):
+
+        mold_available_on_any_day = False
+        casing_available_on_any_day = (
+            not casing_required
+        )
+        line_available_on_any_day = False
+        combined_capacity_on_any_day = False
+        maximum_combined_cavities = 0
+
+        for day_offset in range(
+            self.planning_horizon_days + 1
+        ):
             candidate_date = current_date + timedelta(days=day_offset)
             available_mold = self._available_mold_count(conn, mold_key, candidate_date, planning_version)
             available_casing = float("inf") if not casing_required else self._available_casing_count(conn, casing_type, candidate_date, planning_version)
-            available_line = self._available_line_cavity_count(conn, line_name, candidate_date, planning_version)
-            available_resource_cavities = int(min(available_mold, available_casing, available_line)) if available_casing != float("inf") else int(min(available_mold, available_line))
+            available_line = (
+                self._available_line_cavity_count(
+                    conn,
+                    line_name,
+                    candidate_date,
+                    planning_version,
+                )
+            )
+
+            mold_available_on_any_day = (
+                mold_available_on_any_day
+                or available_mold > 0
+            )
+            line_available_on_any_day = (
+                line_available_on_any_day
+                or available_line > 0
+            )
+
+            if casing_required:
+                casing_available_on_any_day = (
+                    casing_available_on_any_day
+                    or available_casing > 0
+                )
+
+            available_resource_cavities = (
+                int(
+                    min(
+                        available_mold,
+                        available_casing,
+                        available_line,
+                    )
+                )
+                if available_casing != float("inf")
+                else int(
+                    min(
+                        available_mold,
+                        available_line,
+                    )
+                )
+            )
+
+            maximum_combined_cavities = max(
+                maximum_combined_cavities,
+                available_resource_cavities,
+            )
+            combined_capacity_on_any_day = (
+                combined_capacity_on_any_day
+                or available_resource_cavities > 0
+            )
+
             if available_resource_cavities <= 0:
                 continue
             required_cavities = max(1, ceil(remaining_qty / total_plan)) if total_plan > 0 else 0
@@ -801,7 +1048,78 @@ class FactoryPlanningEngine:
                 break
         completed_qty = min(order_qty, stock_allocated_qty + produced_qty)
         if remaining_qty > 0:
-            reason = "No resource available within planning horizon."
+            horizon_days = (
+                self.planning_horizon_days + 1
+            )
+
+            if not mold_key:
+                reason = (
+                    "SMDS mold/key code is missing. "
+                    "Assign the correct mold key code "
+                    f"for SAP {sap_code}."
+                )
+            elif not line_name:
+                reason = (
+                    "SMDS compatible production line "
+                    "is missing. Assign at least one "
+                    f"production line for SAP {sap_code}."
+                )
+            elif not mold_available_on_any_day:
+                reason = (
+                    "No mold capacity is available for "
+                    f"key code '{mold_key}' during the "
+                    f"{horizon_days}-day planning horizon. "
+                    "The mold is missing, inactive, or "
+                    "fully reserved by higher-priority "
+                    "shipments."
+                )
+            elif (
+                casing_required
+                and not casing_available_on_any_day
+            ):
+                reason = (
+                    "No casing capacity is available for "
+                    f"type '{casing_type}' during the "
+                    f"{horizon_days}-day planning horizon. "
+                    "The casing is missing, inactive, or "
+                    "fully reserved by higher-priority "
+                    "shipments."
+                )
+            elif not line_available_on_any_day:
+                reason = (
+                    "No compatible active cavity capacity "
+                    f"is available for line(s) '{line_name}' "
+                    f"during the {horizon_days}-day "
+                    "planning horizon. The cavities are "
+                    "missing, inactive, in breakdown, "
+                    "assigned, or fully reserved."
+                )
+            elif not combined_capacity_on_any_day:
+                resource_names = (
+                    "mold, casing and cavity"
+                    if casing_required
+                    else "mold and cavity"
+                )
+                reason = (
+                    f"The required {resource_names} "
+                    "resources are not available together "
+                    "on the same production date during "
+                    f"the {horizon_days}-day planning "
+                    "horizon."
+                )
+            else:
+                reason = (
+                    "The available combined capacity is "
+                    "insufficient to complete this item "
+                    f"within the {horizon_days}-day "
+                    "planning horizon. "
+                    f"Unplanned quantity: "
+                    f"{int(remaining_qty)}. "
+                    f"Maximum simultaneous cavities "
+                    f"found: "
+                    f"{maximum_combined_cavities}."
+                )
+
             item_status = "Blocked"
             receive_date = None
             allocated_cavity_count = 0
@@ -876,144 +1194,594 @@ class FactoryPlanningEngine:
             "shipment_item_id": shipment_item_id,
         })
 
-    def _reserve_resource(self, conn, run_id: int | None, planning_version: int, shipment: dict[str, Any], shipment_item_id: int | None, reservation_date: date, resource_type: str, resource_key: str, reserved_qty: int, capacity_qty: int, sap_code: str, note: str) -> None:
-        if reserved_qty <= 0 or shipment_item_id is None:
+    def _reserve_resource(
+        self,
+        conn,
+        run_id: int | None,
+        planning_version: int,
+        shipment: dict[str, Any],
+        shipment_item_id: int | None,
+        reservation_date: date,
+        resource_type: str,
+        resource_key: str,
+        reserved_qty: int,
+        capacity_qty: int,
+        sap_code: str,
+        note: str,
+    ) -> None:
+        if reserved_qty <= 0:
             return
-        key = (reservation_date, resource_type, resource_key)
-        self._resource_usage[key] = int(self._resource_usage.get(key, 0)) + reserved_qty
-        conn.execute(text("""
-            INSERT INTO planning_resource_reservations (
-                planning_run_id, planning_version, shipment_id, shipment_item_id, reservation_date,
-                resource_type, resource_key, reserved_qty, capacity_qty, sap_code, note
-            ) VALUES (
-                :planning_run_id, :planning_version, :shipment_id, :shipment_item_id, :reservation_date,
-                :resource_type, :resource_key, :reserved_qty, :capacity_qty, :sap_code, :note
-            )
-        """), {
-            "planning_run_id": run_id,
-            "planning_version": planning_version,
-            "shipment_id": int(shipment.get("id") or 0),
-            "shipment_item_id": shipment_item_id,
-            "reservation_date": reservation_date,
-            "resource_type": resource_type,
-            "resource_key": resource_key,
-            "reserved_qty": reserved_qty,
-            "capacity_qty": capacity_qty,
-            "sap_code": sap_code,
-            "note": note,
-        })
 
-    def _load_smds_item(self, conn, sap_code: str) -> dict[str, Any] | None:
+        canonical_key = canonical_resource_key(
+            resource_type,
+            resource_key,
+        )
+        identity = resource_identity(
+            resource_type,
+            canonical_key,
+        )
+        usage_key = (
+            reservation_date,
+            resource_type,
+            identity,
+        )
+        self._resource_usage[usage_key] = int(
+            self._resource_usage.get(
+                usage_key,
+                0,
+            )
+        ) + reserved_qty
+
+        if (
+            self._preview_mode
+            or shipment_item_id is None
+        ):
+            return
+
+        conn.execute(
+            text(
+                """
+                INSERT INTO planning_resource_reservations (
+                    planning_run_id,
+                    planning_version,
+                    shipment_id,
+                    shipment_item_id,
+                    reservation_date,
+                    resource_type,
+                    resource_key,
+                    reserved_qty,
+                    capacity_qty,
+                    sap_code,
+                    note
+                )
+                VALUES (
+                    :planning_run_id,
+                    :planning_version,
+                    :shipment_id,
+                    :shipment_item_id,
+                    :reservation_date,
+                    :resource_type,
+                    :resource_key,
+                    :reserved_qty,
+                    :capacity_qty,
+                    :sap_code,
+                    :note
+                )
+                """
+            ),
+            {
+                "planning_run_id": run_id,
+                "planning_version": planning_version,
+                "shipment_id": int(
+                    shipment.get("id") or 0
+                ),
+                "shipment_item_id": shipment_item_id,
+                "reservation_date": reservation_date,
+                "resource_type": resource_type,
+                "resource_key": canonical_key,
+                "reserved_qty": reserved_qty,
+                "capacity_qty": capacity_qty,
+                "sap_code": normalize_sap_code(
+                    sap_code
+                ),
+                "note": note,
+            },
+        )
+
+    def _load_smds_item(
+        self,
+        conn,
+        sap_code: str,
+    ) -> dict[str, Any] | None:
+        canonical_sap = normalize_sap_code(
+            sap_code
+        )
         try:
-            row = conn.execute(text("""
-                SELECT sap_code, material_description, key_code, casing_type, line, day_plan, night_plan, total_plan, planning_manager_approval_status
-                FROM smds
-                WHERE sap_code = :sap_code
-                LIMIT 1
-            """), {"sap_code": sap_code}).mappings().first()
-            return dict(row) if row else None
+            row = conn.execute(
+                text(
+                    """
+                    SELECT
+                        sap_code,
+                        material_description,
+                        key_code,
+                        casing_type,
+                        line,
+                        day_plan,
+                        night_plan,
+                        total_plan,
+                        planning_manager_approval_status
+                    FROM smds
+                    WHERE mpps_identifier_key(sap_code)
+                        = mpps_identifier_key(:sap_code)
+                    LIMIT 1
+                    """
+                ),
+                {"sap_code": canonical_sap},
+            ).mappings().first()
+
+            if not row:
+                return None
+
+            result = dict(row)
+            result["sap_code"] = normalize_sap_code(
+                result.get("sap_code")
+            )
+            result["key_code"] = normalize_mold_key(
+                result.get("key_code")
+            )
+            result["casing_type"] = (
+                normalize_casing_type(
+                    result.get("casing_type")
+                )
+            )
+            result["line"] = normalize_line_name(
+                result.get("line")
+            )
+            return result
         except Exception:
             return None
 
-    def _get_available_stock(self, conn, sap_code: str, exclude_shipment_id: int | None = None) -> int:
+    def _get_available_stock(
+        self,
+        conn,
+        sap_code: str,
+        exclude_shipment_id: int | None = None,
+    ) -> int:
+        canonical_sap = normalize_sap_code(
+            sap_code
+        )
         try:
-            stock = conn.execute(text("""
-                SELECT COALESCE(fg_stock, 0) + COALESCE(qc_stock, 0) - COALESCE(scrap_stock, 0) - COALESCE(blocked_stock, 0) AS available_qty
-                FROM mpps_sap_stock_items
-                WHERE sap_code = :sap_code
-                LIMIT 1
-            """), {"sap_code": sap_code}).scalar_one_or_none()
+            stock = conn.execute(
+                text(
+                    """
+                    SELECT
+                        COALESCE(fg_stock, 0)
+                        + COALESCE(qc_stock, 0)
+                        - COALESCE(scrap_stock, 0)
+                        - COALESCE(blocked_stock, 0)
+                            AS available_qty
+                    FROM mpps_sap_stock_items
+                    WHERE mpps_identifier_key(sap_code)
+                        = mpps_identifier_key(:sap_code)
+                    LIMIT 1
+                    """
+                ),
+                {"sap_code": canonical_sap},
+            ).scalar_one_or_none()
+
             if stock is None:
                 return 0
-            return max(0, int(stock))
+
+            return max(
+                0,
+                int(stock),
+            )
         except Exception:
             return 0
 
-    def _available_mold_count(self, conn, key_code: str, reservation_date: date, planning_version: int) -> int:
-        if not key_code:
+    def _available_mold_count(
+        self,
+        conn,
+        key_code: str,
+        reservation_date: date,
+        planning_version: int,
+    ) -> int:
+        canonical_key = normalize_mold_key(
+            key_code
+        )
+        if canonical_key == "-":
             return 0
+
+        identity = resource_identity(
+            "mold",
+            canonical_key,
+        )
+
         try:
-            row = conn.execute(text("""
-                SELECT COALESCE(mold_count, 0) AS total_count,
-                       COALESCE(production_mold_count, 0) AS production_count,
-                       COALESCE(breakdown_mold_count, 0) AS breakdown_count,
-                       COALESCE(planning_reserved_mold_count, 0) AS planning_reserved_count
-                FROM mold_master
-                WHERE LOWER(TRIM(mold_key_code)) = LOWER(TRIM(:key_code))
-                LIMIT 1
-            """), {"key_code": key_code}).mappings().first()
+            row = conn.execute(
+                text(
+                    """
+                    SELECT
+                        COALESCE(mold_count, 0)
+                            AS total_count,
+                        COALESCE(
+                            production_mold_count,
+                            0
+                        ) AS production_count,
+                        COALESCE(
+                            breakdown_mold_count,
+                            0
+                        ) AS breakdown_count,
+                        COALESCE(
+                            planning_reserved_mold_count,
+                            0
+                        ) AS planning_reserved_count
+                    FROM mold_master
+                    WHERE mpps_identifier_key(
+                            mold_key_code
+                          )
+                        = mpps_identifier_key(
+                            :key_code
+                          )
+                      AND LOWER(
+                            COALESCE(
+                                status,
+                                'Active'
+                            )
+                          ) = 'active'
+                      AND COALESCE(
+                            is_active,
+                            TRUE
+                          ) = TRUE
+                    LIMIT 1
+                    """
+                ),
+                {"key_code": canonical_key},
+            ).mappings().first()
+
             if not row:
                 return 0
-            total_count = int(row.get("total_count") or 0)
-            reserved_count = self._resource_usage.get((reservation_date, "mold", key_code), 0)
-            reserved_from_db = int(conn.execute(text("""
-                SELECT COALESCE(SUM(reserved_qty), 0)
-                FROM planning_resource_reservations
-                WHERE reservation_date = :reservation_date
-                  AND resource_type = 'mold'
-                  AND resource_key = :resource_key
-            """), {"reservation_date": reservation_date, "resource_key": key_code}).scalar_one() or 0)
-            base_available = total_count - int(row.get("production_count") or 0) - int(row.get("breakdown_count") or 0) - int(row.get("planning_reserved_count") or 0)
-            return max(0, base_available - reserved_count - reserved_from_db)
+
+            total_count = int(
+                row.get("total_count") or 0
+            )
+            usage_key = (
+                reservation_date,
+                "mold",
+                identity,
+            )
+            reserved_count = int(
+                self._resource_usage.get(
+                    usage_key,
+                    0,
+                )
+            )
+            reserved_from_db = 0
+
+            if not self._ignore_database_reservations:
+                reserved_from_db = int(
+                    conn.execute(
+                        text(
+                            """
+                            SELECT
+                                COALESCE(
+                                    SUM(reserved_qty),
+                                    0
+                                )
+                            FROM
+                                planning_resource_reservations
+                            WHERE reservation_date
+                                    = :reservation_date
+                              AND resource_type = 'mold'
+                              AND mpps_identifier_key(
+                                    resource_key
+                                  )
+                                  = mpps_identifier_key(
+                                    :resource_key
+                                  )
+                            """
+                        ),
+                        {
+                            "reservation_date": (
+                                reservation_date
+                            ),
+                            "resource_key": canonical_key,
+                        },
+                    ).scalar_one()
+                    or 0
+                )
+
+            base_available = (
+                total_count
+                - int(
+                    row.get("production_count")
+                    or 0
+                )
+                - int(
+                    row.get("breakdown_count")
+                    or 0
+                )
+                - int(
+                    row.get(
+                        "planning_reserved_count"
+                    )
+                    or 0
+                )
+            )
+            return max(
+                0,
+                base_available
+                - reserved_count
+                - reserved_from_db,
+            )
         except Exception:
             return 0
 
-    def _available_casing_count(self, conn, casing_type: str, reservation_date: date, planning_version: int) -> int:
-        if not casing_type:
+    def _available_casing_count(
+        self,
+        conn,
+        casing_type: str,
+        reservation_date: date,
+        planning_version: int,
+    ) -> int:
+        canonical_type = normalize_casing_type(
+            casing_type
+        )
+        if is_no_casing(canonical_type):
             return 0
+        if canonical_type == "-":
+            return 0
+
+        identity = resource_identity(
+            "casing",
+            canonical_type,
+        )
+
         try:
-            row = conn.execute(text("""
-                SELECT COALESCE(total_casing_count, 0) AS total_count,
-                       COALESCE(available_casing_count, 0) AS available_count,
-                       COALESCE(production_casing_count, 0) AS production_count,
-                       COALESCE(breakdown_casing_count, 0) AS breakdown_count,
-                       COALESCE(planning_reserved_casing_count, 0) AS planning_reserved_count
-                FROM casing_master
-                WHERE LOWER(TRIM(casing_type)) = LOWER(TRIM(:casing_type))
-                LIMIT 1
-            """), {"casing_type": casing_type}).mappings().first()
+            row = conn.execute(
+                text(
+                    """
+                    SELECT
+                        COALESCE(
+                            total_casing_count,
+                            0
+                        ) AS total_count,
+                        COALESCE(
+                            available_casing_count,
+                            0
+                        ) AS available_count,
+                        COALESCE(
+                            production_casing_count,
+                            0
+                        ) AS production_count,
+                        COALESCE(
+                            breakdown_casing_count,
+                            0
+                        ) AS breakdown_count,
+                        COALESCE(
+                            planning_reserved_casing_count,
+                            0
+                        ) AS planning_reserved_count
+                    FROM casing_master
+                    WHERE mpps_identifier_key(
+                            casing_type
+                          )
+                        = mpps_identifier_key(
+                            :casing_type
+                          )
+                      AND LOWER(
+                            COALESCE(
+                                status,
+                                'Active'
+                            )
+                          ) = 'active'
+                      AND COALESCE(
+                            is_active,
+                            TRUE
+                          ) = TRUE
+                    LIMIT 1
+                    """
+                ),
+                {"casing_type": canonical_type},
+            ).mappings().first()
+
             if row:
-                base_count = int(row.get("available_count") or row.get("total_count") or 0)
+                # available_casing_count is the physical
+                # Active + Free count. Do not subtract
+                # production/breakdown a second time.
+                base_count = int(
+                    row.get("available_count")
+                    or 0
+                )
             else:
-                base_count = int(conn.execute(text("""
-                    SELECT COUNT(*)
-                    FROM casing_units
-                    WHERE LOWER(TRIM(casing_type)) = LOWER(TRIM(:casing_type))
-                      AND LOWER(COALESCE(condition_status, 'Active')) = 'active'
-                      AND LOWER(COALESCE(stock_status, 'Free')) = 'free'
-                """), {"casing_type": casing_type}).scalar_one() or 0)
-            reserved_count = self._resource_usage.get((reservation_date, "casing", casing_type), 0)
-            reserved_from_db = int(conn.execute(text("""
-                SELECT COALESCE(SUM(reserved_qty), 0)
-                FROM planning_resource_reservations
-                WHERE reservation_date = :reservation_date
-                  AND resource_type = 'casing'
-                  AND resource_key = :resource_key
-            """), {"reservation_date": reservation_date, "resource_key": casing_type}).scalar_one() or 0)
-            return max(0, base_count - reserved_count - reserved_from_db)
+                base_count = int(
+                    conn.execute(
+                        text(
+                            """
+                            SELECT COUNT(*)
+                            FROM casing_units
+                            WHERE mpps_identifier_key(
+                                    casing_type
+                                  )
+                                = mpps_identifier_key(
+                                    :casing_type
+                                  )
+                              AND LOWER(
+                                    COALESCE(
+                                        condition_status,
+                                        'Active'
+                                    )
+                                  ) = 'active'
+                              AND LOWER(
+                                    COALESCE(
+                                        stock_status,
+                                        'Free'
+                                    )
+                                  ) = 'free'
+                            """
+                        ),
+                        {"casing_type": canonical_type},
+                    ).scalar_one()
+                    or 0
+                )
+
+            usage_key = (
+                reservation_date,
+                "casing",
+                identity,
+            )
+            reserved_count = int(
+                self._resource_usage.get(
+                    usage_key,
+                    0,
+                )
+            )
+            reserved_from_db = 0
+
+            if not self._ignore_database_reservations:
+                reserved_from_db = int(
+                    conn.execute(
+                        text(
+                            """
+                            SELECT
+                                COALESCE(
+                                    SUM(reserved_qty),
+                                    0
+                                )
+                            FROM
+                                planning_resource_reservations
+                            WHERE reservation_date
+                                    = :reservation_date
+                              AND resource_type = 'casing'
+                              AND mpps_identifier_key(
+                                    resource_key
+                                  )
+                                  = mpps_identifier_key(
+                                    :resource_key
+                                  )
+                            """
+                        ),
+                        {
+                            "reservation_date": (
+                                reservation_date
+                            ),
+                            "resource_key": canonical_type,
+                        },
+                    ).scalar_one()
+                    or 0
+                )
+
+            return max(
+                0,
+                base_count
+                - reserved_count
+                - reserved_from_db,
+            )
         except Exception:
             return 0
 
-    def _available_line_cavity_count(self, conn, line_name: str, reservation_date: date, planning_version: int) -> int:
-        if not line_name:
+    def _available_line_cavity_count(
+        self,
+        conn,
+        line_name: str,
+        reservation_date: date,
+        planning_version: int,
+    ) -> int:
+        canonical_line = normalize_line_name(
+            line_name
+        )
+        if not canonical_line:
             return 0
+
+        identity = resource_identity(
+            "line_cavity",
+            canonical_line,
+        )
+
         try:
-            total = int(conn.execute(text("""
-                SELECT COUNT(*)
-                FROM production_line_cavities
-                WHERE LOWER(TRIM(line_name)) = LOWER(TRIM(:line_name))
-                  AND LOWER(COALESCE(status, 'Active')) = 'active'
-                  AND TRIM(COALESCE(assigned_tyre_item, '')) = ''
-            """), {"line_name": line_name}).scalar_one() or 0)
-            reserved_count = self._resource_usage.get((reservation_date, "line_cavity", line_name), 0)
-            reserved_from_db = int(conn.execute(text("""
-                SELECT COALESCE(SUM(reserved_qty), 0)
-                FROM planning_resource_reservations
-                WHERE reservation_date = :reservation_date
-                  AND resource_type = 'line_cavity'
-                  AND resource_key = :resource_key
-            """), {"reservation_date": reservation_date, "resource_key": line_name}).scalar_one() or 0)
-            return max(0, total - reserved_count - reserved_from_db)
+            total = int(
+                conn.execute(
+                    text(
+                        """
+                        SELECT COUNT(*)
+                        FROM production_line_cavities
+                        WHERE mpps_line_key(line_name)
+                            = mpps_line_key(:line_name)
+                          AND LOWER(
+                                COALESCE(
+                                    status,
+                                    'Active'
+                                )
+                              ) = 'active'
+                          AND COALESCE(
+                                is_active,
+                                TRUE
+                              ) = TRUE
+                          AND TRIM(
+                                COALESCE(
+                                    assigned_tyre_item,
+                                    ''
+                                )
+                              ) = ''
+                        """
+                    ),
+                    {"line_name": canonical_line},
+                ).scalar_one()
+                or 0
+            )
+            usage_key = (
+                reservation_date,
+                "line_cavity",
+                identity,
+            )
+            reserved_count = int(
+                self._resource_usage.get(
+                    usage_key,
+                    0,
+                )
+            )
+            reserved_from_db = 0
+
+            if not self._ignore_database_reservations:
+                reserved_from_db = int(
+                    conn.execute(
+                        text(
+                            """
+                            SELECT
+                                COALESCE(
+                                    SUM(reserved_qty),
+                                    0
+                                )
+                            FROM
+                                planning_resource_reservations
+                            WHERE reservation_date
+                                    = :reservation_date
+                              AND resource_type
+                                    = 'line_cavity'
+                              AND mpps_line_key(
+                                    resource_key
+                                  )
+                                  = mpps_line_key(
+                                    :resource_key
+                                  )
+                            """
+                        ),
+                        {
+                            "reservation_date": (
+                                reservation_date
+                            ),
+                            "resource_key": canonical_line,
+                        },
+                    ).scalar_one()
+                    or 0
+                )
+
+            return max(
+                0,
+                total
+                - reserved_count
+                - reserved_from_db,
+            )
         except Exception:
             return 0
 
@@ -1041,4 +1809,5 @@ class FactoryPlanningEngine:
 
 
 FactoryOutDateCalculator = FactoryPlanningEngine
+
 

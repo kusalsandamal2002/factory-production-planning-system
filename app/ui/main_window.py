@@ -1,5 +1,6 @@
 from __future__ import annotations
-from PySide6.QtCore import QEvent, Qt
+from time import perf_counter
+from PySide6.QtCore import QEvent, QTimer, Qt
 from PySide6.QtWidgets import QApplication
 
 
@@ -322,10 +323,28 @@ class MainWindow(QMainWindow):
         shell_layout.addWidget(self._build_sidebar())
         shell_layout.addWidget(self._build_content(), 1)
 
+        self._startup_target_index = (
+            self.MONTHLY_STOCK_COUNT_INDEX
+            if self.monthly_stock_only_mode
+            else self.DASHBOARD_INDEX
+        )
+
         if self.monthly_stock_only_mode:
-            self.navigate(self.MONTHLY_STOCK_COUNT_INDEX)
+            self.stack.setCurrentIndex(0)
         else:
-            self.navigate(self.DASHBOARD_INDEX)
+            self.stack.setCurrentIndex(
+                self.DASHBOARD_INDEX
+            )
+            self._sync_sidebar_selection(
+                self.DASHBOARD_INDEX
+            )
+
+        QTimer.singleShot(
+            50,
+            lambda: self.navigate(
+                self._startup_target_index
+            ),
+        )
 
     def _current_role_name(self) -> str:
         try:
@@ -511,170 +530,628 @@ class MainWindow(QMainWindow):
         content.setObjectName("ContentArea")
 
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(22, 22, 22, 22)
+        layout.setContentsMargins(
+            22,
+            22,
+            22,
+            22,
+        )
         layout.setSpacing(0)
 
         self.stack = QStackedWidget()
-        self._last_stack_index = self.stack.currentIndex()
-        self.stack.currentChanged.connect(self._on_stack_changed)
+        self._last_stack_index = (
+            self.stack.currentIndex()
+        )
+        self.stack.currentChanged.connect(
+            self._on_stack_changed
+        )
+
+        self._page_instances = {}
+        self._page_factories = {}
+        self._page_attributes = {}
+        self._page_titles = {}
+        self._loaded_page_indexes = set()
+        self._page_load_times = {}
 
         if self.monthly_stock_only_mode:
-            self.monthly_stock_count_page = MonthlyStockCountPage(self.current_user)
-            self.stack.addWidget(self._wrap_scroll(self.monthly_stock_count_page))
+            self.monthly_stock_count_page = None
+            self._page_factories[0] = (
+                lambda: MonthlyStockCountPage(
+                    self.current_user
+                )
+            )
+            self._page_attributes[0] = (
+                "monthly_stock_count_page"
+            )
+            self._page_titles[0] = (
+                "Monthly Stock Count"
+            )
+            self.stack.addWidget(
+                self._loading_page(
+                    "Monthly Stock Count"
+                )
+            )
             layout.addWidget(self.stack)
             return content
 
-        self.dashboard_page = self._create_dashboard_page()
-        self.order_entry_page = OrderEntryPage(self.current_user, on_shipment_saved=self.open_saved_shipment_details)
-        self.schedule_page = SchedulePage(self.current_user)
+        definitions = [
+            (
+                self.DASHBOARD_INDEX,
+                "dashboard_page",
+                "Dashboard",
+                self._create_dashboard_page,
+            ),
+            (
+                self.ORDER_ENTRY_INDEX,
+                "order_entry_page",
+                "Shipment Orders",
+                lambda: OrderEntryPage(
+                    self.current_user,
+                    on_shipment_saved=(
+                        self.open_saved_shipment_details
+                    ),
+                ),
+            ),
+            (
+                self.SCHEDULE_INDEX,
+                "schedule_page",
+                "Production Planning",
+                lambda: SchedulePage(
+                    self.current_user
+                ),
+            ),
+            (
+                self.STOCK_PLANNING_INDEX,
+                "stock_planning_page",
+                "Stock Planning",
+                lambda: StockPlanningPage(
+                    open_item_detail_callback=(
+                        self.open_stock_item_detail
+                    )
+                ),
+            ),
+            (
+                self.SHIPMENT_DETAILS_INDEX,
+                "shipment_details_page",
+                "Shipment Details",
+                lambda: ShipmentDetailsPage(
+                    self.current_user,
+                    on_new_shipment=(
+                        self.open_new_shipment_entry
+                    ),
+                ),
+            ),
+            (
+                self.TIRE_DETAILS_INDEX,
+                "tire_details_page",
+                "Archived Legacy Module",
+                lambda: PlaceholderPage(
+                    "Archived Legacy Module",
+                    (
+                        "This archived module is not part "
+                        "of the current MPPS workflow."
+                    ),
+                ),
+            ),
+            (
+                self.TIRE_STOCK_INDEX,
+                "tire_stock_page",
+                "Final Tyre Stock",
+                TireStockPage,
+            ),
+            (
+                self.FACTORY_DATA_CENTER_INDEX,
+                "factory_data_center_page",
+                "Factory Data Center",
+                lambda: create_factory_data_center_page(
+                    open_callback=(
+                        self.open_module_action
+                    )
+                ),
+            ),
+            (
+                self.MANAGER_OUTPUT_INDEX,
+                "manager_output_page",
+                "Manager Output",
+                lambda: create_manager_output_page(
+                    open_callback=(
+                        self.open_module_action
+                    )
+                ),
+            ),
+            (
+                self.ADMIN_CONTROL_INDEX,
+                "admin_control_page",
+                "Admin Control",
+                lambda: create_admin_control_page(
+                    open_callback=(
+                        self.open_module_action
+                    )
+                ),
+            ),
+            (
+                self.PRODUCT_MASTER_INDEX,
+                "product_master_page",
+                "Tyre Item Master",
+                TyreItemMasterPage,
+            ),
+            (
+                self.STOCK_MASTER_INDEX,
+                "stock_master_page",
+                "Stock Master",
+                StockMasterPage,
+            ),
+            (
+                self.BOM_MASTER_INDEX,
+                "bom_master_page",
+                "BOM Master",
+                BomMasterPage,
+            ),
+            (
+                self.COMPOUND_MASTER_INDEX,
+                "compound_master_page",
+                "Compound Master",
+                CompoundMasterPage,
+            ),
+            (
+                self.BEAD_MASTER_INDEX,
+                "bead_master_page",
+                "Bead Master",
+                BeadMasterPage,
+            ),
+            (
+                self.PRODUCTION_ENTRY_INDEX,
+                "production_entry_page",
+                "Archived Legacy Module",
+                lambda: PlaceholderPage(
+                    "Archived Legacy Module",
+                    (
+                        "This archived module is not part "
+                        "of the current MPPS workflow."
+                    ),
+                ),
+            ),
+            (
+                self.BAND_MASTER_INDEX,
+                "band_master_page",
+                "Band Master",
+                lambda: self._safe_create_page(
+                    BandMasterPage
+                ),
+            ),
+            (
+                self.CAPACITY_MASTER_INDEX,
+                "capacity_master_page",
+                "Capacity / Time Master",
+                lambda: self._safe_create_page(
+                    CapacityMasterPage
+                ),
+            ),
+            (
+                self.OVEN_MASTER_INDEX,
+                "oven_master_page",
+                "Production Lines",
+                ProductionLineMasterPage,
+            ),
+            (
+                self.MATERIAL_REQUIREMENT_INDEX,
+                "material_requirement_page",
+                "Material Requirement",
+                lambda: self._safe_create_page(
+                    MaterialRequirementPage
+                ),
+            ),
+            (
+                self.CAPACITY_ANALYSIS_INDEX,
+                "capacity_analysis_page",
+                "Capacity Analysis",
+                lambda: self._safe_create_page(
+                    CapacityAnalysisPage
+                ),
+            ),
+            (
+                self.SHIPMENT_RISK_INDEX,
+                "shipment_risk_page",
+                "Shipment Risk",
+                lambda: self._safe_create_page(
+                    ShipmentRiskPage
+                ),
+            ),
+            (
+                self.DATA_QUALITY_INDEX,
+                "data_quality_page",
+                "Data Quality",
+                lambda: self._safe_create_page(
+                    DataQualityWarningsPage
+                ),
+            ),
+            (
+                self.RAW_EXCEL_VIEWER_INDEX,
+                "raw_excel_viewer_page",
+                "Legacy Excel Import",
+                lambda: self._safe_create_page(
+                    RawExcelViewerPage
+                ),
+            ),
+            (
+                self.USERS_ROLES_INDEX,
+                "users_roles_page",
+                "Users & Roles",
+                lambda: self._safe_create_page(
+                    UsersRolesPage
+                ),
+            ),
+            (
+                self.BACKUP_RESTORE_INDEX,
+                "backup_restore_page",
+                "Backup & Restore",
+                lambda: self._safe_create_page(
+                    BackupRestorePage
+                ),
+            ),
+            (
+                self.AUDIT_LOG_INDEX,
+                "audit_log_page",
+                "Audit Log",
+                lambda: self._safe_create_page(
+                    AuditLogPage
+                ),
+            ),
+            (
+                self.MONTHLY_STOCK_COUNT_INDEX,
+                "monthly_stock_count_page",
+                "Monthly Stock Count",
+                lambda: MonthlyStockCountPage(
+                    self.current_user
+                ),
+            ),
+            (
+                self.PLACEHOLDER_INDEX,
+                "placeholder_page",
+                "Module",
+                lambda: PlaceholderPage(
+                    "Module",
+                    (
+                        "This module will be connected "
+                        "in the next step."
+                    ),
+                ),
+            ),
+            (
+                self.TYRE_PRODUCT_TREE_INDEX,
+                "tyre_product_tree_page",
+                "Master Data",
+                lambda: MasterDataHubPage(
+                    on_open_page=(
+                        lambda index: self.navigate(index)
+                    ),
+                    page_indexes={
+                        "Factory Capacity": (
+                            self.FACTORY_CAPACITY_INDEX
+                        ),
+                        "Tyre Item Master": (
+                            self.PRODUCT_MASTER_INDEX
+                        ),
+                        "Final Tyre Stock": (
+                            self.STOCK_MASTER_INDEX
+                        ),
+                        "Daily Stock": (
+                            self.DAILY_STOCK_INDEX
+                        ),
+                        "Legacy Excel Import": (
+                            self.RAW_EXCEL_VIEWER_INDEX
+                        ),
+                    },
+                ),
+            ),
+            (
+                self.MOLD_MASTER_V2_INDEX,
+                "mold_master_v2_page",
+                "Mold Master",
+                MoldMasterPage,
+            ),
+            (
+                self.CASING_MASTER_V2_INDEX,
+                "casing_master_v2_page",
+                "Casing Master",
+                CasingMasterPage,
+            ),
+            (
+                self.DELIVERY_DATE_INDEX,
+                "delivery_date_page",
+                "Delivery Date Calculation",
+                lambda: PlaceholderPage(
+                    "Delivery Date Calculation",
+                    (
+                        "Calculate realistic customer "
+                        "delivery dates using stock and "
+                        "production capacity."
+                    ),
+                ),
+            ),
+            (
+                self.DAILY_PLAN_INDEX,
+                "daily_plan_page",
+                "Daily Production Plan",
+                lambda: PlaceholderPage(
+                    "Daily Production Plan",
+                    (
+                        "Generate and manage day-wise "
+                        "production plans."
+                    ),
+                ),
+            ),
+            (
+                self.SHIFT_PLAN_INDEX,
+                "shift_plan_page",
+                "Day / Night Shift Plan",
+                lambda: PlaceholderPage(
+                    "Day / Night Shift Plan",
+                    (
+                        "Split production into day and "
+                        "night shift targets."
+                    ),
+                ),
+            ),
+            (
+                self.REPORTS_INDEX,
+                "reports_page",
+                "Reports",
+                lambda: PlaceholderPage(
+                    "Reports",
+                    (
+                        "View production, delivery and "
+                        "capacity reports."
+                    ),
+                ),
+            ),
+            (
+                self.FACTORY_CAPACITY_INDEX,
+                "factory_capacity_page",
+                "Factory Capacity",
+                lambda: FactoryCapacityPage(
+                    on_open_page=(
+                        lambda index: self.navigate(index)
+                    ),
+                    on_back=(
+                        lambda: self.navigate(
+                            self.TYRE_PRODUCT_TREE_INDEX
+                        )
+                    ),
+                    page_indexes={
+                        "Production Lines": (
+                            self.OVEN_MASTER_INDEX
+                        ),
+                        "Cavities": (
+                            self.CAVITIES_MASTER_INDEX
+                        ),
+                        "Mold Master": (
+                            self.MOLD_MASTER_V2_INDEX
+                        ),
+                        "Casing Master": (
+                            self.CASING_MASTER_V2_INDEX
+                        ),
+                        "Capacity / Time Master": (
+                            self.CAPACITY_MASTER_INDEX
+                        ),
+                    },
+                ),
+            ),
+            (
+                self.CAVITIES_MASTER_INDEX,
+                "cavities_master_page",
+                "Cavities Master",
+                CavitiesMasterPage,
+            ),
+            (
+                self.DAILY_STOCK_INDEX,
+                "daily_stock_page",
+                "Daily Stock",
+                DailyStockPage,
+            ),
+        ]
 
-        self.stock_planning_page = StockPlanningPage(
-            open_item_detail_callback=self.open_stock_item_detail
-        )
-
-        self.shipment_details_page = ShipmentDetailsPage(self.current_user)
-
-        self.tire_details_page = PlaceholderPage(
-            "Archived Legacy Module",
-            "This archived module is not part of the current MPPS workflow.",
-        )
-
-        self.tire_stock_page = TireStockPage()
-
-        self.factory_data_center_page = create_factory_data_center_page(
-            open_callback=self.open_module_action
-        )
-
-        self.manager_output_page = create_manager_output_page(
-            open_callback=self.open_module_action
-        )
-
-        self.admin_control_page = create_admin_control_page(
-            open_callback=self.open_module_action
-        )
-
-        self.product_master_page = TyreItemMasterPage()
-        self.stock_master_page = StockMasterPage()
-        self.daily_stock_page = DailyStockPage()
-        self.bom_master_page = BomMasterPage()
-        self.compound_master_page = CompoundMasterPage()
-        self.bead_master_page = BeadMasterPage()
-
-        self.production_entry_page = PlaceholderPage(
-            "Archived Legacy Module",
-            "This archived module is not part of the current MPPS workflow.",
-        )
-
-        self.band_master_page = self._safe_create_page(BandMasterPage)
-        self.capacity_master_page = self._safe_create_page(CapacityMasterPage)
-        self.oven_master_page = ProductionLineMasterPage()
-        self.material_requirement_page = self._safe_create_page(MaterialRequirementPage)
-        self.capacity_analysis_page = self._safe_create_page(CapacityAnalysisPage)
-        self.shipment_risk_page = self._safe_create_page(ShipmentRiskPage)
-        self.data_quality_page = self._safe_create_page(DataQualityWarningsPage)
-        self.raw_excel_viewer_page = self._safe_create_page(RawExcelViewerPage)
-        self.users_roles_page = self._safe_create_page(UsersRolesPage)
-        self.backup_restore_page = self._safe_create_page(BackupRestorePage)
-        self.audit_log_page = self._safe_create_page(AuditLogPage)
-
-        self.monthly_stock_count_page = MonthlyStockCountPage(self.current_user)
-
-        self.placeholder_page = PlaceholderPage(
-            "Module",
-            "This module will be connected in the next step.",
-        )
-        self.tyre_product_tree_page = MasterDataHubPage(
-            on_open_page=lambda index: self.navigate(index),
-            page_indexes={
-                "Factory Capacity": self.FACTORY_CAPACITY_INDEX,
-                "Tyre Item Master": self.PRODUCT_MASTER_INDEX,
-                "Final Tyre Stock": self.STOCK_MASTER_INDEX,
-                "Daily Stock": self.DAILY_STOCK_INDEX,
-                "Legacy Excel Import": self.RAW_EXCEL_VIEWER_INDEX,
-            },
-        )
-
-        self.factory_capacity_page = FactoryCapacityPage(
-            on_open_page=lambda index: self.navigate(index),
-            on_back=lambda: self.navigate(self.TYRE_PRODUCT_TREE_INDEX),
-            page_indexes={
-                "Production Lines": self.OVEN_MASTER_INDEX,
-                "Cavities": self.CAVITIES_MASTER_INDEX,
-                "Mold Master": self.MOLD_MASTER_V2_INDEX,
-                "Casing Master": self.CASING_MASTER_V2_INDEX,
-                "Capacity / Time Master": self.CAPACITY_MASTER_INDEX,
-            },
-        )
-
-        self.cavities_master_page = CavitiesMasterPage()
-
-        self.mold_master_v2_page = MoldMasterPage()
-
-        self.casing_master_v2_page = CasingMasterPage()
-
-        self.delivery_date_page = PlaceholderPage(
-            "Delivery Date Calculation",
-            "Calculate realistic customer delivery dates using stock, production line, mold, casing, cavity and schedule availability.",
-        )
-
-        self.daily_plan_page = PlaceholderPage(
-            "Daily Production Plan",
-            "Generate and manage day-wise production plans from confirmed customer orders.",
-        )
-
-        self.shift_plan_page = PlaceholderPage(
-            "Day / Night Shift Plan",
-            "Split production plan into day shift and night shift targets with line-wise allocation.",
-        )
-
-        self.reports_page = PlaceholderPage(
-            "Reports",
-            "View production, planning, delivery commitment, line load, mold utilization and material requirement reports.",
-        )
-
-        self.stack.addWidget(self._wrap_scroll(self.dashboard_page))
-        self.stack.addWidget(self._wrap_scroll(self.order_entry_page))
-        self.stack.addWidget(self._wrap_scroll(self.schedule_page))
-        self.stack.addWidget(self._wrap_scroll(self.stock_planning_page))
-        self.stack.addWidget(self._wrap_scroll(self.shipment_details_page))
-        self.stack.addWidget(self._wrap_scroll(self.tire_details_page))
-        self.stack.addWidget(self._wrap_scroll(self.tire_stock_page))
-        self.stack.addWidget(self._wrap_scroll(self.factory_data_center_page))
-        self.stack.addWidget(self._wrap_scroll(self.manager_output_page))
-        self.stack.addWidget(self._wrap_scroll(self.admin_control_page))
-        self.stack.addWidget(self._wrap_scroll(self.product_master_page))
-        self.stack.addWidget(self._wrap_scroll(self.stock_master_page))
-        self.stack.addWidget(self._wrap_scroll(self.bom_master_page))
-        self.stack.addWidget(self._wrap_scroll(self.compound_master_page))
-        self.stack.addWidget(self._wrap_scroll(self.bead_master_page))
-        self.stack.addWidget(self._wrap_scroll(self.production_entry_page))
-        self.stack.addWidget(self._wrap_scroll(self.band_master_page))
-        self.stack.addWidget(self._wrap_scroll(self.capacity_master_page))
-        self.stack.addWidget(self._wrap_scroll(self.oven_master_page))
-        self.stack.addWidget(self._wrap_scroll(self.material_requirement_page))
-        self.stack.addWidget(self._wrap_scroll(self.capacity_analysis_page))
-        self.stack.addWidget(self._wrap_scroll(self.shipment_risk_page))
-        self.stack.addWidget(self._wrap_scroll(self.data_quality_page))
-        self.stack.addWidget(self._wrap_scroll(self.raw_excel_viewer_page))
-        self.stack.addWidget(self._wrap_scroll(self.users_roles_page))
-        self.stack.addWidget(self._wrap_scroll(self.backup_restore_page))
-        self.stack.addWidget(self._wrap_scroll(self.audit_log_page))
-        self.stack.addWidget(self._wrap_scroll(self.monthly_stock_count_page))
-        self.stack.addWidget(self._wrap_scroll(self.placeholder_page))
-        self.stack.addWidget(self._wrap_scroll(self.tyre_product_tree_page))
-        self.stack.addWidget(self._wrap_scroll(self.mold_master_v2_page))
-        self.stack.addWidget(self._wrap_scroll(self.casing_master_v2_page))
-        self.stack.addWidget(self._wrap_scroll(self.delivery_date_page))
-        self.stack.addWidget(self._wrap_scroll(self.daily_plan_page))
-        self.stack.addWidget(self._wrap_scroll(self.shift_plan_page))
-        self.stack.addWidget(self._wrap_scroll(self.reports_page))
-        self.stack.addWidget(self._wrap_scroll(self.factory_capacity_page))
-        self.stack.addWidget(self._wrap_scroll(self.cavities_master_page))
-        self.stack.addWidget(self._wrap_scroll(self.daily_stock_page))
+        for (
+            index,
+            attribute,
+            title,
+            factory,
+        ) in definitions:
+            self._page_factories[index] = factory
+            self._page_attributes[index] = attribute
+            self._page_titles[index] = title
+            setattr(
+                self,
+                attribute,
+                None,
+            )
+            self.stack.addWidget(
+                self._loading_page(title)
+            )
 
         layout.addWidget(self.stack)
-
         return content
+
+    def _loading_page(
+        self,
+        title: str,
+    ) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(
+            24,
+            24,
+            24,
+            24,
+        )
+
+        card = QFrame()
+        card.setStyleSheet(
+            """
+            QFrame {
+                background: #ffffff;
+                border: 1px solid #dbe4f0;
+                border-radius: 18px;
+            }
+            """
+        )
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(
+            28,
+            26,
+            28,
+            26,
+        )
+        card_layout.setSpacing(10)
+
+        title_label = QLabel(title)
+        title_label.setStyleSheet(
+            "color:#0f172a; font-size:20pt; "
+            "font-weight:950;"
+        )
+
+        message = QLabel(
+            "Loading this workspace only when it is "
+            "needed. This keeps login and startup fast."
+        )
+        message.setWordWrap(True)
+        message.setStyleSheet(
+            "color:#64748b; font-weight:700;"
+        )
+
+        badge = QLabel(
+            "LOADING WORKSPACE..."
+        )
+        badge.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        badge.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Fixed,
+        )
+        badge.setStyleSheet(
+            "background:#dbeafe; color:#1d4ed8; "
+            "border:1px solid #bfdbfe; "
+            "border-radius:10px; padding:8px 12px; "
+            "font-weight:950;"
+        )
+
+        card_layout.addWidget(title_label)
+        card_layout.addWidget(message)
+        card_layout.addSpacing(6)
+        card_layout.addWidget(badge)
+        card_layout.addStretch()
+
+        layout.addWidget(card)
+        layout.addStretch()
+        return page
+
+    def _ensure_page_loaded(
+        self,
+        index: int,
+    ) -> tuple[QWidget | None, bool]:
+        stack_index = (
+            0
+            if self.monthly_stock_only_mode
+            else index
+        )
+
+        if stack_index in self._loaded_page_indexes:
+            return (
+                self._page_instances.get(
+                    stack_index
+                ),
+                False,
+            )
+
+        factory = self._page_factories.get(
+            stack_index
+        )
+        if factory is None:
+            return None, False
+
+        title = self._page_titles.get(
+            stack_index,
+            "Workspace",
+        )
+        placeholder = self.stack.widget(
+            stack_index
+        )
+
+        self.stack.setCurrentIndex(
+            stack_index
+        )
+        QApplication.setOverrideCursor(
+            Qt.CursorShape.WaitCursor
+        )
+        QApplication.processEvents()
+
+        started = perf_counter()
+
+        try:
+            page = factory()
+            container = self._wrap_scroll(
+                page
+            )
+
+            self.stack.removeWidget(
+                placeholder
+            )
+            self.stack.insertWidget(
+                stack_index,
+                container,
+            )
+            placeholder.deleteLater()
+
+            attribute = self._page_attributes.get(
+                stack_index
+            )
+            if attribute:
+                setattr(
+                    self,
+                    attribute,
+                    page,
+                )
+
+            self._page_instances[
+                stack_index
+            ] = page
+            self._loaded_page_indexes.add(
+                stack_index
+            )
+
+            elapsed = (
+                perf_counter()
+                - started
+            )
+            self._page_load_times[
+                stack_index
+            ] = elapsed
+
+            print(
+                "[MPPS STARTUP] Loaded "
+                f"{title} in {elapsed:.2f}s",
+                flush=True,
+            )
+
+            self.stack.setCurrentIndex(
+                stack_index
+            )
+            return page, True
+
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Workspace Load Failed",
+                (
+                    f"{title} could not be loaded."
+                    f"\n\nReason: {exc}"
+                ),
+            )
+            return None, False
+
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _safe_create_page(self, page_class, *args) -> QWidget:
         try:
@@ -949,23 +1426,48 @@ class MainWindow(QMainWindow):
                 button.blockSignals(False)
 
 
-    def navigate(self, index: int) -> None:
+    def navigate(
+        self,
+        index: int,
+    ) -> None:
         self._sync_sidebar_selection(index)
+
         if self.monthly_stock_only_mode:
+            page, loaded_now = (
+                self._ensure_page_loaded(0)
+            )
             self.stack.setCurrentIndex(0)
 
             for button in self.nav_buttons:
                 button.setChecked(True)
 
-            self._refresh_monthly_stock_only_page()
+            if (
+                page is not None
+                and not loaded_now
+            ):
+                self._refresh_monthly_stock_only_page()
+            return
+
+        page, loaded_now = (
+            self._ensure_page_loaded(index)
+        )
+
+        if page is None:
             return
 
         self.stack.setCurrentIndex(index)
 
-        for button_position, button in enumerate(self.nav_buttons):
-            button.setChecked(button_position == self._nav_position_from_index(index))
+        for (
+            button_position,
+            button,
+        ) in enumerate(self.nav_buttons):
+            button.setChecked(
+                button_position
+                == self._nav_position_from_index(index)
+            )
 
-        self._refresh_page(index)
+        if not loaded_now:
+            self._refresh_page(index)
 
     def _refresh_monthly_stock_only_page(self) -> None:
         page = getattr(self, "monthly_stock_count_page", None)
@@ -1000,48 +1502,93 @@ class MainWindow(QMainWindow):
 
         return nav_map.get(index, -1)
 
-    def _refresh_page(self, index: int) -> None:
-        page_by_index = {
-            self.DASHBOARD_INDEX: self.dashboard_page,
-            self.ORDER_ENTRY_INDEX: self.order_entry_page,
-            self.SCHEDULE_INDEX: self.schedule_page,
-            self.STOCK_PLANNING_INDEX: self.stock_planning_page,
-            self.SHIPMENT_DETAILS_INDEX: self.shipment_details_page,
-            self.TIRE_STOCK_INDEX: self.tire_stock_page,
-            self.PRODUCT_MASTER_INDEX: self.product_master_page,
-            self.STOCK_MASTER_INDEX: self.stock_master_page,
-            self.BOM_MASTER_INDEX: self.bom_master_page,
-            self.COMPOUND_MASTER_INDEX: self.compound_master_page,
-            self.BEAD_MASTER_INDEX: self.bead_master_page,
-            self.BAND_MASTER_INDEX: self.band_master_page,
-            self.CAPACITY_MASTER_INDEX: self.capacity_master_page,
-            self.OVEN_MASTER_INDEX: self.oven_master_page,
-            self.MATERIAL_REQUIREMENT_INDEX: self.material_requirement_page,
-            self.CAPACITY_ANALYSIS_INDEX: self.capacity_analysis_page,
-            self.SHIPMENT_RISK_INDEX: self.shipment_risk_page,
-            self.DATA_QUALITY_INDEX: self.data_quality_page,
-            self.RAW_EXCEL_VIEWER_INDEX: self.raw_excel_viewer_page,
-            self.USERS_ROLES_INDEX: self.users_roles_page,
-            self.BACKUP_RESTORE_INDEX: self.backup_restore_page,
-            self.AUDIT_LOG_INDEX: self.audit_log_page,
-            self.MONTHLY_STOCK_COUNT_INDEX: self.monthly_stock_count_page,
-        }
-
-        page = page_by_index.get(index)
+    def _refresh_page(
+        self,
+        index: int,
+    ) -> None:
+        page = self._page_instances.get(
+            index
+        )
 
         if page is None:
             return
 
-        for method_name in ("refresh", "refresh_page", "load_data"):
-            method = getattr(page, method_name, None)
+        for method_name in (
+            "refresh",
+            "refresh_page",
+            "load_data",
+        ):
+            method = getattr(
+                page,
+                method_name,
+                None,
+            )
+
             if callable(method):
                 try:
                     method()
                 except TypeError:
                     pass
                 except Exception as exc:
-                    QMessageBox.warning(self, "Refresh Warning", str(exc))
+                    QMessageBox.warning(
+                        self,
+                        "Refresh Warning",
+                        str(exc),
+                    )
                 break
+
+    def open_new_shipment_entry(
+        self,
+    ) -> None:
+        self.navigate(
+            self.ORDER_ENTRY_INDEX
+        )
+
+        page = getattr(
+            self,
+            "order_entry_page",
+            None,
+        )
+
+        if page is None:
+            QMessageBox.warning(
+                self,
+                "Shipment Orders Unavailable",
+                (
+                    "The Shipment Orders page "
+                    "could not be loaded."
+                ),
+            )
+            return
+
+        clear_form = getattr(
+            page,
+            "clear_form",
+            None,
+        )
+        if callable(clear_form):
+            clear_form()
+
+        refresh_master_items = getattr(
+            page,
+            "refresh_master_items",
+            None,
+        )
+        if callable(refresh_master_items):
+            try:
+                refresh_master_items(
+                    show_warning=False
+                )
+            except TypeError:
+                refresh_master_items()
+
+        shipment_name_input = getattr(
+            page,
+            "shipment_name_input",
+            None,
+        )
+        if shipment_name_input is not None:
+            shipment_name_input.setFocus()
 
     def open_shipment_details_page(self) -> None:
         self.navigate(self.SHIPMENT_DETAILS_INDEX)
@@ -1163,22 +1710,41 @@ class MainWindow(QMainWindow):
 
         self.show_placeholder(title or "Module", subtitle or "This module will be connected soon.")
 
-    def show_placeholder(self, title: str, subtitle: str) -> None:
+    def show_placeholder(
+        self,
+        title: str,
+        subtitle: str,
+    ) -> None:
         if self.monthly_stock_only_mode:
-            self.navigate(self.MONTHLY_STOCK_COUNT_INDEX)
+            self.navigate(
+                self.MONTHLY_STOCK_COUNT_INDEX
+            )
             return
 
-        self.placeholder_page = PlaceholderPage(title, subtitle)
+        index = self.PLACEHOLDER_INDEX
+        placeholder = PlaceholderPage(
+            title,
+            subtitle,
+        )
 
-        old_widget = self.stack.widget(self.PLACEHOLDER_INDEX)
+        old_widget = self.stack.widget(index)
         self.stack.removeWidget(old_widget)
         old_widget.deleteLater()
 
+        container = self._wrap_scroll(
+            placeholder
+        )
         self.stack.insertWidget(
-            self.PLACEHOLDER_INDEX,
-            self._wrap_scroll(self.placeholder_page),
+            index,
+            container,
         )
 
-        self.navigate(self.PLACEHOLDER_INDEX)
+        self.placeholder_page = placeholder
+        self._page_instances[
+            index
+        ] = placeholder
+        self._loaded_page_indexes.add(
+            index
+        )
 
-
+        self.navigate(index)

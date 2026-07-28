@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import re
 
@@ -29,10 +29,15 @@ from PySide6.QtWidgets import (
 from sqlalchemy import text
 
 from app.database import engine
+from app.services.master_data_normalization import (
+    clean_text,
+    is_no_casing,
+    normalize_casing_type,
+)
 
 
 def _clean(value) -> str:
-    return re.sub(r"\s+", " ", str(value or "").strip())
+    return clean_text(value)
 
 
 def _code_prefix(casing_type: str) -> str:
@@ -76,6 +81,18 @@ class CasingRepository:
                 )
             """))
 
+            for statement in [
+                "ALTER TABLE casing_master ADD COLUMN IF NOT EXISTS total_casing_count INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE casing_master ADD COLUMN IF NOT EXISTS production_casing_count INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE casing_master ADD COLUMN IF NOT EXISTS breakdown_casing_count INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE casing_master ADD COLUMN IF NOT EXISTS planning_reserved_casing_count INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE casing_master ADD COLUMN IF NOT EXISTS casing_code TEXT",
+                "ALTER TABLE casing_master ADD COLUMN IF NOT EXISTS description TEXT",
+                "ALTER TABLE casing_master ADD COLUMN IF NOT EXISTS casing_count INTEGER DEFAULT 0",
+                "ALTER TABLE casing_master ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
+            ]:
+                conn.execute(text(statement))
+
             conn.execute(text("""
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_casing_units_type_no
                 ON casing_units (casing_type, casing_no)
@@ -91,7 +108,13 @@ class CasingRepository:
     def ensure_units_from_counts(self) -> None:
         with engine.begin() as conn:
             rows = conn.execute(text("""
-                SELECT casing_type, available_casing_count
+                SELECT
+                    casing_type,
+                    GREATEST(
+                        COALESCE(total_casing_count, 0),
+                        COALESCE(casing_count, 0),
+                        COALESCE(available_casing_count, 0)
+                    ) AS target_count
                 FROM casing_master
                 WHERE casing_type IS NOT NULL
                   AND TRIM(casing_type) <> ''
@@ -101,7 +124,9 @@ class CasingRepository:
 
             for row in rows:
                 casing_type = row["casing_type"]
-                target_count = int(row["available_casing_count"] or 0)
+                target_count = int(
+                    row["target_count"] or 0
+                )
 
                 if target_count <= 0:
                     continue
@@ -152,19 +177,145 @@ class CasingRepository:
 
                 self._sync_count_for_type(conn, casing_type)
 
-    def _sync_count_for_type(self, conn, casing_type: str) -> None:
+    def _sync_count_for_type(
+        self,
+        conn,
+        casing_type: str,
+    ) -> None:
+        canonical_type = normalize_casing_type(
+            casing_type
+        )
+
+        if is_no_casing(canonical_type):
+            conn.execute(
+                text(
+                    """
+                    UPDATE casing_master
+                    SET
+                        available_casing_count = 0,
+                        total_casing_count = 0,
+                        production_casing_count = 0,
+                        breakdown_casing_count = 0,
+                        planning_reserved_casing_count = 0,
+                        casing_count = 0,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE mpps_identifier_key(
+                            casing_type
+                          )
+                        = mpps_identifier_key(
+                            :casing_type
+                          )
+                    """
+                ),
+                {"casing_type": canonical_type},
+            )
+            return
+
         conn.execute(
-            text("""
+            text(
+                """
                 UPDATE casing_master
-                SET available_casing_count = (
+                SET
+                    total_casing_count = (
                         SELECT COUNT(*)
                         FROM casing_units
-                        WHERE casing_type = :casing_type
+                        WHERE mpps_identifier_key(
+                                casing_type
+                              )
+                            = mpps_identifier_key(
+                                :casing_type
+                              )
+                    ),
+                    available_casing_count = (
+                        SELECT COUNT(*)
+                        FROM casing_units
+                        WHERE mpps_identifier_key(
+                                casing_type
+                              )
+                            = mpps_identifier_key(
+                                :casing_type
+                              )
+                          AND LOWER(
+                                COALESCE(
+                                    condition_status,
+                                    'Active'
+                                )
+                              ) = 'active'
+                          AND LOWER(
+                                COALESCE(
+                                    stock_status,
+                                    'Free'
+                                )
+                              ) = 'free'
+                    ),
+                    production_casing_count = (
+                        SELECT COUNT(*)
+                        FROM casing_units
+                        WHERE mpps_identifier_key(
+                                casing_type
+                              )
+                            = mpps_identifier_key(
+                                :casing_type
+                              )
+                          AND LOWER(
+                                COALESCE(
+                                    stock_status,
+                                    ''
+                                )
+                              ) = 'in use'
+                    ),
+                    breakdown_casing_count = (
+                        SELECT COUNT(*)
+                        FROM casing_units
+                        WHERE mpps_identifier_key(
+                                casing_type
+                              )
+                            = mpps_identifier_key(
+                                :casing_type
+                              )
+                          AND LOWER(
+                                COALESCE(
+                                    condition_status,
+                                    ''
+                                )
+                              ) = 'breakdown'
+                    ),
+                    planning_reserved_casing_count = (
+                        SELECT COUNT(*)
+                        FROM casing_units
+                        WHERE mpps_identifier_key(
+                                casing_type
+                              )
+                            = mpps_identifier_key(
+                                :casing_type
+                              )
+                          AND LOWER(
+                                COALESCE(
+                                    stock_status,
+                                    ''
+                                )
+                              ) = 'reserved'
+                    ),
+                    casing_count = (
+                        SELECT COUNT(*)
+                        FROM casing_units
+                        WHERE mpps_identifier_key(
+                                casing_type
+                              )
+                            = mpps_identifier_key(
+                                :casing_type
+                              )
                     ),
                     updated_at = CURRENT_TIMESTAMP
-                WHERE casing_type = :casing_type
-            """),
-            {"casing_type": casing_type},
+                WHERE mpps_identifier_key(
+                        casing_type
+                      )
+                    = mpps_identifier_key(
+                        :casing_type
+                      )
+                """
+            ),
+            {"casing_type": canonical_type},
         )
 
     def overview_stats(self) -> dict:
@@ -273,109 +424,378 @@ class CasingRepository:
                 WHERE casing_type = :casing_type
             """), {"casing_type": casing_type}).mappings().one())
 
-    def add_type(self, casing_type: str, initial_count: int, remarks: str) -> None:
-        casing_type = _clean(casing_type)
+    def _assert_unique_type(
+        self,
+        conn,
+        casing_type: str,
+        exclude_type: str | None = None,
+    ) -> None:
+        params = {
+            "casing_type": casing_type,
+        }
+        exclude_sql = ""
+
+        if exclude_type is not None:
+            params["exclude_type"] = exclude_type
+            exclude_sql = (
+                "AND mpps_identifier_key(casing_type) "
+                "<> mpps_identifier_key(:exclude_type)"
+            )
+
+        duplicate = conn.execute(
+            text(
+                f"""
+                SELECT casing_type
+                FROM casing_master
+                WHERE mpps_identifier_key(
+                        casing_type
+                      )
+                    = mpps_identifier_key(
+                        :casing_type
+                      )
+                  {exclude_sql}
+                LIMIT 1
+                """
+            ),
+            params,
+        ).scalar_one_or_none()
+
+        if duplicate is not None:
+            raise ValueError(
+                "A casing type with the same normalized "
+                f"name already exists: {duplicate}"
+            )
+
+    def add_type(
+        self,
+        casing_type: str,
+        initial_count: int,
+        remarks: str,
+    ) -> None:
+        casing_type = normalize_casing_type(
+            casing_type
+        )
+
+        if casing_type == "-":
+            raise ValueError(
+                "A valid Casing Type is required."
+            )
+
+        if is_no_casing(casing_type):
+            raise ValueError(
+                "'No Casing' is a planning rule, not a "
+                "physical casing inventory type."
+            )
 
         with engine.begin() as conn:
+            self._assert_unique_type(
+                conn,
+                casing_type,
+            )
+
             conn.execute(
-                text("""
+                text(
+                    """
                     INSERT INTO casing_master (
                         casing_type,
+                        casing_code,
+                        description,
                         available_casing_count,
+                        total_casing_count,
+                        production_casing_count,
+                        breakdown_casing_count,
+                        planning_reserved_casing_count,
+                        casing_count,
                         status,
+                        is_active,
                         remarks,
                         updated_at
                     )
                     VALUES (
                         :casing_type,
+                        :casing_type,
+                        :casing_type,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
                         0,
                         'Active',
+                        TRUE,
                         :remarks,
                         CURRENT_TIMESTAMP
                     )
-                """),
+                    """
+                ),
                 {
                     "casing_type": casing_type,
-                    "remarks": remarks,
+                    "remarks": _clean(remarks),
                 },
             )
 
-            for _ in range(max(0, int(initial_count))):
-                self._add_one_unit(conn, casing_type)
+            for _ in range(
+                max(0, int(initial_count))
+            ):
+                self._add_one_unit(
+                    conn,
+                    casing_type,
+                )
 
-            self._sync_count_for_type(conn, casing_type)
+            self._sync_count_for_type(
+                conn,
+                casing_type,
+            )
 
-    def rename_type(self, old_type: str, new_type: str, remarks: str) -> None:
-        old_type = _clean(old_type)
-        new_type = _clean(new_type)
+    def rename_type(
+        self,
+        old_type: str,
+        new_type: str,
+        remarks: str,
+    ) -> None:
+        old_type = normalize_casing_type(
+            old_type
+        )
+        new_type = normalize_casing_type(
+            new_type
+        )
+
+        if new_type == "-":
+            raise ValueError(
+                "A valid Casing Type is required."
+            )
+
+        if is_no_casing(new_type):
+            raise ValueError(
+                "A physical casing type cannot be "
+                "renamed to 'No Casing'."
+            )
 
         with engine.begin() as conn:
+            self._assert_unique_type(
+                conn,
+                new_type,
+                exclude_type=old_type,
+            )
+
             conn.execute(
-                text("""
+                text(
+                    """
                     UPDATE casing_master
-                    SET casing_type = :new_type,
+                    SET
+                        casing_type = :new_type,
+                        casing_code = :new_type,
+                        description = :new_type,
                         remarks = :remarks,
                         updated_at = CURRENT_TIMESTAMP
-                    WHERE casing_type = :old_type
-                """),
+                    WHERE mpps_identifier_key(
+                            casing_type
+                          )
+                        = mpps_identifier_key(
+                            :old_type
+                          )
+                    """
+                ),
                 {
                     "old_type": old_type,
                     "new_type": new_type,
-                    "remarks": remarks,
+                    "remarks": _clean(remarks),
                 },
             )
 
             unit_rows = conn.execute(
-                text("""
+                text(
+                    """
                     SELECT id, casing_no
                     FROM casing_units
-                    WHERE casing_type = :old_type
+                    WHERE mpps_identifier_key(
+                            casing_type
+                          )
+                        = mpps_identifier_key(
+                            :old_type
+                          )
                     ORDER BY casing_no
-                """),
+                    """
+                ),
                 {"old_type": old_type},
             ).mappings().all()
 
             for row in unit_rows:
                 conn.execute(
-                    text("""
+                    text(
+                        """
                         UPDATE casing_units
-                        SET casing_type = :new_type,
+                        SET
+                            casing_type = :new_type,
                             casing_code = :casing_code,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE id = :id
-                    """),
+                        """
+                    ),
                     {
                         "id": row["id"],
                         "new_type": new_type,
-                        "casing_code": _unit_code(new_type, int(row["casing_no"])),
+                        "casing_code": _unit_code(
+                            new_type,
+                            int(row["casing_no"]),
+                        ),
                     },
                 )
 
             conn.execute(
-                text("""
+                text(
+                    """
                     UPDATE mold_master
-                    SET casing_type = :new_type,
+                    SET
+                        casing_type = :new_type,
                         updated_at = CURRENT_TIMESTAMP
-                    WHERE casing_type = :old_type
-                """),
+                    WHERE mpps_identifier_key(
+                            casing_type
+                          )
+                        = mpps_identifier_key(
+                            :old_type
+                          )
+                    """
+                ),
+                {
+                    "old_type": old_type,
+                    "new_type": new_type,
+                },
+            )
+            conn.execute(
+                text(
+                    """
+                    UPDATE smds
+                    SET
+                        casing_type = :new_type,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE mpps_identifier_key(
+                            casing_type
+                          )
+                        = mpps_identifier_key(
+                            :old_type
+                          )
+                    """
+                ),
+                {
+                    "old_type": old_type,
+                    "new_type": new_type,
+                },
+            )
+            conn.execute(
+                text(
+                    """
+                    UPDATE planning_resource_reservations
+                    SET resource_key = :new_type
+                    WHERE resource_type = 'casing'
+                      AND mpps_identifier_key(
+                            resource_key
+                          )
+                          = mpps_identifier_key(
+                            :old_type
+                          )
+                    """
+                ),
                 {
                     "old_type": old_type,
                     "new_type": new_type,
                 },
             )
 
-            self._sync_count_for_type(conn, new_type)
+            self._sync_count_for_type(
+                conn,
+                new_type,
+            )
 
-    def delete_type(self, casing_type: str) -> None:
-        casing_type = _clean(casing_type)
+    def delete_type(
+        self,
+        casing_type: str,
+    ) -> None:
+        casing_type = normalize_casing_type(
+            casing_type
+        )
+
+        if is_no_casing(casing_type):
+            raise ValueError(
+                "'No Casing' is a protected planning rule."
+            )
 
         with engine.begin() as conn:
+            references = conn.execute(
+                text(
+                    """
+                    SELECT
+                        (
+                            SELECT COUNT(*)
+                            FROM smds
+                            WHERE mpps_identifier_key(
+                                    casing_type
+                                  )
+                                = mpps_identifier_key(
+                                    :casing_type
+                                  )
+                        )
+                        + (
+                            SELECT COUNT(*)
+                            FROM mold_master
+                            WHERE mpps_identifier_key(
+                                    casing_type
+                                  )
+                                = mpps_identifier_key(
+                                    :casing_type
+                                  )
+                        )
+                        + (
+                            SELECT COUNT(*)
+                            FROM
+                                planning_resource_reservations
+                            WHERE resource_type = 'casing'
+                              AND mpps_identifier_key(
+                                    resource_key
+                                  )
+                                  = mpps_identifier_key(
+                                    :casing_type
+                                  )
+                        )
+                    """
+                ),
+                {"casing_type": casing_type},
+            ).scalar_one()
+
+            if int(references or 0) > 0:
+                raise ValueError(
+                    "This casing type is still referenced "
+                    "by SMDS, Mold Master, or planning "
+                    "reservations. Rename or correct those "
+                    "records before deletion."
+                )
+
             conn.execute(
-                text("DELETE FROM casing_units WHERE casing_type = :casing_type"),
+                text(
+                    """
+                    DELETE FROM casing_units
+                    WHERE mpps_identifier_key(
+                            casing_type
+                          )
+                        = mpps_identifier_key(
+                            :casing_type
+                          )
+                    """
+                ),
                 {"casing_type": casing_type},
             )
             conn.execute(
-                text("DELETE FROM casing_master WHERE casing_type = :casing_type"),
+                text(
+                    """
+                    DELETE FROM casing_master
+                    WHERE mpps_identifier_key(
+                            casing_type
+                          )
+                        = mpps_identifier_key(
+                            :casing_type
+                          )
+                    """
+                ),
                 {"casing_type": casing_type},
             )
 
@@ -433,7 +853,14 @@ class CasingRepository:
             """), {"id": unit_id}).mappings().one())
 
     def add_units(self, casing_type: str, qty: int) -> None:
-        casing_type = _clean(casing_type)
+        casing_type = normalize_casing_type(
+            casing_type
+        )
+        if is_no_casing(casing_type):
+            raise ValueError(
+                "Physical units cannot be added to "
+                "'No Casing'."
+            )
         qty = max(1, int(qty))
 
         with engine.begin() as conn:
@@ -628,7 +1055,9 @@ class CasingTypeDialog(QDialog):
 
     def data(self) -> dict:
         return {
-            "casing_type": self.casing_type_input.text().strip(),
+            "casing_type": normalize_casing_type(
+                self.casing_type_input.text()
+            ),
             "initial_count": int(self.initial_count_input.value()) if self.allow_initial_count else 0,
             "remarks": self.remarks_input.toPlainText().strip(),
         }
@@ -1632,3 +2061,4 @@ class CasingMasterPage(QWidget):
             self.refresh_overview()
         except Exception as exc:
             QMessageBox.critical(self, "Database Error", "Could not delete casing unit. " + str(exc))
+
