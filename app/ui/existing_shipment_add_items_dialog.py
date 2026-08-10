@@ -62,6 +62,7 @@ def _fmt_date(value: Any) -> str:
     return str(value)
 
 
+# DELIVERY DATE INTEGRITY V6.3: review shipments cannot receive planned dates
 class ExistingShipmentAddItemsDialog(QDialog):
     """Dedicated modal workspace for adding items to a saved shipment."""
 
@@ -1090,6 +1091,26 @@ class ExistingShipmentAddItemsDialog(QDialog):
             )
 
         self.shipment = dict(row)
+        shipment_status = str(
+            self.shipment.get("status") or ""
+        ).strip().lower()
+        planning_status = str(
+            self.shipment.get("planning_status") or ""
+        ).strip().lower()
+        target_source = str(
+            self.shipment.get("target_date_source") or ""
+        ).strip().lower()
+        self.review_required = (
+            shipment_status
+            in {
+                "imported review",
+                "review required",
+                "draft import",
+                "excel review hold",
+            }
+            or planning_status == "review required"
+            or target_source == "excel import - date missing"
+        )
 
         shipment_no = str(
             self.shipment.get("shipment_no")
@@ -1103,19 +1124,18 @@ class ExistingShipmentAddItemsDialog(QDialog):
             self.shipment.get("customer_name")
             or "-"
         )
-        target = (
-            self.shipment.get("target_date")
-            or self.shipment.get("plan_date")
-            or self.shipment.get(
-                "manager_order_date"
-            )
+        target = self.shipment.get("target_date")
+        target_display = (
+            "Approval Required"
+            if self.review_required
+            else _fmt_date(target)
         )
 
         self.shipment_context.setText(
             f"{shipment_name}  •  "
             f"Shipment ID: {shipment_no}  •  "
             f"Customer: {customer}  •  "
-            f"Target Date: {_fmt_date(target)}"
+            f"Target Date: {target_display}"
         )
         self.setWindowTitle(
             f"Add Items — {shipment_name}"
@@ -1394,13 +1414,9 @@ class ExistingShipmentAddItemsDialog(QDialog):
             self._update_metrics()
             return
 
-        target_date = (
-            self.shipment.get("target_date")
-            or self.shipment.get("plan_date")
-            or self.shipment.get(
-                "manager_order_date"
-            )
-        )
+        # Workbook plan dates and manager/order dates are not approved
+        # customer target dates.
+        target_date = self.shipment.get("target_date")
 
         target_is_manual = bool(
             self.shipment.get(
@@ -1499,6 +1515,19 @@ class ExistingShipmentAddItemsDialog(QDialog):
                 )
                 or ""
             )
+
+            if self.review_required:
+                # Keep non-reserving stock/production preview, but do not
+                # manufacture production dates or capacity before target
+                # approval.
+                item["allocated_cavity_count"] = 0
+                item["daily_capacity"] = 0
+                item["production_days"] = 0
+                item["item_receive_date"] = None
+                item["item_status"] = "Imported Review"
+                item["schedule_reason"] = (
+                    "Target date approval required before live planning."
+                )
 
         self._update_readiness()
         self._update_metrics()
@@ -1990,6 +2019,17 @@ class ExistingShipmentAddItemsDialog(QDialog):
         inserted_ids: list[int] = []
 
         try:
+            if self.review_required:
+                for item in self.new_items:
+                    item["allocated_cavity_count"] = 0
+                    item["daily_capacity"] = 0
+                    item["production_days"] = 0
+                    item["item_receive_date"] = None
+                    item["item_status"] = "Imported Review"
+                    item["schedule_reason"] = (
+                        "Target date approval required before live planning."
+                    )
+
             with engine.begin() as connection:
                 for item in self.new_items:
                     item_id = int(
@@ -2155,15 +2195,16 @@ class ExistingShipmentAddItemsDialog(QDialog):
                     )
                     inserted_ids.append(item_id)
 
-            self.planner.replan_all_open_shipments(
-                trigger_reason=(
-                    "existing_shipment_popup_items_added_"
-                    f"{self.shipment_id}"
-                ),
-                created_by=(
-                    "existing_shipment_add_items_popup"
-                ),
-            )
+            if not self.review_required:
+                self.planner.replan_all_open_shipments(
+                    trigger_reason=(
+                        "existing_shipment_popup_items_added_"
+                        f"{self.shipment_id}"
+                    ),
+                    created_by=(
+                        "existing_shipment_add_items_popup"
+                    ),
+                )
 
         except Exception as exc:
             if inserted_ids:
@@ -2234,7 +2275,11 @@ class ExistingShipmentAddItemsDialog(QDialog):
                 f"{len(inserted_ids)} new "
                 f"{'item was' if len(inserted_ids) == 1 else 'items were'} "
                 "added successfully.\n\n"
-                "All active shipments were replanned."
+                + (
+                    "Target approval is still required before planning."
+                    if self.review_required
+                    else "All active shipments were replanned."
+                )
             ),
         )
         self.accept()

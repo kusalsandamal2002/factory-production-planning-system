@@ -1,3 +1,5 @@
+# PRODUCTION PLANNING FAST ASYNC LOAD V7.1
+# MPPS ULTRA PERFORMANCE + GLOBAL PROGRESS V7.2
 from __future__ import annotations
 from time import perf_counter
 from PySide6.QtCore import QEvent, QTimer, Qt
@@ -13,6 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -52,6 +55,15 @@ from app.ui.casing_master_page import CasingMasterPage
 from app.ui.tyre_item_master_page import TyreItemMasterPage
 from app.ui.admin_database_viewer_page import AdminDatabaseViewerPage
 from app.ui.factory_out_date_logic_page import FactoryOutDateLogicPage
+from app.ui.intelligent_operations_pages import (
+    DeliveryDateControlPage,
+    DailyProductionPlanPage,
+    ShiftPlanPage,
+    OperationsReportsPage,
+)
+from app.ui.workbook_learning_center_page import (
+    WorkbookLearningCenterPage,
+)
 
 
 def _resolve_page_class(module_path: str, candidates: list[str]):
@@ -242,6 +254,7 @@ class MainWindow(QMainWindow):
 
     CAVITIES_MASTER_INDEX = 37
     DAILY_STOCK_INDEX = 38
+    WORKBOOK_LEARNING_INDEX = 39
     MONTHLY_STOCK_MANAGER_ROLE = "Monthly Stock Manager"
     MONTHLY_STOCK_VIEWER_ROLE = "Monthly Stock Viewer"
 
@@ -478,7 +491,8 @@ class MainWindow(QMainWindow):
         self._add_caption(layout, "Reports & Admin")
         self._add_nav_button(layout, "Reports", self.REPORTS_INDEX)
         self._add_nav_button(layout, "Admin Settings", self.ADMIN_CONTROL_INDEX)
-        self._add_nav_button(layout, "Legacy Excel Import", self.RAW_EXCEL_VIEWER_INDEX)
+        self._add_nav_button(layout, "Intelligent Excel Import", self.RAW_EXCEL_VIEWER_INDEX)
+        self._add_nav_button(layout, "AI Learning Center", self.WORKBOOK_LEARNING_INDEX)
 
         layout.addStretch()
         layout.addWidget(self._build_connection_badge())
@@ -768,9 +782,19 @@ class MainWindow(QMainWindow):
             (
                 self.RAW_EXCEL_VIEWER_INDEX,
                 "raw_excel_viewer_page",
-                "Legacy Excel Import",
+                "Intelligent Excel Import",
                 lambda: self._safe_create_page(
-                    RawExcelViewerPage
+                    RawExcelViewerPage,
+                    self.current_user,
+                ),
+            ),
+            (
+                self.WORKBOOK_LEARNING_INDEX,
+                "workbook_learning_center_page",
+                "AI Learning Center",
+                lambda: self._safe_create_page(
+                    WorkbookLearningCenterPage,
+                    self.current_user,
                 ),
             ),
             (
@@ -838,7 +862,7 @@ class MainWindow(QMainWindow):
                         "Daily Stock": (
                             self.DAILY_STOCK_INDEX
                         ),
-                        "Legacy Excel Import": (
+                        "Intelligent Excel Import": (
                             self.RAW_EXCEL_VIEWER_INDEX
                         ),
                     },
@@ -860,49 +884,32 @@ class MainWindow(QMainWindow):
                 self.DELIVERY_DATE_INDEX,
                 "delivery_date_page",
                 "Delivery Date Calculation",
-                lambda: PlaceholderPage(
-                    "Delivery Date Calculation",
-                    (
-                        "Calculate realistic customer "
-                        "delivery dates using stock and "
-                        "production capacity."
-                    ),
+                lambda: DeliveryDateControlPage(
+                    self.current_user
                 ),
             ),
             (
                 self.DAILY_PLAN_INDEX,
                 "daily_plan_page",
                 "Daily Production Plan",
-                lambda: PlaceholderPage(
-                    "Daily Production Plan",
-                    (
-                        "Generate and manage day-wise "
-                        "production plans."
-                    ),
+                lambda: DailyProductionPlanPage(
+                    self.current_user
                 ),
             ),
             (
                 self.SHIFT_PLAN_INDEX,
                 "shift_plan_page",
                 "Day / Night Shift Plan",
-                lambda: PlaceholderPage(
-                    "Day / Night Shift Plan",
-                    (
-                        "Split production into day and "
-                        "night shift targets."
-                    ),
+                lambda: ShiftPlanPage(
+                    self.current_user
                 ),
             ),
             (
                 self.REPORTS_INDEX,
                 "reports_page",
                 "Reports",
-                lambda: PlaceholderPage(
-                    "Reports",
-                    (
-                        "View production, delivery and "
-                        "capacity reports."
-                    ),
+                lambda: OperationsReportsPage(
+                    self.current_user
                 ),
             ),
             (
@@ -1020,7 +1027,7 @@ class MainWindow(QMainWindow):
         )
 
         badge = QLabel(
-            "LOADING WORKSPACE..."
+            "LOADING WORKSPACE 0%"
         )
         badge.setAlignment(
             Qt.AlignmentFlag.AlignCenter
@@ -1036,15 +1043,91 @@ class MainWindow(QMainWindow):
             "font-weight:950;"
         )
 
+        progress = QProgressBar()
+        progress.setRange(0, 100)
+        progress.setValue(0)
+        progress.setFormat("%p%")
+        progress.setTextVisible(True)
+        progress.setMinimumHeight(24)
+        progress.setStyleSheet(
+            "QProgressBar {"
+            "border:1px solid #cbd5e1;"
+            "border-radius:9px;"
+            "background:#f8fafc;"
+            "text-align:center;"
+            "font-weight:900;"
+            "color:#0f172a;"
+            "}"
+            "QProgressBar::chunk {"
+            "background:#2563eb;"
+            "border-radius:8px;"
+            "}"
+        )
+
+        progress_label = QLabel(
+            "Preparing workspace..."
+        )
+        progress_label.setWordWrap(True)
+        progress_label.setStyleSheet(
+            "color:#475569; font-weight:800;"
+        )
+
+        # Stored on the placeholder so every lazy page can show a common
+        # percentage without requiring each page class to implement its own
+        # loading widget. The percentage is stage-based for generic page load;
+        # pages with background workers (Production Planning) show real task
+        # progress inside the page itself.
+        page._mpps_progress_bar = progress
+        page._mpps_progress_label = progress_label
+        page._mpps_loading_badge = badge
+
         card_layout.addWidget(title_label)
         card_layout.addWidget(message)
         card_layout.addSpacing(6)
         card_layout.addWidget(badge)
+        card_layout.addWidget(progress)
+        card_layout.addWidget(progress_label)
         card_layout.addStretch()
 
         layout.addWidget(card)
         layout.addStretch()
         return page
+
+    def _set_loading_progress(
+        self,
+        placeholder: QWidget | None,
+        percent: int,
+        message: str,
+    ) -> None:
+        if placeholder is None:
+            return
+        value = max(0, min(100, int(percent)))
+        progress = getattr(
+            placeholder,
+            "_mpps_progress_bar",
+            None,
+        )
+        label = getattr(
+            placeholder,
+            "_mpps_progress_label",
+            None,
+        )
+        badge = getattr(
+            placeholder,
+            "_mpps_loading_badge",
+            None,
+        )
+        if progress is not None:
+            progress.setValue(value)
+        if label is not None:
+            label.setText(message)
+        if badge is not None:
+            badge.setText(
+                f"LOADING WORKSPACE {value}%"
+                if value < 100
+                else "WORKSPACE READY 100%"
+            )
+        QApplication.processEvents()
 
     def _ensure_page_loaded(
         self,
@@ -1084,14 +1167,48 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(
             Qt.CursorShape.WaitCursor
         )
-        QApplication.processEvents()
+        self._set_loading_progress(
+            placeholder,
+            5,
+            "Opening workspace...",
+        )
 
         started = perf_counter()
 
         try:
+            print(
+                "[MPPS STARTUP] Loading "
+                f"{title}...",
+                flush=True,
+            )
+            self._set_loading_progress(
+                placeholder,
+                20,
+                "Building page controls and loading initial data...",
+            )
             page = factory()
+            self._set_loading_progress(
+                placeholder,
+                78,
+                "Page created; preparing scroll workspace...",
+            )
             container = self._wrap_scroll(
                 page
+            )
+            self._set_loading_progress(
+                placeholder,
+                88,
+                "Connecting workspace to navigation...",
+            )
+            self._set_loading_progress(
+                placeholder,
+                96,
+                "Finalizing workspace...",
+            )
+            self._set_loading_progress(
+                placeholder,
+                100,
+                "Workspace ready",
             )
 
             self.stack.removeWidget(
@@ -1688,6 +1805,8 @@ class MainWindow(QMainWindow):
             "shipment_risk": (self.SHIPMENT_RISK_INDEX, None, None),
             "data_quality": (self.DATA_QUALITY_INDEX, None, None),
             "raw_excel_viewer": (self.RAW_EXCEL_VIEWER_INDEX, None, None),
+            "workbook_learning": (self.WORKBOOK_LEARNING_INDEX, None, None),
+            "ai_learning": (self.WORKBOOK_LEARNING_INDEX, None, None),
             "users_roles": (self.USERS_ROLES_INDEX, None, None),
             "backup_restore": (self.BACKUP_RESTORE_INDEX, None, None),
             "audit_log": (self.AUDIT_LOG_INDEX, None, None),

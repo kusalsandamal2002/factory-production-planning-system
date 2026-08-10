@@ -48,6 +48,7 @@ NO_CASING_VALUES = {
 
 # NO-CASING NORMALIZATION FIX V5.1
 # PRODUCTION LINE CAPACITY CARD REMOVED V5.2
+# PROCESS STANDARD PLANNING INTEGRITY V6.5
 def _casing_required(value: Any) -> bool:
     """Return False for all supported no-casing descriptions.
 
@@ -1468,8 +1469,30 @@ class ItemResourceControlCenterPage(QWidget):
             )
         simultaneous = min(candidates.values()) if candidates else 0
         total_plan = max(0.0, _to_float(self.smds.get("total_plan")))
+        normal_curing_minutes = max(
+            0.0,
+            _to_float(
+                self.smds.get("normal_curing_minutes")
+            ),
+        )
+        handling_present = (
+            self.smds.get("handling_time") is not None
+        )
+        process_standard_missing = (
+            total_plan <= 0
+            or normal_curing_minutes <= 0
+            or not handling_present
+        )
         daily = int(simultaneous * total_plan)
-        bottlenecks = [name for name, value in candidates.items() if value == simultaneous]
+        bottlenecks = (
+            ["PROCESS STANDARD"]
+            if process_standard_missing
+            else [
+                name
+                for name, value in candidates.items()
+                if value == simultaneous
+            ]
+        )
         physical_candidates = {
             "MOLD": mold_before,
             "CAVITY": cavity_free,
@@ -1645,6 +1668,7 @@ class ItemResourceControlCenterPage(QWidget):
             "daily_free": daily_free,
             "total_plan": total_plan,
             "daily": daily,
+            "process_standard_missing": process_standard_missing,
             "bottlenecks": bottlenecks,
             "item_reservations_today": dict(item_reservations_today),
         })
@@ -1802,6 +1826,39 @@ class ItemResourceControlCenterPage(QWidget):
                 else
                 "Confirm mold, cavity and oven readiness before "
                 "the start. No casing is required for this item."
+            )
+        elif (
+            production_required > 0
+            and _norm(
+                self.smds.get(
+                    "planning_manager_approval_status"
+                )
+            ) != "approved"
+        ):
+            status = "MASTER APPROVAL REQUIRED"
+            style = "LifecycleBlocked"
+            summary = (
+                "The item has production demand, but its SMDS planning "
+                "approval is not Approved."
+            )
+            next_action = (
+                "Review the process standard in SMDS Master and approve "
+                "the item before replanning."
+            )
+        elif (
+            production_required > 0
+            and d.get("process_standard_missing")
+        ):
+            status = "PROCESS STANDARD REQUIRED"
+            style = "LifecycleBlocked"
+            summary = (
+                "Mold, casing and cavity resources may be available, but "
+                "curing cycle, handling time or total plan is missing. "
+                "Daily output and completion date cannot be calculated."
+            )
+            next_action = (
+                "Repair or approve the SMDS process standard, then run "
+                "the cumulative production planner."
             )
         elif blocked_windows or (production_required > 0 and d.get("physical_capacity", 0) <= 0):
             status = "WAITING FOR RESOURCES"
@@ -2346,14 +2403,20 @@ class ItemResourceControlCenterPage(QWidget):
         bottleneck_text = " + ".join(
             d["bottlenecks"]
         )
-        self.bottleneck_value.setText(
-            (
-                "NO ADDITIONAL FREE CAPACITY — "
-                if d["simultaneous"] <= 0
-                else "ADDITIONAL CAPACITY LIMITED BY "
+        if d.get("process_standard_missing"):
+            self.bottleneck_value.setText(
+                "PRODUCTION RATE UNAVAILABLE — PROCESS STANDARD "
+                "MISSING (CURING / HANDLING / TOTAL PLAN)"
             )
-            + bottleneck_text
-        )
+        else:
+            self.bottleneck_value.setText(
+                (
+                    "NO ADDITIONAL FREE CAPACITY — "
+                    if d["simultaneous"] <= 0
+                    else "ADDITIONAL CAPACITY LIMITED BY "
+                )
+                + bottleneck_text
+            )
 
         casing_total_text = (
             _fmt_int(d["casing_total"])

@@ -1,4 +1,11 @@
-﻿import sys
+import sys
+
+from app.services.performance_runtime import (
+    configure_process_environment,
+    configure_qt_thread_pool,
+)
+
+_PERFORMANCE_INFO = configure_process_environment()
 
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QDialog
@@ -55,6 +62,14 @@ def apply_app_palette(app: QApplication) -> None:
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Factory Oven Production Planning System")
+    configure_qt_thread_pool(_PERFORMANCE_INFO)
+    print(
+        "[MPPS PERFORMANCE] "
+        f"CPU cores={_PERFORMANCE_INFO.cpu_count}; "
+        f"Qt workers={_PERFORMANCE_INFO.thread_pool_size}; "
+        f"priority={_PERFORMANCE_INFO.process_priority}",
+        flush=True,
+    )
     apply_app_palette(app)
 
     login_dialog = LoginDialog()

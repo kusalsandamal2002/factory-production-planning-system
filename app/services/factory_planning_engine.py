@@ -8,6 +8,11 @@ from typing import Any
 from sqlalchemy import Date, bindparam, text
 
 from app.database import engine
+from app.services.process_standard_resolution import (
+    process_standard_complete,
+    resolve_process_standard_from_connection,
+)
+
 from app.services.master_data_normalization import (
     is_no_casing,
     normalize_casing_type,
@@ -19,8 +24,43 @@ from app.services.master_data_normalization import (
 )
 
 OPEN_SHIPMENT_STATUSES = {"planned", "pending", "open", "saved", "in progress", "processing", ""}
-CLOSED_SHIPMENT_STATUSES = {"cancelled", "canceled", "closed", "complete", "completed", "shipped", "done"}
+# DELIVERY DATE INTEGRITY V6.3: no partial blocked resource reservations
+# DELIVERY DATE INTEGRITY V6.3: no fabricated shipment receive dates
+CLOSED_SHIPMENT_STATUSES = {"cancelled", "canceled", "closed", "complete", "completed", "shipped", "done", "draft", "draft import", "imported review", "review required", "on hold", "hold", "excel review hold"}
 NO_CASING_VALUES = {"", "-", "no casing", "none", "n/a", "na", "not required"}
+
+# AUTO FACTORY-OUT TARGET SCHEDULING V6.4
+# PROCESS STANDARD PLANNING INTEGRITY V6.5
+AUTO_TARGET_SOURCE = "Auto Earliest Feasible Factory Out"
+AUTO_TARGET_SOURCE_VALUES = {
+    "auto earliest feasible factory out",
+    "automatic factory receive",
+    "automatic factory out",
+    "auto factory receive",
+    "auto factory out",
+    "auto suggested",
+    "auto target",
+}
+
+
+def is_auto_target_source(value: Any) -> bool:
+    normalized = str(value or "").strip().lower()
+    return (
+        not normalized
+        or normalized in AUTO_TARGET_SOURCE_VALUES
+        or normalized.startswith("auto ")
+        or normalized.startswith("automatic ")
+    )
+
+
+def shipment_target_is_locked(shipment: dict[str, Any]) -> bool:
+    if bool(shipment.get("target_date_is_manual")):
+        return True
+    if shipment.get("target_date") is None:
+        return False
+    return not is_auto_target_source(
+        shipment.get("target_date_source")
+    )
 
 
 @dataclass
@@ -146,7 +186,7 @@ class FactoryPlanningEngine:
                     shipment_date DATE NOT NULL,
                     target_date DATE,
                     target_date_is_manual BOOLEAN NOT NULL DEFAULT FALSE,
-                    target_date_source VARCHAR(80) NOT NULL DEFAULT 'Automatic Factory Receive',
+                    target_date_source VARCHAR(80) NOT NULL DEFAULT 'Auto Earliest Feasible Factory Out',
                     plan_date DATE,
                     factory_can_receive_date DATE,
                     factory_out_date DATE,
@@ -201,10 +241,11 @@ class FactoryPlanningEngine:
             for sql in [
                 "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS target_date DATE",
                 "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS target_date_is_manual BOOLEAN NOT NULL DEFAULT FALSE",
-                "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS target_date_source VARCHAR(80) NOT NULL DEFAULT 'Automatic Factory Receive'",
+                "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS target_date_source VARCHAR(80) NOT NULL DEFAULT 'Auto Earliest Feasible Factory Out'",
                 "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS plan_date DATE",
                 "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS factory_can_receive_date DATE",
                 "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS factory_out_date DATE",
+                "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS dispatch_buffer_days INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS delivery_status VARCHAR(80) NOT NULL DEFAULT ''",
                 "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS delay_days INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS early_days INTEGER NOT NULL DEFAULT 0",
@@ -389,18 +430,79 @@ class FactoryPlanningEngine:
             conn.execute(text("DELETE FROM shipment_stock_allocations"))
 
             open_shipments = conn.execute(text("""
-                SELECT id, shipment_no, shipment_name, customer_name, shipment_date, target_date, plan_date, status, created_at, note, COALESCE(shipment_name, '') AS shipment_label,
-                       COALESCE(target_date_is_manual, FALSE) AS target_date_is_manual
+                SELECT
+                    id,
+                    shipment_no,
+                    shipment_name,
+                    customer_name,
+                    shipment_date,
+                    target_date,
+                    plan_date,
+                    status,
+                    created_at,
+                    note,
+                    COALESCE(shipment_name, '') AS shipment_label,
+                    COALESCE(target_date_is_manual, FALSE)
+                        AS target_date_is_manual,
+                    COALESCE(
+                        NULLIF(target_date_source, ''),
+                        :auto_target_source
+                    ) AS target_date_source,
+                    GREATEST(
+                        0,
+                        COALESCE(dispatch_buffer_days, 0)
+                    ) AS dispatch_buffer_days
                 FROM mpps_shipments
-                WHERE COALESCE(LOWER(status), 'planned') NOT IN ('cancelled', 'canceled', 'closed', 'complete', 'completed', 'shipped', 'done')
+                WHERE COALESCE(LOWER(status), 'planned') NOT IN (
+                    'cancelled',
+                    'canceled',
+                    'closed',
+                    'complete',
+                    'completed',
+                    'shipped',
+                    'done',
+                    'draft',
+                    'draft import',
+                    'imported review',
+                    'review required',
+                    'on hold',
+                    'hold',
+                    'excel review hold'
+                )
                 ORDER BY
-                    CASE WHEN COALESCE(target_date_is_manual, FALSE) THEN 0 ELSE 1 END,
-                    CASE WHEN COALESCE(target_date_is_manual, FALSE)
-                         THEN COALESCE(target_date, DATE '9999-12-31')
-                         ELSE DATE '9999-12-31' END,
+                    CASE
+                        WHEN COALESCE(target_date_is_manual, FALSE)
+                        THEN 0
+                        WHEN target_date IS NOT NULL
+                         AND LOWER(
+                                COALESCE(target_date_source, '')
+                             ) NOT LIKE 'auto%%'
+                         AND LOWER(
+                                COALESCE(target_date_source, '')
+                             ) NOT LIKE 'automatic%%'
+                        THEN 0
+                        ELSE 1
+                    END,
+                    CASE
+                        WHEN COALESCE(target_date_is_manual, FALSE)
+                          OR (
+                                target_date IS NOT NULL
+                            AND LOWER(
+                                    COALESCE(target_date_source, '')
+                                ) NOT LIKE 'auto%%'
+                            AND LOWER(
+                                    COALESCE(target_date_source, '')
+                                ) NOT LIKE 'automatic%%'
+                          )
+                        THEN COALESCE(
+                            target_date,
+                            DATE '9999-12-31'
+                        )
+                        ELSE DATE '9999-12-31'
+                    END,
                     COALESCE(created_at, CURRENT_TIMESTAMP),
                     id
-            """))
+            """), {"auto_target_source": AUTO_TARGET_SOURCE})
             shipment_rows = [dict(row) for row in open_shipments.mappings().all()]
 
             stock_remaining_by_sap: dict[str, int] = {}
@@ -423,6 +525,7 @@ class FactoryPlanningEngine:
                 shipment_note_parts: list[str] = []
                 latest_item_date: date | None = None
                 item_statuses: list[str] = []
+                all_positive_items_dated = True
 
                 for item in items:
                     item_id = int(item["id"])
@@ -452,42 +555,151 @@ class FactoryPlanningEngine:
                     )
                     item_results.append(planned_item)
                     completed_qty += planned_item.completed_qty
-                    latest_item_date = planned_item.item_receive_date if planned_item.item_receive_date is not None and (latest_item_date is None or planned_item.item_receive_date > latest_item_date) else latest_item_date
+                    latest_item_date = (
+                        planned_item.item_receive_date
+                        if (
+                            planned_item.item_receive_date is not None
+                            and (
+                                latest_item_date is None
+                                or planned_item.item_receive_date
+                                    > latest_item_date
+                            )
+                        )
+                        else latest_item_date
+                    )
+                    if (
+                        order_qty > 0
+                        and planned_item.item_receive_date is None
+                    ):
+                        all_positive_items_dated = False
                     item_statuses.append(planned_item.item_status)
                     if planned_item.item_status == "Blocked":
                         shipment_note_parts.append(f"{sap_code}: {planned_item.schedule_reason}")
 
-                factory_can_receive_date = latest_item_date or shipment.get("shipment_date") or shipment.get("plan_date") or shipment.get("target_date") or self.start_date
-                if not item_results:
-                    factory_can_receive_date = shipment.get("shipment_date") or self.start_date
+                # A shipment-level receive date is valid only when every
+                # positive-quantity item has a verified receive date. Never
+                # substitute shipment_date, target_date, plan_date, or today for
+                # an unresolved item schedule.
+                factory_can_receive_date = (
+                    latest_item_date
+                    if item_results and all_positive_items_dated
+                    else None
+                )
 
-                manual_target = bool(shipment.get("target_date_is_manual"))
+                target_locked = shipment_target_is_locked(
+                    shipment
+                )
+                auto_target = not target_locked
+                dispatch_buffer_days = max(
+                    0,
+                    int(
+                        shipment.get(
+                            "dispatch_buffer_days"
+                        )
+                        or 0
+                    ),
+                )
+                factory_out_date = (
+                    factory_can_receive_date
+                    + timedelta(
+                        days=dispatch_buffer_days
+                    )
+                    if factory_can_receive_date
+                    is not None
+                    else None
+                )
                 effective_target_date = (
                     shipment.get("target_date")
-                    if manual_target
-                    else factory_can_receive_date
+                    if target_locked
+                    else factory_out_date
                 )
-                shipment_status = self._evaluate_shipment_status(item_statuses, effective_target_date)
+                target_source = (
+                    str(
+                        shipment.get(
+                            "target_date_source"
+                        )
+                        or ""
+                    ).strip()
+                    if target_locked
+                    else AUTO_TARGET_SOURCE
+                )
+                target_is_manual = bool(
+                    shipment.get(
+                        "target_date_is_manual"
+                    )
+                ) if target_locked else False
+
+                shipment_status = (
+                    self._evaluate_shipment_status(
+                        item_statuses,
+                        effective_target_date,
+                    )
+                )
                 planning_status = shipment_status
-                delivery_status = self._evaluate_delivery_status(effective_target_date, factory_can_receive_date)
+                if (
+                    auto_target
+                    and shipment_status == "Planned"
+                ):
+                    planning_status = "Auto Planned"
+
+                if auto_target:
+                    if factory_out_date is not None:
+                        delivery_status = "Auto Scheduled"
+                    elif "blocked" in shipment_status.lower():
+                        delivery_status = "Blocked"
+                    else:
+                        delivery_status = "Pending Planning"
+                else:
+                    delivery_status = self._evaluate_delivery_status(
+                        effective_target_date,
+                        factory_out_date,
+                    )
+
                 delay_days = 0
                 early_days = 0
-                if effective_target_date is not None:
-                    if factory_can_receive_date is None:
-                        delay_days = 0
-                        early_days = 0
-                    elif factory_can_receive_date < effective_target_date:
-                        early_days = (effective_target_date - factory_can_receive_date).days
-                    elif factory_can_receive_date > effective_target_date:
-                        delay_days = (factory_can_receive_date - effective_target_date).days
+                if (
+                    target_locked
+                    and effective_target_date is not None
+                    and factory_out_date is not None
+                ):
+                    if factory_out_date < effective_target_date:
+                        early_days = (
+                            effective_target_date
+                            - factory_out_date
+                        ).days
+                    elif factory_out_date > effective_target_date:
+                        delay_days = (
+                            factory_out_date
+                            - effective_target_date
+                        ).days
 
                 progress_pct = round((completed_qty / total_qty * 100) if total_qty else 0.0, 2)
-                planning_note = "; ".join(shipment_note_parts) if shipment_note_parts else "Planned within cumulative shipment priority and available capacity."
+                if shipment_note_parts:
+                    planning_note = "; ".join(shipment_note_parts)
+                elif factory_can_receive_date is None:
+                    planning_note = (
+                        "Planning is incomplete. Factory receive and factory-out "
+                        "dates remain pending until every positive-quantity item "
+                        "has a verified receive date."
+                    )
+                elif auto_target:
+                    planning_note = (
+                        "Auto Target was set to the earliest feasible Factory "
+                        "Can Out date after cumulative stock, mold, casing and "
+                        "cavity planning."
+                    )
+                else:
+                    planning_note = (
+                        "Planned within cumulative shipment priority and "
+                        "available capacity."
+                    )
 
                 stmt = text("""
                     UPDATE mpps_shipments
                     SET target_date = :target_date,
                         plan_date = COALESCE(:plan_date, :plan_date_fallback),
+                        target_date_is_manual = :target_date_is_manual,
+                        target_date_source = :target_date_source,
                         factory_can_receive_date = :factory_can_receive_date,
                         factory_out_date = :factory_out_date,
                         delivery_status = :delivery_status,
@@ -513,9 +725,14 @@ class FactoryPlanningEngine:
                     "shipment_id": shipment_id,
                     "target_date": effective_target_date,
                     "plan_date": effective_target_date,
-                    "plan_date_fallback": effective_target_date or shipment.get("shipment_date"),
+                    "plan_date_fallback": (
+                        effective_target_date
+                        or shipment.get("shipment_date")
+                    ),
+                    "target_date_is_manual": target_is_manual,
+                    "target_date_source": target_source,
                     "factory_can_receive_date": factory_can_receive_date,
-                    "factory_out_date": factory_can_receive_date,
+                    "factory_out_date": factory_out_date,
                     "delivery_status": delivery_status,
                     "delay_days": delay_days,
                     "early_days": early_days,
@@ -616,7 +833,10 @@ class FactoryPlanningEngine:
                     FROM mpps_shipments shipment
                     WHERE COALESCE(LOWER(shipment.status), 'planned') NOT IN (
                         'cancelled', 'canceled', 'closed', 'complete',
-                        'completed', 'shipped', 'done'
+                        'completed', 'shipped', 'done',
+                        'draft', 'draft import', 'imported review',
+                        'review required', 'on hold', 'hold',
+                        'excel review hold'
                     )
                     {exclude_sql}
                 """), params).mappings().all()
@@ -743,13 +963,25 @@ class FactoryPlanningEngine:
         self,
         shipment: dict[str, Any],
     ) -> tuple[Any, ...]:
-        manual = bool(shipment.get("target_date_is_manual"))
+        target_locked = shipment_target_is_locked(
+            shipment
+        )
         target = shipment.get("target_date")
         created = shipment.get("created_at") or datetime.max
         shipment_id = int(shipment.get("id") or 0)
-        if manual:
-            return (0, target or date.max, created, shipment_id)
-        return (1, date.max, created, shipment_id)
+        if target_locked:
+            return (
+                0,
+                target or date.max,
+                created,
+                shipment_id,
+            )
+        return (
+            1,
+            date.max,
+            created,
+            shipment_id,
+        )
 
     def final_shipment_date(self, cart_items: list[dict[str, Any]]) -> date | None:
         dates = []
@@ -896,8 +1128,15 @@ class FactoryPlanningEngine:
                 receive_date=None,
                 progress_pct=round((completed_qty / order_qty * 100) if order_qty else 0.0, 2),
                 item_status="Blocked",
-                schedule_reason="SMDS total plan is missing or zero.",
-                factory_out_reason="SMDS total plan is missing or zero.",
+                schedule_reason=(
+                    "SMDS process standard is missing or unresolved: "
+                    "curing cycle, handling time and total plan are required. "
+                    "Physical mold/casing/cavity capacity alone cannot create "
+                    "a production date."
+                ),
+                factory_out_reason=(
+                    "SMDS process standard is missing or unresolved."
+                ),
             )
             if not preview:
                 self._persist_item_result(conn, shipment, shipment_item_id, result, planning_version)
@@ -960,6 +1199,9 @@ class FactoryPlanningEngine:
         daily_capacity = 0
         receive_date = None
         reason = ""
+        tentative_allocations: list[
+            tuple[date, int, int]
+        ] = []
 
         mold_available_on_any_day = False
         casing_available_on_any_day = (
@@ -1038,11 +1280,17 @@ class FactoryPlanningEngine:
             allocated_cavity_count = max(allocated_cavity_count, allocated_cavities)
             production_days += 1
             daily_capacity = max(daily_capacity, int(ceil(allocated_cavities * total_plan)))
-            receive_date = candidate_date + timedelta(days=1)
-            self._reserve_resource(conn, run_id, planning_version, shipment, shipment_item_id, candidate_date, "mold", mold_key, allocated_cavities, daily_capacity, sap_code, description)
-            self._reserve_resource(conn, run_id, planning_version, shipment, shipment_item_id, candidate_date, "line_cavity", line_name, allocated_cavities, daily_capacity, sap_code, description)
-            if casing_required:
-                self._reserve_resource(conn, run_id, planning_version, shipment, shipment_item_id, candidate_date, "casing", casing_type, allocated_cavities, daily_capacity, sap_code, description)
+            receive_date = (
+                candidate_date
+                + timedelta(days=1)
+            )
+            tentative_allocations.append(
+                (
+                    candidate_date,
+                    allocated_cavities,
+                    daily_capacity,
+                )
+            )
             remaining_qty -= daily_production_qty
             if remaining_qty <= 0:
                 break
@@ -1126,6 +1374,58 @@ class FactoryPlanningEngine:
             daily_capacity = 0
             production_days = 0
         else:
+            # Commit resource reservations only after the whole production
+            # requirement is feasible. A blocked/partial schedule must not
+            # consume mold, casing, or cavity capacity.
+            for (
+                reservation_date,
+                reservation_cavities,
+                reservation_daily_capacity,
+            ) in tentative_allocations:
+                self._reserve_resource(
+                    conn,
+                    run_id,
+                    planning_version,
+                    shipment,
+                    shipment_item_id,
+                    reservation_date,
+                    "mold",
+                    mold_key,
+                    reservation_cavities,
+                    reservation_daily_capacity,
+                    sap_code,
+                    description,
+                )
+                self._reserve_resource(
+                    conn,
+                    run_id,
+                    planning_version,
+                    shipment,
+                    shipment_item_id,
+                    reservation_date,
+                    "line_cavity",
+                    line_name,
+                    reservation_cavities,
+                    reservation_daily_capacity,
+                    sap_code,
+                    description,
+                )
+                if casing_required:
+                    self._reserve_resource(
+                        conn,
+                        run_id,
+                        planning_version,
+                        shipment,
+                        shipment_item_id,
+                        reservation_date,
+                        "casing",
+                        casing_type,
+                        reservation_cavities,
+                        reservation_daily_capacity,
+                        sap_code,
+                        description,
+                    )
+
             item_status = "Planned"
             reason = "Planned within available capacity."
         progress_pct = round((completed_qty / order_qty * 100) if order_qty else 0.0, 2)
@@ -1309,7 +1609,17 @@ class FactoryPlanningEngine:
                         day_plan,
                         night_plan,
                         total_plan,
-                        planning_manager_approval_status
+                        curing_cycle,
+                        normal_curing_minutes,
+                        normal_curing_time_text,
+                        handling_time,
+                        planning_manager_approval_status,
+                        planning_manager_approval_note,
+                        planning_manager_approved_at,
+                        manager_approval_updated_at,
+                        process_standard_source,
+                        process_standard_confidence,
+                        process_standard_peer_count
                     FROM smds
                     WHERE mpps_identifier_key(sap_code)
                         = mpps_identifier_key(:sap_code)
@@ -1337,6 +1647,20 @@ class FactoryPlanningEngine:
             result["line"] = normalize_line_name(
                 result.get("line")
             )
+
+            if not process_standard_complete(result):
+                resolution = resolve_process_standard_from_connection(
+                    conn,
+                    result,
+                )
+                if resolution:
+                    result.update(
+                        resolution.as_smds_values()
+                    )
+                    result[
+                        "process_standard_runtime_inferred"
+                    ] = True
+
             return result
         except Exception:
             return None

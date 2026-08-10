@@ -1,0 +1,13 @@
+{
+  "run_id": 1,
+  "shipments_audited": 66,
+  "false_on_time_before": 10,
+  "false_on_time_after": 0,
+  "unresolved_review_repaired": 66,
+  "prior_manual_approvals_promoted": 0,
+  "headers_pending_after": 66,
+  "resource_reservations_removed": 0,
+  "review_stock_reservations_removed": 0,
+  "review_cavity_rows_removed": 0,
+  "report_directory": "C:\\MY\\Laugfs\\Laugfs_App\\factory-production-planning-system\\reports\\delivery_date_integrity_v6_3_20260728_154605"
+}

@@ -6,10 +6,15 @@ from datetime import date, datetime
 from decimal import Decimal
 import json
 import re
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
+
+from app.services.process_standard_resolution import (
+    build_process_standard_index,
+    process_standard_complete,
+)
 
 from app.services.master_data_normalization import (
     identifier_key,
@@ -19,6 +24,28 @@ from app.services.master_data_normalization import (
     normalize_sap_code,
 )
 
+
+# PROCESS STANDARD PLANNING INTEGRITY V6.5
+# MPPS ULTRA PERFORMANCE + GLOBAL PROGRESS V7.2
+
+ProgressCallback = Callable[[int, str], None]
+
+
+def _emit_progress(
+    callback: ProgressCallback | None,
+    percent: int,
+    message: str,
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(
+            max(0, min(100, int(percent))),
+            str(message),
+        )
+    except Exception:
+        # Progress reporting must never stop the production planner.
+        pass
 
 OPEN_SHIPMENT_STATUSES = {
     "",
@@ -339,31 +366,47 @@ def generate_cavity_plan(
     session: Session,
     *,
     settings: CavityPlanSettings,
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[
     list[CavityPlanRow],
     CavityPlanSummary,
     list[BlockedDemand],
 ]:
+    _emit_progress(progress_callback, 1, "Preparing planner schema")
     ensure_cavity_plan_schema(session)
 
+    _emit_progress(progress_callback, 5, "Loading factory cavities")
     cavities = _load_cavities(session)
+
+    _emit_progress(progress_callback, 10, "Loading approved SMDS master data")
     smds_rows = _load_smds_rows(session)
+
+    _emit_progress(progress_callback, 17, "Loading shipment demand and stock")
     demands, stock_map = _load_production_demands(
         session,
         smds_rows=smds_rows,
     )
+
+    _emit_progress(progress_callback, 24, "Loading mold and casing capacity")
     mold_capacity = _load_mold_capacity(session)
     casing_capacity = _load_casing_capacity(session)
 
     eligible: list[_Demand] = []
     blocked: list[BlockedDemand] = []
+    available_lines = {
+        _norm_line(cavity.line_name)
+        for cavity in cavities
+        if _cavity_operational_status(cavity) == "AVAILABLE / FREE"
+    }
 
-    for demand in demands:
+    total_demands = max(1, len(demands))
+    for index, demand in enumerate(demands, start=1):
         reason = _validate_demand(
             demand,
             mold_capacity=mold_capacity,
             casing_capacity=casing_capacity,
             cavities=cavities,
+            available_lines=available_lines,
         )
         if reason:
             blocked.append(
@@ -379,17 +422,34 @@ def generate_cavity_plan(
         else:
             eligible.append(demand)
 
+        if index == total_demands or index % 25 == 0:
+            _emit_progress(
+                progress_callback,
+                25 + int(7 * index / total_demands),
+                f"Validating production demand {index}/{total_demands}",
+            )
+
     eligible.sort(key=_demand_sort_key)
 
     first_day_demands = [
         _copy_demand(demand) for demand in eligible
     ]
+
+    def first_day_progress(local_percent: int, message: str) -> None:
+        _emit_progress(
+            progress_callback,
+            32 + int(local_percent * 0.38),
+            f"Today plan — {message}",
+        )
+
+    _emit_progress(progress_callback, 32, "Scheduling today's cavities")
     first_units = _schedule_day(
         cavities=cavities,
         demands=first_day_demands,
         settings=settings,
         mold_capacity=mold_capacity,
         casing_capacity=casing_capacity,
+        progress_callback=first_day_progress,
     )
 
     first_remaining = {
@@ -418,14 +478,25 @@ def generate_cavity_plan(
         night_shift_minutes=settings.night_shift_minutes,
         changeover_minutes=settings.changeover_minutes,
     )
+
+    def next_day_progress(local_percent: int, message: str) -> None:
+        _emit_progress(
+            progress_callback,
+            70 + int(local_percent * 0.20),
+            f"Next-day plan — {message}",
+        )
+
+    _emit_progress(progress_callback, 70, "Scheduling next-day cavities")
     next_units = _schedule_day(
         cavities=cavities,
         demands=next_day_demands,
         settings=next_settings,
         mold_capacity=mold_capacity,
         casing_capacity=casing_capacity,
+        progress_callback=next_day_progress,
     )
 
+    _emit_progress(progress_callback, 91, "Building production-plan display rows")
     rows = _build_display_rows(
         cavities=cavities,
         first_units=first_units,
@@ -504,6 +575,7 @@ def generate_cavity_plan(
     else:
         status_text = "PARTIALLY PLANNED"
 
+    _emit_progress(progress_callback, 97, "Finalizing production summary")
     summary = CavityPlanSummary(
         total_cavities=len(cavities),
         breakdown_cavities=breakdown_count,
@@ -519,6 +591,7 @@ def generate_cavity_plan(
         warning_items=warnings,
         status_text=status_text,
     )
+    _emit_progress(progress_callback, 100, "Production plan ready")
     return rows, summary, blocked
 
 
@@ -994,6 +1067,9 @@ def _load_production_demands(
 
     stock_map = _load_stock_map(session)
     stock_remaining = dict(stock_map)
+    process_standard_index = build_process_standard_index(
+        smds_rows.values()
+    )
     demands: list[_Demand] = []
     for raw in item_rows:
         row = dict(raw)
@@ -1008,7 +1084,15 @@ def _load_production_demands(
         production_qty = max(0, net_qty - stock_used)
         if production_qty <= 0:
             continue
-        smds = smds_rows.get(key, {})
+        smds = dict(smds_rows.get(key, {}))
+        if smds and not process_standard_complete(smds):
+            resolution = process_standard_index.resolve(
+                smds
+            )
+            if resolution:
+                smds.update(
+                    resolution.as_smds_values()
+                )
         description = str(_pick(smds, "material_description", "item_description", "description") or row.get("item_description") or sap_code).strip()
         approval = str(_pick(smds, "planning_manager_approval_status", "approval_status") or "Pending").strip()
         line_names = _compatible_lines(smds)
@@ -1291,6 +1375,7 @@ def _validate_demand(
     mold_capacity: dict[str, int],
     casing_capacity: dict[str, int],
     cavities: list[_Cavity],
+    available_lines: set[str] | None = None,
 ) -> str:
     if not demand.source:
         return "SMDS technical data was not found."
@@ -1323,11 +1408,12 @@ def _validate_demand(
                 "No available casing matches the SMDS "
                 "casing type."
             )
-    available_lines = {
-        _norm_line(cavity.line_name)
-        for cavity in cavities
-        if _cavity_operational_status(cavity) == "AVAILABLE / FREE"
-    }
+    if available_lines is None:
+        available_lines = {
+            _norm_line(cavity.line_name)
+            for cavity in cavities
+            if _cavity_operational_status(cavity) == "AVAILABLE / FREE"
+        }
     if not (
         {
             _norm_line(line)
@@ -1349,15 +1435,13 @@ def _schedule_day(
     settings: CavityPlanSettings,
     mold_capacity: dict[str, int],
     casing_capacity: dict[str, int],
+    progress_callback: ProgressCallback | None = None,
 ) -> list[_UnitAllocation]:
-    """Plan fixed factory shifts.
+    """Plan fixed factory shifts with indexed compatible-demand scanning.
 
-    DAY is 07:00-19:00 and NIGHT is 19:00-07:00. Enabled
-    windows are derived from the stored day/night minute values:
-    720/720 = all shifts, 720/0 = day only, 0/720 = night only.
-
-    The same tyre reuses the same oven in the next enabled shift
-    whenever possible.
+    V7.2 preserves the original candidate ordering, resource-concurrency rules
+    and same-SAP cavity reuse. The expensive all-demands scan is replaced by a
+    per-line candidate index rebuilt from the same globally sorted demand list.
     """
     states = [
         _Cavity(**asdict(cavity))
@@ -1390,6 +1474,37 @@ def _schedule_day(
     ]
     active_demands.sort(key=_demand_sort_key)
 
+    # Static normalization is intentionally done once outside the hot loops.
+    cavity_line_key = {
+        cavity.cavity_id: _norm_line(cavity.line_name)
+        for cavity in states
+    }
+    demand_line_keys = {
+        id(demand): {
+            _norm_line(line)
+            for line in demand.line_names
+        }
+        for demand in active_demands
+    }
+    demand_mold_key = {
+        id(demand): _norm_resource(demand.mold_type)
+        for demand in active_demands
+    }
+    demand_casing_key = {
+        id(demand): (
+            _norm_resource(demand.casing_type)
+            if _casing_required(demand.casing_type)
+            else ""
+        )
+        for demand in active_demands
+    }
+
+    total_requested_units = max(
+        1,
+        sum(demand.remaining_qty for demand in active_demands),
+    )
+    _emit_progress(progress_callback, 0, "Preparing cavity/resource indexes")
+
     day_enabled = int(settings.day_shift_minutes) > 0
     night_enabled = int(settings.night_shift_minutes) > 0
 
@@ -1399,7 +1514,10 @@ def _schedule_day(
     if night_enabled:
         shift_windows.append(("NIGHT", 720, 1440))
 
-    for shift_name, shift_start, shift_end in shift_windows:
+    for shift_index, (shift_name, shift_start, shift_end) in enumerate(
+        shift_windows,
+        start=1,
+    ):
         if not active_demands:
             break
 
@@ -1407,6 +1525,19 @@ def _schedule_day(
             cavity.cursor = shift_start
 
         while active_demands:
+            # Same dynamic demand ordering as V7.1, but one compatible-line
+            # index prevents every cavity from scanning every demand.
+            active_demands.sort(key=_demand_sort_key)
+            compatible_by_line: dict[
+                str,
+                list[tuple[int, _Demand]],
+            ] = defaultdict(list)
+            for priority, demand in enumerate(active_demands):
+                for line_key in demand_line_keys.get(id(demand), set()):
+                    compatible_by_line[line_key].append(
+                        (priority, demand)
+                    )
+
             best: tuple[
                 tuple[Any, ...],
                 _Cavity,
@@ -1419,13 +1550,17 @@ def _schedule_day(
                 if cavity.cursor >= shift_end:
                     continue
 
-                for priority, demand in enumerate(active_demands):
+                line_key = cavity_line_key.get(
+                    cavity.cavity_id,
+                    _norm_line(cavity.line_name),
+                )
+                candidates = compatible_by_line.get(
+                    line_key,
+                    (),
+                )
+
+                for priority, demand in candidates:
                     if demand.remaining_qty <= 0:
-                        continue
-                    if not _line_compatible(
-                        cavity.line_name,
-                        demand.line_names,
-                    ):
                         continue
 
                     changeover = (
@@ -1439,12 +1574,8 @@ def _schedule_day(
                         cavity.cursor + changeover,
                     )
                     duration = demand.effective_cycle_minutes
-                    mold_key = _norm_resource(demand.mold_type)
-                    casing_key = (
-                        _norm_resource(demand.casing_type)
-                        if _casing_required(demand.casing_type)
-                        else ""
-                    )
+                    mold_key = demand_mold_key[id(demand)]
+                    casing_key = demand_casing_key[id(demand)]
 
                     start = _find_resource_start(
                         requested_start=requested_start,
@@ -1476,7 +1607,7 @@ def _schedule_day(
                         reuse_rank,
                         priority,
                         _demand_sort_key(demand),
-                        _norm_line(cavity.line_name),
+                        line_key,
                         cavity.cavity_no,
                         cavity.cavity_id,
                     )
@@ -1506,10 +1637,10 @@ def _schedule_day(
                 cavity.cursor = shift_end
                 continue
 
-            mold_key = _norm_resource(demand.mold_type)
+            mold_key = demand_mold_key[id(demand)]
             mold_intervals[mold_key].append((start, end))
-            if _casing_required(demand.casing_type):
-                casing_key = _norm_resource(demand.casing_type)
+            casing_key = demand_casing_key[id(demand)]
+            if casing_key:
                 casing_intervals[casing_key].append((start, end))
 
             allocations.append(
@@ -1534,9 +1665,35 @@ def _schedule_day(
                 for item in active_demands
                 if item.remaining_qty > 0
             ]
-            active_demands.sort(key=_demand_sort_key)
 
+            if len(allocations) % 4 == 0:
+                allocation_percent = min(
+                    96,
+                    int(100 * len(allocations) / total_requested_units),
+                )
+                _emit_progress(
+                    progress_callback,
+                    allocation_percent,
+                    (
+                        f"{shift_name} shift — allocated "
+                        f"{len(allocations):,} pcs"
+                    ),
+                )
+
+        if shift_windows:
+            _emit_progress(
+                progress_callback,
+                min(98, int(100 * shift_index / len(shift_windows))),
+                f"{shift_name} shift completed",
+            )
+
+    _emit_progress(
+        progress_callback,
+        100,
+        f"Allocated {len(allocations):,} cavity cycles",
+    )
     return allocations
+
 
 def _find_resource_start(
     *,

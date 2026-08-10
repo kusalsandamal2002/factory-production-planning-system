@@ -1,0 +1,13 @@
+{
+  "version": "7.0.0",
+  "shipment_backup": "mpps_shipments_v7_before_20260729_214904",
+  "item_backup": "mpps_shipment_items_v7_before_20260729_214904",
+  "legacy_excel_shipments": 66,
+  "identity_groups": 66,
+  "canonical_shipments": 66,
+  "superseded_duplicates": 0,
+  "protected_duplicate_reviews": 0,
+  "reservations_released": 0,
+  "stock_allocations_released": 0,
+  "live_baseline_plan_date": "2025-10-31"
+}

@@ -1,0 +1,26 @@
+{
+  "version": "7.2.0",
+  "indexes_ready": [
+    "ix_v72_shipment_items_shipment_sap",
+    "ix_v72_shipment_items_active_sap_expr",
+    "ix_v72_shipments_planning_queue",
+    "ix_v72_stock_sap_expr",
+    "ix_v72_smds_sap_expr",
+    "ix_v72_cavities_live_line",
+    "ix_v72_mold_key_status",
+    "ix_v72_casing_units_live",
+    "ix_v72_casing_master_type"
+  ],
+  "tables_analyzed": [
+    "mpps_shipments",
+    "mpps_shipment_items",
+    "mpps_sap_stock_items",
+    "smds",
+    "production_line_cavities",
+    "mold_master",
+    "casing_units",
+    "casing_master"
+  ],
+  "data_rows_modified": 0,
+  "note": "Performance-only migration. No shipment, stock, plan or master data values were changed."
+}

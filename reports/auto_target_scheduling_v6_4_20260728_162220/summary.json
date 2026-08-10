@@ -1,0 +1,9 @@
+{
+  "run_id": 1,
+  "shipments_audited": 66,
+  "legacy_review_promoted": 66,
+  "auto_review_promoted": 66,
+  "manual_review_promoted": 0,
+  "automatic_sources_normalized": 0,
+  "auto_target_source": "Auto Earliest Feasible Factory Out"
+}

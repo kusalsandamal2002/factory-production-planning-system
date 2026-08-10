@@ -1,0 +1,11 @@
+{
+  "version": "6.5.0",
+  "backup_table": "smds_process_standard_backup_20260729_191419",
+  "approval_backup_table": "smds_approval_backup_20260713_165501",
+  "total_rows": 2951,
+  "missing_before": 1465,
+  "inferred_rows": 260,
+  "approvals_restored": 1551,
+  "unresolved_rows": 1205,
+  "missing_after": 1205
+}

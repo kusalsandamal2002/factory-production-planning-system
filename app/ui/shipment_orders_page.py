@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+# STOCK ALLOCATION INTEGRITY V6.2
+
 import csv
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QDate, Qt
 from PySide6.QtGui import QFont, QColor
@@ -1193,7 +1195,7 @@ class ShipmentOrdersPage(QWidget):
         hint.setWordWrap(True)
 
         self.next_factory_out_label = QLabel(
-            "Next factory receive date: -"
+            "Next Factory Can Out date: -"
         )
         self.next_factory_out_label.setStyleSheet(
             "color:#1d4ed8; font-size:9.5pt; "
@@ -1301,6 +1303,10 @@ class ShipmentOrdersPage(QWidget):
             "cannot_meet",
         )
         self.promise_filter.addItem(
+            "Auto scheduled",
+            "auto_scheduled",
+        )
+        self.promise_filter.addItem(
             "Pending calculation",
             "pending",
         )
@@ -1388,8 +1394,63 @@ class ShipmentOrdersPage(QWidget):
         filter_grid.setColumnStretch(1, 1)
         filter_grid.setColumnStretch(2, 1)
 
+        schedule_row = QHBoxLayout()
+        schedule_row.setSpacing(8)
+
+        schedule_hint = QLabel(
+            "Schedule control: double-click Target Date to edit, "
+            "or use the quick actions for the selected shipment."
+        )
+        schedule_hint.setObjectName("Hint")
+        schedule_hint.setWordWrap(True)
+
+        self.quick_target_btn = QPushButton(
+            "Set Target Date"
+        )
+        self.quick_target_btn.setObjectName(
+            "SecondaryButton"
+        )
+        self.quick_target_btn.clicked.connect(
+            self.change_selected_target_date
+        )
+
+        self.quick_auto_target_btn = QPushButton(
+            "Reset to Auto Target"
+        )
+        self.quick_auto_target_btn.setObjectName(
+            "SecondaryButton"
+        )
+        self.quick_auto_target_btn.clicked.connect(
+            self.reset_selected_to_auto_target
+        )
+
+        self.quick_replan_btn = QPushButton(
+            "Replan All"
+        )
+        self.quick_replan_btn.setObjectName(
+            "PrimaryButton"
+        )
+        self.quick_replan_btn.clicked.connect(
+            self.replan_all_from_list
+        )
+
+        schedule_row.addWidget(
+            schedule_hint,
+            1,
+        )
+        schedule_row.addWidget(
+            self.quick_target_btn
+        )
+        schedule_row.addWidget(
+            self.quick_auto_target_btn
+        )
+        schedule_row.addWidget(
+            self.quick_replan_btn
+        )
+
         header_layout.addLayout(top)
         header_layout.addLayout(filter_grid)
+        header_layout.addLayout(schedule_row)
         layout.addWidget(header)
 
         # Hidden compatibility labels.
@@ -1437,20 +1498,21 @@ class ShipmentOrdersPage(QWidget):
         )
 
         table_hint = QLabel(
-            "NO is calculated from the earliest Target Date. "
-            "Stock Progress = Stock Allocated / Total Quantity. "
-            "Green means the target can be met; red means it cannot."
+            "Manual/Excel target dates receive priority. Shipments without "
+            "an Excel target use the earliest feasible Factory Can Out date as "
+            "an editable Auto Target. Double-click Target Date to reschedule."
         )
         table_hint.setObjectName("Hint")
         table_hint.setWordWrap(True)
 
-        self.list_table = QTableWidget(0, 9)
+        self.list_table = QTableWidget(0, 10)
         self.list_table.setHorizontalHeaderLabels([
             "NO",
             "Shipment Name",
             "Shipment ID",
             "Target Date",
-            "Factory Can Receive Date",
+            "Target Source",
+            "Factory Can Out",
             "Total Quantity",
             "Stock Allocated",
             "Progress %",
@@ -1594,6 +1656,12 @@ class ShipmentOrdersPage(QWidget):
         if state == "cancelled":
             return "CANCELLED"
 
+        if state == "review_required":
+            return "REVIEW REQUIRED"
+
+        if state == "auto_scheduled":
+            return "AUTO TARGET — SCHEDULED"
+
         if state == "pending":
             return "PENDING CALCULATION"
 
@@ -1632,6 +1700,13 @@ class ShipmentOrdersPage(QWidget):
             )
             item.setBackground(
                 QColor("#dcfce7")
+            )
+        elif state == "auto_scheduled":
+            item.setForeground(
+                QColor("#1d4ed8")
+            )
+            item.setBackground(
+                QColor("#dbeafe")
             )
         elif state == "cannot_meet":
             item.setForeground(
@@ -1777,8 +1852,8 @@ class ShipmentOrdersPage(QWidget):
             "SecondaryButton"
         )
         self.change_target_date_btn.setToolTip(
-            "Set a manual Target Date or use the "
-            "automatic Factory Can Receive Date"
+            "Set a manual Target Date or reset to the earliest "
+            "feasible Factory Can Out Auto Target"
         )
         self.change_target_date_btn.clicked.connect(
             self.change_current_target_date
@@ -1867,7 +1942,7 @@ class ShipmentOrdersPage(QWidget):
             "Target / Priority Date: -"
         )
         self.info_factory_receive = QLabel(
-            "Factory Can Receive: -"
+            "Factory Can Out: -"
         )
         self.info_last_replanned = QLabel(
             "Last Replanned: -"
@@ -1957,7 +2032,7 @@ class ShipmentOrdersPage(QWidget):
         delivery_timeline.addWidget(
             self._metric_card(
                 self.detail_factory_receive_date_value,
-                "Factory Can Receive",
+                "Factory Can Out",
             )
         )
         delivery_timeline.addWidget(
@@ -2176,7 +2251,7 @@ class ShipmentOrdersPage(QWidget):
             QHeaderView.ResizeMode.Stretch,
         )
         header.setSectionResizeMode(
-            8,
+            9,
             QHeaderView.ResizeMode.Stretch,
         )
 
@@ -2184,11 +2259,12 @@ class ShipmentOrdersPage(QWidget):
         self.list_table.setColumnWidth(1, 220)
         self.list_table.setColumnWidth(2, 155)
         self.list_table.setColumnWidth(3, 110)
-        self.list_table.setColumnWidth(4, 150)
-        self.list_table.setColumnWidth(5, 105)
+        self.list_table.setColumnWidth(4, 190)
+        self.list_table.setColumnWidth(5, 120)
         self.list_table.setColumnWidth(6, 105)
-        self.list_table.setColumnWidth(7, 90)
-        self.list_table.setColumnWidth(8, 245)
+        self.list_table.setColumnWidth(7, 105)
+        self.list_table.setColumnWidth(8, 90)
+        self.list_table.setColumnWidth(9, 245)
 
     def _setup_detail_table(self) -> None:
         table = self.detail_table
@@ -2282,6 +2358,7 @@ class ShipmentOrdersPage(QWidget):
                 "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS shipment_name VARCHAR(255) NOT NULL DEFAULT ''",
                 "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS manager_order_date DATE",
                 "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS factory_out_date DATE",
+                "ALTER TABLE mpps_shipments ADD COLUMN IF NOT EXISTS dispatch_buffer_days INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS stock_allocated_qty INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS production_required_qty INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS allocated_cavity_count INTEGER NOT NULL DEFAULT 0",
@@ -2290,156 +2367,284 @@ class ShipmentOrdersPage(QWidget):
                 "ALTER TABLE mpps_shipment_items ADD COLUMN IF NOT EXISTS schedule_reason TEXT NOT NULL DEFAULT ''",
             ]:
                 connection.execute(text(sql))
-            connection.execute(text("""
-                UPDATE mpps_shipments
-                SET manager_order_date = COALESCE(manager_order_date, created_at::date, shipment_date, CURRENT_DATE)
-                WHERE manager_order_date IS NULL
-            """))
-            connection.execute(text("""
-                UPDATE mpps_shipment_items
-                SET item_receive_date = COALESCE(item_receive_date, end_date, start_date)
-                WHERE item_receive_date IS NULL
-            """))
+            # Delivery dates are operational outputs. Schema initialization must
+            # never manufacture dates from CURRENT_DATE, shipment_date, or
+            # manager_order_date. A safe reconciliation only derives a shipment
+            # receive date when every positive-quantity item has a real receive
+            # date and the shipment is not waiting for target approval.
             self._recalculate_all_factory_out_dates(connection)
 
-    def _recalculate_all_factory_out_dates(self, connection) -> None:
-        connection.execute(text("""
-            UPDATE mpps_shipments s
-            SET factory_out_date = COALESCE(
-                (SELECT MAX(COALESCE(i.item_receive_date, i.end_date, i.start_date)) FROM mpps_shipment_items i WHERE i.shipment_id = s.id),
-                s.manager_order_date,
-                s.shipment_date,
-                CURRENT_DATE
+    @staticmethod
+    def _record_requires_target_approval(
+        shipment: dict | None,
+    ) -> bool:
+        data = dict(shipment or {})
+        status = str(data.get("status") or "").strip().lower()
+        planning_status = str(
+            data.get("planning_status") or ""
+        ).strip().lower()
+        target_source = str(
+            data.get("target_date_source") or ""
+        ).strip().lower()
+        return (
+            status
+            in {
+                "imported review",
+                "review required",
+                "draft import",
+                "excel review hold",
+            }
+            or planning_status == "review required"
+            or target_source == "excel import - date missing"
+        )
+
+    @staticmethod
+    def _review_required_sql(alias: str = "shipment") -> str:
+        return f"""
+            (
+                LOWER(COALESCE({alias}.status, '')) IN (
+                    'imported review',
+                    'review required',
+                    'draft import',
+                    'excel review hold'
+                )
+                OR LOWER(COALESCE({alias}.planning_status, ''))
+                    = 'review required'
+                OR LOWER(COALESCE({alias}.target_date_source, ''))
+                    = 'excel import - date missing'
             )
-        """))
+        """
+
+    def _recalculate_all_factory_out_dates(
+        self,
+        connection,
+    ) -> None:
+        self._reconcile_factory_out_dates(
+            connection
+        )
 
     def recalculate_shipment_factory_out_date(
         self,
         shipment_id: int,
     ) -> None:
         self.planner.ensure_schema()
-
         with engine.begin() as connection:
-            connection.execute(
-                text(
-                    """
-                    WITH calculated AS (
-                        SELECT
-                            shipment.id,
+            self._reconcile_factory_out_dates(
+                connection,
+                shipment_id=shipment_id,
+            )
+
+    def _reconcile_factory_out_dates(
+        self,
+        connection,
+        *,
+        shipment_id: int | None = None,
+    ) -> None:
+        review_sql = self._review_required_sql(
+            "shipment"
+        )
+        id_filter = (
+            "WHERE shipment.id = :shipment_id"
+            if shipment_id is not None
+            else ""
+        )
+        params = (
+            {"shipment_id": shipment_id}
+            if shipment_id is not None
+            else {}
+        )
+
+        connection.execute(
+            text(
+                f"""
+                WITH item_rollup AS (
+                    SELECT
+                        shipment_id,
+                        COUNT(*) FILTER (
+                            WHERE COALESCE(quantity, 0) > 0
+                        ) AS positive_item_count,
+                        COUNT(*) FILTER (
+                            WHERE COALESCE(quantity, 0) > 0
+                              AND COALESCE(
+                                    item_receive_date,
+                                    receive_date,
+                                    end_date,
+                                    start_date
+                                  ) IS NULL
+                        ) AS missing_receive_count,
+                        MAX(
                             COALESCE(
-                                MAX(
-                                    COALESCE(
-                                        item.item_receive_date,
-                                        item.receive_date,
-                                        item.end_date,
-                                        item.start_date
-                                    )
-                                ),
-                                shipment.factory_can_receive_date,
-                                shipment.factory_out_date,
-                                shipment.shipment_date,
-                                CURRENT_DATE
-                            ) AS factory_receive,
-                            CASE
-                                WHEN COALESCE(
-                                    shipment.target_date_is_manual,
-                                    FALSE
-                                )
-                                THEN COALESCE(
-                                    shipment.target_date,
-                                    shipment.manager_order_date,
-                                    shipment.plan_date,
-                                    shipment.shipment_date,
-                                    CURRENT_DATE
-                                )
-                                ELSE COALESCE(
-                                    MAX(
-                                        COALESCE(
-                                            item.item_receive_date,
-                                            item.receive_date,
-                                            item.end_date,
-                                            item.start_date
-                                        )
-                                    ),
-                                    shipment.factory_can_receive_date,
-                                    shipment.factory_out_date,
-                                    shipment.target_date,
-                                    shipment.manager_order_date,
-                                    shipment.plan_date,
-                                    shipment.shipment_date,
-                                    CURRENT_DATE
-                                )
-                            END AS effective_target
-                        FROM mpps_shipments shipment
-                        LEFT JOIN mpps_shipment_items item
-                          ON item.shipment_id = shipment.id
-                        WHERE shipment.id = :shipment_id
-                        GROUP BY
-                            shipment.id,
-                            shipment.target_date_is_manual,
-                            shipment.target_date,
-                            shipment.manager_order_date,
-                            shipment.plan_date,
-                            shipment.factory_can_receive_date,
-                            shipment.factory_out_date,
-                            shipment.shipment_date
-                    )
-                    UPDATE mpps_shipments shipment
-                    SET
-                        factory_out_date =
-                            calculated.factory_receive,
-                        factory_can_receive_date =
-                            calculated.factory_receive,
-                        target_date =
-                            calculated.effective_target,
-                        plan_date =
-                            calculated.effective_target,
-                        manager_order_date =
-                            calculated.effective_target,
-                        target_date_source = CASE
-                            WHEN COALESCE(
+                                item_receive_date,
+                                receive_date,
+                                end_date,
+                                start_date
+                            )
+                        ) AS latest_receive_date
+                    FROM mpps_shipment_items
+                    GROUP BY shipment_id
+                ),
+                calculated AS (
+                    SELECT
+                        shipment.id,
+                        shipment.shipment_date,
+                        shipment.target_date,
+                        shipment.plan_date,
+                        shipment.target_date_is_manual,
+                        shipment.target_date_source,
+                        shipment.planning_status,
+                        GREATEST(
+                            0,
+                            COALESCE(
+                                shipment.dispatch_buffer_days,
+                                0
+                            )
+                        ) AS dispatch_buffer_days,
+                        {review_sql} AS review_required,
+                        (
+                            NOT COALESCE(
                                 shipment.target_date_is_manual,
                                 FALSE
                             )
-                            THEN 'Manual'
-                            ELSE 'Automatic Factory Receive'
-                        END,
-                        delivery_status = CASE
-                            WHEN calculated.factory_receive
-                                < calculated.effective_target
-                            THEN 'Can Deliver Early'
-                            WHEN calculated.factory_receive
-                                = calculated.effective_target
-                            THEN 'On Time'
-                            ELSE 'Delayed'
-                        END,
-                        delay_days = CASE
-                            WHEN calculated.factory_receive
-                                > calculated.effective_target
-                            THEN (
-                                calculated.factory_receive
-                                - calculated.effective_target
+                            AND (
+                                shipment.target_date IS NULL
+                                OR LOWER(
+                                    COALESCE(
+                                        shipment.target_date_source,
+                                        ''
+                                    )
+                                ) LIKE 'auto%%'
+                                OR LOWER(
+                                    COALESCE(
+                                        shipment.target_date_source,
+                                        ''
+                                    )
+                                ) LIKE 'automatic%%'
                             )
-                            ELSE 0
-                        END,
-                        early_days = CASE
-                            WHEN calculated.factory_receive
-                                < calculated.effective_target
-                            THEN (
-                                calculated.effective_target
-                                - calculated.factory_receive
-                            )
-                            ELSE 0
-                        END,
-                        updated_at = CURRENT_TIMESTAMP
-                    FROM calculated
-                    WHERE shipment.id = calculated.id
-                    """
+                        ) AS auto_target,
+                        CASE
+                            WHEN {review_sql}
+                            THEN NULL
+                            WHEN COALESCE(
+                                item_rollup.positive_item_count,
+                                0
+                            ) <= 0
+                            THEN NULL
+                            WHEN COALESCE(
+                                item_rollup.missing_receive_count,
+                                0
+                            ) > 0
+                            THEN NULL
+                            ELSE item_rollup.latest_receive_date
+                        END AS verified_factory_receive
+                    FROM mpps_shipments shipment
+                    LEFT JOIN item_rollup
+                      ON item_rollup.shipment_id = shipment.id
+                    {id_filter}
                 ),
-                {
-                    "shipment_id": shipment_id,
-                },
-            )
+                dated AS (
+                    SELECT
+                        calculated.*,
+                        CASE
+                            WHEN verified_factory_receive IS NULL
+                            THEN NULL
+                            ELSE (
+                                verified_factory_receive
+                                + dispatch_buffer_days
+                            )
+                        END AS verified_factory_out
+                    FROM calculated
+                )
+                UPDATE mpps_shipments shipment
+                SET
+                    factory_can_receive_date =
+                        dated.verified_factory_receive,
+                    factory_out_date =
+                        dated.verified_factory_out,
+                    target_date = CASE
+                        WHEN dated.review_required
+                        THEN NULL
+                        WHEN dated.auto_target
+                        THEN dated.verified_factory_out
+                        ELSE shipment.target_date
+                    END,
+                    plan_date = CASE
+                        WHEN dated.auto_target
+                        THEN COALESCE(
+                            dated.verified_factory_out,
+                            shipment.shipment_date,
+                            shipment.plan_date
+                        )
+                        ELSE shipment.plan_date
+                    END,
+                    target_date_is_manual = CASE
+                        WHEN dated.auto_target
+                        THEN FALSE
+                        ELSE shipment.target_date_is_manual
+                    END,
+                    target_date_source = CASE
+                        WHEN dated.auto_target
+                        THEN 'Auto Earliest Feasible Factory Out'
+                        ELSE shipment.target_date_source
+                    END,
+                    delivery_status = CASE
+                        WHEN dated.review_required
+                        THEN 'Review Required'
+                        WHEN dated.auto_target
+                         AND dated.verified_factory_out IS NOT NULL
+                        THEN 'Auto Scheduled'
+                        WHEN dated.auto_target
+                         AND LOWER(
+                                COALESCE(
+                                    dated.planning_status,
+                                    ''
+                                )
+                             ) LIKE '%%blocked%%'
+                        THEN 'Blocked'
+                        WHEN dated.auto_target
+                        THEN 'Pending Planning'
+                        WHEN shipment.target_date IS NULL
+                        THEN 'Pending Target'
+                        WHEN dated.verified_factory_out IS NULL
+                        THEN 'Pending Planning'
+                        WHEN dated.verified_factory_out
+                            < shipment.target_date
+                        THEN 'Can Deliver Early'
+                        WHEN dated.verified_factory_out
+                            = shipment.target_date
+                        THEN 'On Time'
+                        ELSE 'Delayed'
+                    END,
+                    delay_days = CASE
+                        WHEN dated.auto_target
+                        THEN 0
+                        WHEN shipment.target_date IS NOT NULL
+                         AND dated.verified_factory_out
+                                > shipment.target_date
+                        THEN (
+                            dated.verified_factory_out
+                            - shipment.target_date
+                        )
+                        ELSE 0
+                    END,
+                    early_days = CASE
+                        WHEN dated.auto_target
+                        THEN 0
+                        WHEN shipment.target_date IS NOT NULL
+                         AND dated.verified_factory_out
+                                < shipment.target_date
+                        THEN (
+                            shipment.target_date
+                            - dated.verified_factory_out
+                        )
+                        ELSE 0
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM dated
+                WHERE shipment.id = dated.id
+                """
+            ),
+            params,
+        )
 
     def refresh_list(self) -> None:
         search = (
@@ -2514,14 +2719,28 @@ class ShipmentOrdersPage(QWidget):
                 SELECT
                     shipment_id,
                     COUNT(*) AS item_count,
+                    COALESCE(SUM(quantity), 0) AS total_quantity,
                     COALESCE(
-                        SUM(quantity),
-                        0
-                    ) AS total_quantity,
-                    COALESCE(
-                        SUM(stock_allocated_qty),
+                        SUM(
+                            GREATEST(
+                                0,
+                                LEAST(
+                                    COALESCE(quantity, 0),
+                                    COALESCE(stock_allocated_qty, 0)
+                                )
+                            )
+                        ),
                         0
                     ) AS stock_allocated,
+                    COUNT(*) FILTER (
+                        WHERE COALESCE(quantity, 0) > 0
+                          AND COALESCE(
+                                item_receive_date,
+                                receive_date,
+                                end_date,
+                                start_date
+                              ) IS NULL
+                    ) AS missing_receive_count,
                     MAX(
                         COALESCE(
                             item_receive_date,
@@ -2529,14 +2748,11 @@ class ShipmentOrdersPage(QWidget):
                             end_date,
                             start_date
                         )
-                    ) AS factory_can_receive_date,
+                    ) AS latest_receive_date,
                     STRING_AGG(
                         COALESCE(sap_code, '')
                         || ' '
-                        || COALESCE(
-                            item_description,
-                            ''
-                        ),
+                        || COALESCE(item_description, ''),
                         ' '
                     ) AS item_search_text
                 FROM mpps_shipment_items
@@ -2547,48 +2763,115 @@ class ShipmentOrdersPage(QWidget):
                     shipment.id AS shipment_pk,
                     shipment.shipment_no,
                     COALESCE(
-                        NULLIF(
-                            shipment.shipment_name,
-                            ''
-                        ),
+                        NULLIF(shipment.shipment_name, ''),
                         shipment.shipment_no
                     ) AS shipment_name,
                     shipment.customer_name,
+                    shipment.target_date AS target_date,
                     COALESCE(
-                        shipment.target_date,
-                        shipment.plan_date,
-                        shipment.manager_order_date,
-                        shipment.shipment_date
-                    ) AS target_date,
+                        NULLIF(
+                            shipment.target_date_source,
+                            ''
+                        ),
+                        'Auto Earliest Feasible Factory Out'
+                    ) AS target_date_source,
                     COALESCE(
-                        item.factory_can_receive_date,
-                        shipment.factory_can_receive_date,
-                        shipment.factory_out_date
-                    ) AS factory_can_receive_date,
-                    COALESCE(
-                        item.item_count,
-                        0
-                    ) AS item_count,
+                        shipment.target_date_is_manual,
+                        FALSE
+                    ) AS target_date_is_manual,
+                    (
+                        NOT COALESCE(
+                            shipment.target_date_is_manual,
+                            FALSE
+                        )
+                        AND (
+                            shipment.target_date IS NULL
+                            OR LOWER(
+                                COALESCE(
+                                    shipment.target_date_source,
+                                    ''
+                                )
+                            ) LIKE 'auto%'
+                            OR LOWER(
+                                COALESCE(
+                                    shipment.target_date_source,
+                                    ''
+                                )
+                            ) LIKE 'automatic%'
+                        )
+                    ) AS auto_target,
+                    CASE
+                        WHEN (
+                            LOWER(COALESCE(shipment.status, '')) IN (
+                                'imported review',
+                                'review required',
+                                'draft import',
+                                'excel review hold'
+                            )
+                            OR LOWER(
+                                COALESCE(shipment.planning_status, '')
+                            ) = 'review required'
+                            OR LOWER(
+                                COALESCE(shipment.target_date_source, '')
+                            ) = 'excel import - date missing'
+                        )
+                        THEN NULL
+                        WHEN COALESCE(item.missing_receive_count, 0) > 0
+                        THEN NULL
+                        ELSE COALESCE(
+                            shipment.factory_out_date,
+                            (
+                                item.latest_receive_date
+                                + GREATEST(
+                                    0,
+                                    COALESCE(
+                                        shipment.dispatch_buffer_days,
+                                        0
+                                    )
+                                )
+                            ),
+                            (
+                                shipment.factory_can_receive_date
+                                + GREATEST(
+                                    0,
+                                    COALESCE(
+                                        shipment.dispatch_buffer_days,
+                                        0
+                                    )
+                                )
+                            )
+                        )
+                    END AS factory_can_receive_date,
+                    COALESCE(item.item_count, 0) AS item_count,
                     COALESCE(
                         item.total_quantity,
                         shipment.total_qty,
                         0
                     ) AS total_quantity,
+                    COALESCE(item.stock_allocated, 0) AS stock_allocated,
+                    COALESCE(item.item_search_text, '') AS item_search_text,
                     COALESCE(
-                        item.stock_allocated,
-                        0
-                    ) AS stock_allocated,
-                    COALESCE(
-                        item.item_search_text,
-                        ''
-                    ) AS item_search_text,
-                    COALESCE(
-                        NULLIF(
-                            shipment.status,
-                            ''
-                        ),
+                        NULLIF(shipment.status, ''),
                         'Planned'
-                    ) AS shipment_status
+                    ) AS shipment_status,
+                    COALESCE(
+                        NULLIF(shipment.planning_status, ''),
+                        'Pending'
+                    ) AS planning_status,
+                    (
+                        LOWER(COALESCE(shipment.status, '')) IN (
+                            'imported review',
+                            'review required',
+                            'draft import',
+                            'excel review hold'
+                        )
+                        OR LOWER(
+                            COALESCE(shipment.planning_status, '')
+                        ) = 'review required'
+                        OR LOWER(
+                            COALESCE(shipment.target_date_source, '')
+                        ) = 'excel import - date missing'
+                    ) AS review_required
                 FROM mpps_shipments shipment
                 LEFT JOIN item_summary item
                     ON item.shipment_id = shipment.id
@@ -2597,40 +2880,53 @@ class ShipmentOrdersPage(QWidget):
                 SELECT
                     shipment_base.*,
                     CASE
-                        WHEN LOWER(
-                            shipment_status
-                        ) IN (
+                        WHEN LOWER(shipment_status) IN (
                             'cancelled',
                             'canceled'
                         )
                         THEN 'cancelled'
+                        WHEN review_required
+                        THEN 'review_required'
+                        WHEN auto_target
+                         AND target_date IS NOT NULL
+                         AND factory_can_receive_date IS NOT NULL
+                        THEN 'auto_scheduled'
                         WHEN target_date IS NULL
                         OR factory_can_receive_date IS NULL
                         THEN 'pending'
-                        WHEN factory_can_receive_date
-                            <= target_date
+                        WHEN LOWER(planning_status) IN (
+                            'blocked',
+                            'partially blocked',
+                            'pending replan',
+                            'pending planning'
+                        )
+                        THEN 'pending'
+                        WHEN factory_can_receive_date <= target_date
                         THEN 'can_meet'
                         ELSE 'cannot_meet'
                     END AS promise_state,
                     CASE
-                        WHEN target_date IS NULL
-                        OR factory_can_receive_date IS NULL
+                        WHEN review_required
+                          OR target_date IS NULL
+                          OR factory_can_receive_date IS NULL
                         THEN 0
                         ELSE (
-                            target_date
-                            - factory_can_receive_date
+                            target_date - factory_can_receive_date
                         )
                     END AS variance_days,
                     CASE
                         WHEN total_quantity > 0
-                        THEN LEAST(
-                            100,
-                            ROUND(
-                                (
-                                    stock_allocated::NUMERIC
-                                    / total_quantity
-                                ) * 100,
-                                1
+                        THEN GREATEST(
+                            0,
+                            LEAST(
+                                100,
+                                ROUND(
+                                    (
+                                        stock_allocated::NUMERIC
+                                        / total_quantity
+                                    ) * 100,
+                                    1
+                                )
                             )
                         )
                         ELSE 0
@@ -2641,6 +2937,8 @@ class ShipmentOrdersPage(QWidget):
             FROM shipment_ranked
             WHERE {where_sql}
             ORDER BY
+                CASE WHEN review_required THEN 2 ELSE 0 END,
+                CASE WHEN auto_target THEN 1 ELSE 0 END,
                 target_date ASC NULLS LAST,
                 factory_can_receive_date ASC NULLS LAST,
                 shipment_pk ASC
@@ -2720,7 +3018,7 @@ class ShipmentOrdersPage(QWidget):
             self._format_int(cannot_meet)
         )
         self.next_factory_out_label.setText(
-            "Next factory receive date: "
+            "Next Factory Can Out date: "
             f"{self._fmt_date(next_receive_date)}"
         )
         self.last_refresh_label.setText(
@@ -2758,6 +3056,14 @@ class ShipmentOrdersPage(QWidget):
                 self._fmt_date(
                     row["target_date"]
                 ),
+                (
+                    "AUTO"
+                    if row["auto_target"]
+                    else str(
+                        row["target_date_source"]
+                        or "MANUAL / EXCEL"
+                    )
+                ),
                 self._fmt_date(
                     row["factory_can_receive_date"]
                 ),
@@ -2787,7 +3093,7 @@ class ShipmentOrdersPage(QWidget):
                 )
 
                 if column in {
-                    0, 3, 4, 5, 6, 7,
+                    0, 3, 4, 5, 6, 7, 8,
                 }:
                     table_item.setTextAlignment(
                         Qt.AlignmentFlag.AlignCenter
@@ -2808,7 +3114,7 @@ class ShipmentOrdersPage(QWidget):
                         QColor("#dbeafe")
                     )
 
-                if column == 7:
+                if column == 8:
                     progress = float(
                         row["stock_progress_pct"] or 0
                     )
@@ -2839,13 +3145,13 @@ class ShipmentOrdersPage(QWidget):
                             QColor("#64748b")
                         )
 
-                if column == 8:
+                if column == 9:
                     self._style_promise_status(
                         table_item,
                         row["promise_state"],
                     )
 
-                if column in {1, 2, 8}:
+                if column in {1, 2, 4, 9}:
                     table_item.setToolTip(
                         str(value)
                     )
@@ -2901,6 +3207,71 @@ class ShipmentOrdersPage(QWidget):
                 shipment_id
             )
 
+    def change_selected_target_date(self) -> None:
+        if not self.selected_shipment_id:
+            self.on_list_selection_changed()
+        if not self.selected_shipment_id:
+            QMessageBox.information(
+                self,
+                "Shipment Required",
+                "Select a shipment before changing its Target Date.",
+            )
+            return
+        self.edit_target_date_for_shipment(
+            int(self.selected_shipment_id)
+        )
+
+    def reset_selected_to_auto_target(self) -> None:
+        if not self.selected_shipment_id:
+            self.on_list_selection_changed()
+        if not self.selected_shipment_id:
+            QMessageBox.information(
+                self,
+                "Shipment Required",
+                "Select a shipment before resetting its Auto Target.",
+            )
+            return
+        self._set_shipment_auto_target(
+            int(self.selected_shipment_id),
+            confirmation_required=True,
+        )
+
+    def replan_all_from_list(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Replan All Active Shipments",
+            "Run cumulative stock, mold, casing and cavity planning for "
+            "all active shipments now? Manual/Excel targets keep priority; "
+            "Auto Target shipments receive the earliest feasible Factory "
+            "Can Out date.",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            result = self.planner.replan_all_open_shipments(
+                trigger_reason="shipment_portfolio_replan_all",
+                created_by="shipment_orders",
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Replanning Failed",
+                str(exc),
+            )
+            return
+
+        self.refresh_list()
+        QMessageBox.information(
+            self,
+            "Replanning Complete",
+            f"Planning run #{result.planning_run_id or '-'} completed for "
+            f"{len(result.shipments):,} active shipments.",
+        )
+
     def open_selected_shipment(self) -> None:
         if not self.selected_shipment_id:
             self.on_list_selection_changed()
@@ -2911,10 +3282,9 @@ class ShipmentOrdersPage(QWidget):
         self,
         shipment_id: int,
     ) -> None:
-        self.recalculate_shipment_factory_out_date(
-            shipment_id
-        )
-
+        # Opening a detail page is read-only. Delivery dates are recalculated by
+        # the planner, explicit target-date approval, or integrity maintenance.
+        # A screen view must never change target or receive dates.
         shipment = self.get_shipment(
             shipment_id
         )
@@ -2958,27 +3328,138 @@ class ShipmentOrdersPage(QWidget):
                     SELECT
                         COUNT(id) AS items,
                         COALESCE(
-                            SUM(quantity),
+                            SUM(GREATEST(0, COALESCE(quantity, 0))),
                             0
                         ) AS qty,
                         COALESCE(
-                            SUM(stock_allocated_qty),
+                            SUM(
+                                GREATEST(
+                                    0,
+                                    LEAST(
+                                        GREATEST(
+                                            0,
+                                            COALESCE(quantity, 0)
+                                        ),
+                                        COALESCE(
+                                            stock_allocated_qty,
+                                            0
+                                        )
+                                    )
+                                )
+                            ),
                             0
                         ) AS stock_qty,
                         COALESCE(
-                            SUM(production_required_qty),
+                            SUM(
+                                GREATEST(
+                                    0,
+                                    GREATEST(
+                                        0,
+                                        COALESCE(quantity, 0)
+                                    )
+                                    - GREATEST(
+                                        0,
+                                        LEAST(
+                                            GREATEST(
+                                                0,
+                                                COALESCE(quantity, 0)
+                                            ),
+                                            COALESCE(
+                                                stock_allocated_qty,
+                                                0
+                                            )
+                                        )
+                                    )
+                                    - GREATEST(
+                                        0,
+                                        LEAST(
+                                            GREATEST(
+                                                0,
+                                                COALESCE(quantity, 0)
+                                            ),
+                                            COALESCE(
+                                                produced_qty,
+                                                0
+                                            )
+                                        )
+                                    )
+                                )
+                            ),
                             0
                         ) AS production_qty,
                         COALESCE(
-                            SUM(produced_qty),
+                            SUM(
+                                GREATEST(
+                                    0,
+                                    LEAST(
+                                        GREATEST(
+                                            0,
+                                            COALESCE(quantity, 0)
+                                        ),
+                                        COALESCE(produced_qty, 0)
+                                    )
+                                )
+                            ),
                             0
                         ) AS produced_qty,
                         COALESCE(
-                            SUM(completed_qty),
+                            SUM(
+                                GREATEST(
+                                    0,
+                                    LEAST(
+                                        GREATEST(
+                                            0,
+                                            COALESCE(quantity, 0)
+                                        ),
+                                        GREATEST(
+                                            0,
+                                            COALESCE(
+                                                stock_allocated_qty,
+                                                0
+                                            )
+                                        )
+                                        + GREATEST(
+                                            0,
+                                            COALESCE(produced_qty, 0)
+                                        )
+                                    )
+                                )
+                            ),
                             0
                         ) AS completed_qty,
                         COALESCE(
-                            SUM(remaining_qty),
+                            SUM(
+                                GREATEST(
+                                    0,
+                                    GREATEST(
+                                        0,
+                                        COALESCE(quantity, 0)
+                                    )
+                                    - GREATEST(
+                                        0,
+                                        LEAST(
+                                            GREATEST(
+                                                0,
+                                                COALESCE(quantity, 0)
+                                            ),
+                                            GREATEST(
+                                                0,
+                                                COALESCE(
+                                                    stock_allocated_qty,
+                                                    0
+                                                )
+                                            )
+                                            + GREATEST(
+                                                0,
+                                                COALESCE(
+                                                    produced_qty,
+                                                    0
+                                                )
+                                            )
+                                        )
+                                    )
+                                )
+                            ),
                             0
                         ) AS remaining_qty,
                         MIN(
@@ -2997,19 +3478,65 @@ class ShipmentOrdersPage(QWidget):
                                 start_date
                             )
                         ) AS factory_receive_date,
+                        COUNT(*) FILTER (
+                            WHERE COALESCE(quantity, 0) > 0
+                              AND COALESCE(
+                                    item_receive_date,
+                                    receive_date,
+                                    end_date,
+                                    start_date
+                                  ) IS NULL
+                        ) AS missing_receive_count,
                         ROUND(
                             CASE
                                 WHEN COALESCE(
-                                    SUM(quantity),
+                                    SUM(
+                                        GREATEST(
+                                            0,
+                                            COALESCE(quantity, 0)
+                                        )
+                                    ),
                                     0
                                 ) > 0
                                 THEN (
                                     COALESCE(
-                                        SUM(completed_qty),
+                                        SUM(
+                                            GREATEST(
+                                                0,
+                                                LEAST(
+                                                    GREATEST(
+                                                        0,
+                                                        COALESCE(
+                                                            quantity,
+                                                            0
+                                                        )
+                                                    ),
+                                                    GREATEST(
+                                                        0,
+                                                        COALESCE(
+                                                            stock_allocated_qty,
+                                                            0
+                                                        )
+                                                    )
+                                                    + GREATEST(
+                                                        0,
+                                                        COALESCE(
+                                                            produced_qty,
+                                                            0
+                                                        )
+                                                    )
+                                                )
+                                            )
+                                        ),
                                         0
                                     )::numeric
                                     /
-                                    SUM(quantity)
+                                    SUM(
+                                        GREATEST(
+                                            0,
+                                            COALESCE(quantity, 0)
+                                        )
+                                    )
                                     * 100
                                 )
                                 ELSE 0
@@ -3033,12 +3560,116 @@ class ShipmentOrdersPage(QWidget):
                         id,
                         sap_code,
                         item_description,
-                        quantity,
-                        stock_allocated_qty,
-                        production_required_qty,
-                        produced_qty,
-                        completed_qty,
-                        remaining_qty,
+                        GREATEST(
+                            0,
+                            COALESCE(quantity, 0)
+                        ) AS quantity,
+                        GREATEST(
+                            0,
+                            LEAST(
+                                GREATEST(
+                                    0,
+                                    COALESCE(quantity, 0)
+                                ),
+                                COALESCE(
+                                    stock_allocated_qty,
+                                    0
+                                )
+                            )
+                        ) AS stock_allocated_qty,
+                        GREATEST(
+                            0,
+                            GREATEST(
+                                0,
+                                COALESCE(quantity, 0)
+                            )
+                            - GREATEST(
+                                0,
+                                LEAST(
+                                    GREATEST(
+                                        0,
+                                        COALESCE(quantity, 0)
+                                    ),
+                                    COALESCE(
+                                        stock_allocated_qty,
+                                        0
+                                    )
+                                )
+                            )
+                            - GREATEST(
+                                0,
+                                LEAST(
+                                    GREATEST(
+                                        0,
+                                        COALESCE(quantity, 0)
+                                    ),
+                                    COALESCE(
+                                        produced_qty,
+                                        0
+                                    )
+                                )
+                            )
+                        ) AS production_required_qty,
+                        GREATEST(
+                            0,
+                            LEAST(
+                                GREATEST(
+                                    0,
+                                    COALESCE(quantity, 0)
+                                ),
+                                COALESCE(produced_qty, 0)
+                            )
+                        ) AS produced_qty,
+                        GREATEST(
+                            0,
+                            LEAST(
+                                GREATEST(
+                                    0,
+                                    COALESCE(quantity, 0)
+                                ),
+                                GREATEST(
+                                    0,
+                                    COALESCE(
+                                        stock_allocated_qty,
+                                        0
+                                    )
+                                )
+                                + GREATEST(
+                                    0,
+                                    COALESCE(produced_qty, 0)
+                                )
+                            )
+                        ) AS completed_qty,
+                        GREATEST(
+                            0,
+                            GREATEST(
+                                0,
+                                COALESCE(quantity, 0)
+                            )
+                            - GREATEST(
+                                0,
+                                LEAST(
+                                    GREATEST(
+                                        0,
+                                        COALESCE(quantity, 0)
+                                    ),
+                                    GREATEST(
+                                        0,
+                                        COALESCE(
+                                            stock_allocated_qty,
+                                            0
+                                        )
+                                    )
+                                    + GREATEST(
+                                        0,
+                                        COALESCE(
+                                            produced_qty,
+                                            0
+                                        )
+                                    )
+                                )
+                            )
+                        ) AS remaining_qty,
                         COALESCE(
                             allocated_cavity_count,
                             allocated_cavities,
@@ -3051,7 +3682,46 @@ class ShipmentOrdersPage(QWidget):
                             end_date,
                             start_date
                         ) AS item_receive_date,
-                        progress_pct,
+                        CASE
+                            WHEN GREATEST(
+                                0,
+                                COALESCE(quantity, 0)
+                            ) > 0
+                            THEN ROUND(
+                                (
+                                    GREATEST(
+                                        0,
+                                        LEAST(
+                                            GREATEST(
+                                                0,
+                                                COALESCE(quantity, 0)
+                                            ),
+                                            GREATEST(
+                                                0,
+                                                COALESCE(
+                                                    stock_allocated_qty,
+                                                    0
+                                                )
+                                            )
+                                            + GREATEST(
+                                                0,
+                                                COALESCE(
+                                                    produced_qty,
+                                                    0
+                                                )
+                                            )
+                                        )
+                                    )::NUMERIC
+                                    /
+                                    GREATEST(
+                                        0,
+                                        COALESCE(quantity, 0)
+                                    )
+                                ) * 100,
+                                1
+                            )
+                            ELSE 0
+                        END AS progress_pct,
                         item_status,
                         COALESCE(
                             NULLIF(
@@ -3086,50 +3756,143 @@ class ShipmentOrdersPage(QWidget):
 
         stats = dict(stats or {})
 
+        shipment_status = str(
+            shipment.get("status") or ""
+        ).strip()
+        planning_status = str(
+            shipment.get("planning_status")
+            or shipment_status
+            or "Pending"
+        )
+        target_source_raw = str(
+            shipment.get("target_date_source") or ""
+        ).strip()
+        review_required = (
+            shipment_status.lower()
+            in {
+                "imported review",
+                "review required",
+                "draft import",
+                "excel review hold",
+            }
+            or planning_status.lower() == "review required"
+            or target_source_raw.lower()
+                == "excel import - date missing"
+        )
+
+        # Excel snapshots without a target are automatically scheduled. The
+        # earliest verified Factory Can Out date becomes an editable Auto Target.
         target_date = (
-            shipment.get("target_date")
-            or shipment.get(
-                "manager_order_date"
-            )
-            or shipment.get("plan_date")
+            None
+            if review_required
+            else shipment.get("target_date")
         )
-        factory_receive_date = (
-            shipment.get(
-                "factory_can_receive_date"
-            )
-            or shipment.get(
-                "factory_out_date"
-            )
-            or stats.get(
-                "factory_receive_date"
-            )
-        )
-        target_source = str(
-            shipment.get(
-                "target_date_source"
-            )
-            or (
-                "Manual"
-                if shipment.get(
+        auto_target = (
+            not review_required
+            and not bool(
+                shipment.get(
                     "target_date_is_manual"
                 )
-                else "Automatic Factory Receive"
+            )
+            and (
+                target_date is None
+                or target_source_raw.lower().startswith(
+                    "auto"
+                )
+                or target_source_raw.lower().startswith(
+                    "automatic"
+                )
             )
         )
-        delivery_status = str(
-            shipment.get(
-                "delivery_status"
-            )
-            or shipment.get("status")
-            or "Pending"
+
+        missing_receive_count = int(
+            stats.get("missing_receive_count") or 0
         )
-        planning_status = str(
-            shipment.get(
-                "planning_status"
-            )
-            or shipment.get("status")
-            or "Pending"
+        verified_item_receive_date = (
+            stats.get("factory_receive_date")
+            if missing_receive_count <= 0
+            else None
         )
+        dispatch_buffer_days = max(
+            0,
+            int(
+                shipment.get(
+                    "dispatch_buffer_days"
+                )
+                or 0
+            ),
+        )
+        factory_receive_date = (
+            None
+            if review_required
+            else (
+                verified_item_receive_date
+                or (
+                    shipment.get(
+                        "factory_can_receive_date"
+                    )
+                    if missing_receive_count <= 0
+                    else None
+                )
+            )
+        )
+        factory_out_date = (
+            None
+            if review_required
+            else (
+                (
+                    shipment.get(
+                        "factory_out_date"
+                    )
+                    if missing_receive_count <= 0
+                    else None
+                )
+                or (
+                    factory_receive_date
+                    + timedelta(
+                        days=dispatch_buffer_days
+                    )
+                    if factory_receive_date
+                    is not None
+                    else None
+                )
+            )
+        )
+
+        if auto_target and factory_out_date is not None:
+            target_date = factory_out_date
+
+        if review_required:
+            target_source = (
+                "Excel Import — Legacy Approval Required"
+            )
+            delivery_status = "Review Required"
+            planning_status = "Review Required"
+        elif auto_target:
+            target_source = (
+                "Auto Earliest Feasible Factory Out"
+            )
+            if factory_out_date is not None:
+                delivery_status = "Auto Scheduled"
+            elif "blocked" in planning_status.lower():
+                delivery_status = "Blocked"
+            else:
+                delivery_status = "Pending Planning"
+        else:
+            target_source = (
+                target_source_raw
+                or "Manual / Excel Approved"
+            )
+            if target_date is None:
+                delivery_status = "Pending Target"
+            elif factory_out_date is None:
+                delivery_status = "Pending Planning"
+            elif factory_out_date < target_date:
+                delivery_status = "Can Deliver Early"
+            elif factory_out_date == target_date:
+                delivery_status = "On Time"
+            else:
+                delivery_status = "Delayed"
 
         def format_datetime(value) -> str:
             if value is None:
@@ -3227,34 +3990,74 @@ class ShipmentOrdersPage(QWidget):
         self.info_customer.setText(
             f"Customer / Destination: {customer}"
         )
+        target_display = (
+            "Approval Required"
+            if review_required
+            else (
+                "Auto Planning"
+                if auto_target
+                and target_date is None
+                else self._fmt_date(
+                    target_date
+                )
+            )
+        )
+        out_display = (
+            "Pending Approval"
+            if review_required
+            else (
+                "Pending Planning"
+                if factory_out_date is None
+                else self._fmt_date(
+                    factory_out_date
+                )
+            )
+        )
+
         self.info_target_date.setText(
-            "Target / Priority Date: "
-            f"{self._fmt_date(target_date)}"
+            (
+                "Auto Target Date: "
+                if auto_target
+                else "Target / Priority Date: "
+            )
+            + f"{target_display}"
         )
         self.info_factory_receive.setText(
-            "Factory Can Receive: "
-            f"{self._fmt_date(factory_receive_date)}"
+            "Factory Can Out: "
+            f"{out_display}"
         )
 
         self.detail_target_date_value.setText(
-            self._fmt_date(target_date)
+            target_display
         )
         self.detail_factory_receive_date_value.setText(
-            self._fmt_date(factory_receive_date)
+            out_display
         )
 
-        if (
+        if auto_target:
+            if factory_out_date is not None:
+                variance_text = (
+                    "Auto target = Factory Can Out"
+                )
+                variance_color = "#1d4ed8"
+            elif "blocked" in planning_status.lower():
+                variance_text = "Blocked — review item reasons"
+                variance_color = "#b91c1c"
+            else:
+                variance_text = "Pending auto planning"
+                variance_color = "#92400e"
+        elif (
             target_date is not None
-            and factory_receive_date is not None
+            and factory_out_date is not None
             and hasattr(target_date, "toordinal")
             and hasattr(
-                factory_receive_date,
+                factory_out_date,
                 "toordinal",
             )
         ):
             variance_days = (
                 target_date
-                - factory_receive_date
+                - factory_out_date
             ).days
 
             if variance_days > 0:
@@ -3271,7 +4074,12 @@ class ShipmentOrdersPage(QWidget):
                 variance_text = "On target"
                 variance_color = "#047857"
         else:
-            variance_text = "Pending"
+            if review_required:
+                variance_text = "Pending approval"
+            elif target_date is None:
+                variance_text = "Pending target"
+            else:
+                variance_text = "Pending planning"
             variance_color = "#92400e"
 
         self.detail_delivery_variance_value.setText(
@@ -3663,13 +4471,58 @@ class ShipmentOrdersPage(QWidget):
             data["customer_name"] = data["shipment_no"]
         try:
             with engine.begin() as connection:
-                shipment_id = connection.execute(text("""
-                    INSERT INTO mpps_shipments
-                        (shipment_no, shipment_name, customer_name, shipment_date, manager_order_date, factory_out_date, status, note, updated_at)
-                    VALUES
-                        (:shipment_no, :shipment_name, :customer_name, :shipment_date, :manager_order_date, :manager_order_date, :status, :note, CURRENT_TIMESTAMP)
-                    RETURNING id;
-                """), data).scalar_one()
+                shipment_id = connection.execute(
+                    text(
+                        """
+                        INSERT INTO mpps_shipments
+                        (
+                            shipment_no,
+                            shipment_name,
+                            customer_name,
+                            shipment_date,
+                            manager_order_date,
+                            target_date,
+                            plan_date,
+                            target_date_is_manual,
+                            target_date_source,
+                            factory_can_receive_date,
+                            factory_out_date,
+                            delivery_status,
+                            planning_status,
+                            planning_note,
+                            delay_days,
+                            early_days,
+                            status,
+                            note,
+                            updated_at
+                        )
+                        VALUES
+                        (
+                            :shipment_no,
+                            :shipment_name,
+                            :customer_name,
+                            :shipment_date,
+                            :manager_order_date,
+                            :manager_order_date,
+                            :manager_order_date,
+                            TRUE,
+                            'Manual',
+                            NULL,
+                            NULL,
+                            'Pending Planning',
+                            'Pending Replan',
+                            'Shipment created; waiting for cumulative planning.',
+                            0,
+                            0,
+                            :status,
+                            :note,
+                            CURRENT_TIMESTAMP
+                        )
+                        RETURNING id
+                        """
+                    ),
+                    data,
+                ).scalar_one()
             self.refresh_list()
             self.open_shipment_detail(int(shipment_id))
         except Exception as exc:
@@ -3688,59 +4541,189 @@ class ShipmentOrdersPage(QWidget):
             self._edit_shipment_header(int(self.current_shipment_id))
             self.open_shipment_detail(int(self.current_shipment_id))
 
-    def _edit_shipment_header(self, shipment_id: int) -> None:
-        shipment = self.get_shipment(shipment_id)
-        if not shipment:
+    def _edit_shipment_header(
+        self,
+        shipment_id: int,
+    ) -> None:
+        shipment_row = self.get_shipment(
+            shipment_id
+        )
+        if not shipment_row:
             return
-        dialog = ShipmentDialog(self, dict(shipment))
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        shipment = dict(shipment_row)
+
+        dialog = ShipmentDialog(
+            self,
+            shipment,
+        )
+        if (
+            dialog.exec()
+            != QDialog.DialogCode.Accepted
+        ):
             return
         data = dialog.get_data()
         data["id"] = shipment_id
+
         if not data["shipment_no"]:
-            QMessageBox.warning(self, "Shipment Required", "Please enter shipment ID / name.")
+            QMessageBox.warning(
+                self,
+                "Shipment Required",
+                "Please enter shipment ID / name.",
+            )
             return
         if not data["customer_name"]:
-            data["customer_name"] = data["shipment_no"]
+            data["customer_name"] = (
+                data["shipment_no"]
+            )
+
         try:
             with engine.begin() as connection:
-                connection.execute(text("""
-                    UPDATE mpps_shipments
-                    SET shipment_no = :shipment_no,
-                        shipment_name = :shipment_name,
-                        customer_name = :customer_name,
-                        shipment_date = :shipment_date,
-                        manager_order_date = :manager_order_date,
-                        status = :status,
-                        note = :note,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = :id;
-                """), data)
-            self.recalculate_shipment_factory_out_date(shipment_id)
+                connection.execute(
+                    text(
+                        """
+                        UPDATE mpps_shipments
+                        SET
+                            shipment_no =
+                                :shipment_no,
+                            shipment_name =
+                                :shipment_name,
+                            customer_name =
+                                :customer_name,
+                            shipment_date =
+                                :shipment_date,
+                            manager_order_date =
+                                :manager_order_date,
+                            status = :status,
+                            note = :note,
+                            planning_status =
+                                'Pending Replan',
+                            planning_note =
+                                'Shipment header changed; '
+                                'cumulative replanning requested.',
+                            factory_can_receive_date = NULL,
+                            factory_out_date = NULL,
+                            delivery_status =
+                                'Pending Planning',
+                            delay_days = 0,
+                            early_days = 0,
+                            last_replanned_at = NULL,
+                            updated_at =
+                                CURRENT_TIMESTAMP
+                        WHERE id = :id
+                        """
+                    ),
+                    data,
+                )
+
+            self.planner.replan_all_open_shipments(
+                trigger_reason=(
+                    "shipment_header_edited_"
+                    f"{shipment_id}"
+                ),
+                created_by=(
+                    "shipment_details"
+                ),
+            )
             self.refresh_list()
+
         except Exception as exc:
-            QMessageBox.critical(self, "Edit Failed", str(exc))
+            QMessageBox.critical(
+                self,
+                "Edit Failed",
+                str(exc),
+            )
 
     def move_selected_shipment_date(self, delta_days: int) -> None:
         if not self.selected_shipment_id:
             self.on_list_selection_changed()
         if not self.selected_shipment_id:
-            QMessageBox.information(self, "Select Shipment", "Please select a shipment row first.")
+            QMessageBox.information(
+                self,
+                "Select Shipment",
+                "Please select a shipment row first.",
+            )
             return
+
         shipment_id = int(self.selected_shipment_id)
+        shipment_row = self.get_shipment(shipment_id)
+        if not shipment_row:
+            return
+        shipment = dict(shipment_row)
+
+        if self._record_requires_target_approval(
+            shipment
+        ):
+            QMessageBox.information(
+                self,
+                "Target Approval Required",
+                "This imported shipment has no approved target date. "
+                "Open Shipment Details and use Change Target Date to "
+                "approve a manual target date first.",
+            )
+            return
+
+        if shipment.get("target_date") is None:
+            QMessageBox.information(
+                self,
+                "Target Date Missing",
+                "This shipment has no target date to move.",
+            )
+            return
+
         try:
             with engine.begin() as connection:
-                connection.execute(text("""
-                    UPDATE mpps_shipments
-                    SET manager_order_date = COALESCE(manager_order_date, shipment_date, CURRENT_DATE) + (:delta_days * INTERVAL '1 day'),
-                        shipment_date = COALESCE(manager_order_date, shipment_date, CURRENT_DATE) + (:delta_days * INTERVAL '1 day'),
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = :shipment_id;
-                """), {"shipment_id": shipment_id, "delta_days": delta_days})
-            self.recalculate_shipment_factory_out_date(shipment_id)
+                connection.execute(
+                    text(
+                        """
+                        UPDATE mpps_shipments
+                        SET
+                            target_date =
+                                target_date
+                                + (
+                                    :delta_days
+                                    * INTERVAL '1 day'
+                                  ),
+                            plan_date =
+                                target_date
+                                + (
+                                    :delta_days
+                                    * INTERVAL '1 day'
+                                  ),
+                            target_date_is_manual = TRUE,
+                            target_date_source = 'Manual Approved',
+                            factory_can_receive_date = NULL,
+                            factory_out_date = NULL,
+                            delivery_status =
+                                'Pending Planning',
+                            planning_status =
+                                'Pending Replan',
+                            delay_days = 0,
+                            early_days = 0,
+                            updated_at =
+                                CURRENT_TIMESTAMP
+                        WHERE id = :shipment_id
+                        """
+                    ),
+                    {
+                        "shipment_id": shipment_id,
+                        "delta_days": delta_days,
+                    },
+                )
+
+            self.planner.replan_all_open_shipments(
+                trigger_reason=(
+                    "shipment_priority_date_moved_"
+                    f"{shipment_id}"
+                ),
+                created_by="shipment_orders",
+            )
             self.refresh_list()
         except Exception as exc:
-            QMessageBox.critical(self, "Move Date Failed", str(exc))
+            QMessageBox.critical(
+                self,
+                "Move Date Failed",
+                str(exc),
+            )
 
     def add_item(self) -> None:
         if not self.current_shipment_id:
@@ -3818,6 +4801,15 @@ class ShipmentOrdersPage(QWidget):
         shipment_id = int(
             self.current_shipment_id
         )
+        same_sap_code = (
+            str(original.get("sap_code") or "").strip()
+            == str(data.get("sap_code") or "").strip()
+        )
+        preserved_produced_qty = (
+            max(0, int(original.get("produced_qty") or 0))
+            if same_sap_code
+            else 0
+        )
 
         try:
             with engine.begin() as connection:
@@ -3837,13 +4829,23 @@ class ShipmentOrdersPage(QWidget):
                             item_receive_date = NULL,
                             item_status = 'Pending',
                             schedule_reason =
-                                'Awaiting automatic replanning.',
+                                'Awaiting automatic cumulative replanning.',
                             stock_allocated_qty = 0,
+                            produced_qty =
+                                :produced_qty,
+                            completed_qty =
+                                LEAST(
+                                    GREATEST(:quantity, 0),
+                                    GREATEST(
+                                        :produced_qty,
+                                        0
+                                    )
+                                ),
                             production_required_qty =
                                 GREATEST(
                                     :quantity
-                                    - COALESCE(
-                                        produced_qty,
+                                    - GREATEST(
+                                        :produced_qty,
                                         0
                                     ),
                                     0
@@ -3852,12 +4854,28 @@ class ShipmentOrdersPage(QWidget):
                             allocated_cavities = 0,
                             daily_capacity = 0,
                             production_days = 0,
-                            progress_pct = 0,
+                            progress_pct = CASE
+                                WHEN :quantity > 0
+                                THEN ROUND(
+                                    (
+                                        LEAST(
+                                            :quantity,
+                                            GREATEST(
+                                                :produced_qty,
+                                                0
+                                            )
+                                        )::NUMERIC
+                                        / :quantity
+                                    ) * 100,
+                                    2
+                                )
+                                ELSE 0
+                            END,
                             remaining_qty =
                                 GREATEST(
                                     :quantity
-                                    - COALESCE(
-                                        completed_qty,
+                                    - GREATEST(
+                                        :produced_qty,
                                         0
                                     ),
                                     0
@@ -3875,6 +4893,7 @@ class ShipmentOrdersPage(QWidget):
                         ),
                         "quantity": data["quantity"],
                         "note": data["note"],
+                        "produced_qty": preserved_produced_qty,
                     },
                 )
 
@@ -4064,11 +5083,42 @@ class ShipmentOrdersPage(QWidget):
                     raise RuntimeError(
                         "Selected shipment item was not deleted."
                     )
+            replan_error = ""
+            try:
+                self.planner.replan_all_open_shipments(
+                    trigger_reason=(
+                        "shipment_item_deleted_"
+                        f"{item_id}"
+                    ),
+                    created_by="shipment_details",
+                )
+            except Exception as planner_exc:
+                replan_error = str(planner_exc)
+
             if self.current_shipment_id:
-                self.recalculate_shipment_factory_out_date(int(self.current_shipment_id))
-                self.open_shipment_detail(int(self.current_shipment_id))
+                self.recalculate_shipment_factory_out_date(
+                    int(self.current_shipment_id)
+                )
+                self.open_shipment_detail(
+                    int(self.current_shipment_id)
+                )
+            self.refresh_list()
+
+            if replan_error:
+                QMessageBox.warning(
+                    self,
+                    "Item Deleted — Replan Required",
+                    "The item was deleted, but automatic replanning "
+                    "did not complete. Run Production Planning before "
+                    "using delivery dates.\n\n"
+                    f"Reason: {replan_error}",
+                )
         except Exception as exc:
-            QMessageBox.critical(self, "Delete Item Failed", str(exc))
+            QMessageBox.critical(
+                self,
+                "Delete Item Failed",
+                str(exc),
+            )
 
     def delete_current_shipment(self) -> None:
         if not self.current_shipment_id:
@@ -4262,6 +5312,18 @@ class ShipmentOrdersPage(QWidget):
                 shipment["shipment_no"]
             )
 
+            replan_error = ""
+            try:
+                self.planner.replan_all_open_shipments(
+                    trigger_reason=(
+                        "shipment_deleted_"
+                        f"{shipment_id}"
+                    ),
+                    created_by="shipment_details",
+                )
+            except Exception as planner_exc:
+                replan_error = str(planner_exc)
+
             self.current_shipment_id = None
             self.selected_shipment_id = None
             self.selected_item_id = None
@@ -4278,6 +5340,14 @@ class ShipmentOrdersPage(QWidget):
                     f"Shipment "
                     f"{deleted_shipment_no} "
                     "was deleted successfully."
+                    + (
+                        "\n\nAutomatic replanning did not complete. "
+                        "Run Production Planning before relying on "
+                        "delivery dates.\nReason: "
+                        + replan_error
+                        if replan_error
+                        else ""
+                    )
                 ),
             )
 
@@ -4358,9 +5428,14 @@ class ShipmentOrdersPage(QWidget):
             self.selected_shipment_id = int(
                 shipment_id
             )
-            self.open_shipment_detail(
-                int(shipment_id)
-            )
+            if column == 3:
+                self.edit_target_date_for_shipment(
+                    int(shipment_id)
+                )
+            else:
+                self.open_shipment_detail(
+                    int(shipment_id)
+                )
 
     def on_detail_cell_double_clicked(
         self,
@@ -4530,28 +5605,45 @@ class ShipmentOrdersPage(QWidget):
             return
 
         shipment = dict(shipment_row)
-
+        current_source = str(
+            shipment.get(
+                "target_date_source"
+            )
+            or ""
+        ).strip()
+        current_auto = (
+            not bool(
+                shipment.get(
+                    "target_date_is_manual"
+                )
+            )
+            and (
+                shipment.get("target_date")
+                is None
+                or current_source.lower().startswith(
+                    "auto"
+                )
+                or current_source.lower().startswith(
+                    "automatic"
+                )
+            )
+        )
         current_target = (
             shipment.get("target_date")
-            or shipment.get("plan_date")
-            or shipment.get("manager_order_date")
-            or shipment.get("factory_can_receive_date")
-            or shipment.get("shipment_date")
             or date.today()
         )
-        factory_receive = (
-            shipment.get("factory_can_receive_date")
-            or shipment.get("factory_out_date")
-        )
-        is_manual = bool(
-            shipment.get("target_date_is_manual")
+        factory_out = (
+            shipment.get("factory_out_date")
+            or shipment.get(
+                "factory_can_receive_date"
+            )
         )
 
         dialog = QDialog(self)
         dialog.setWindowTitle(
-            "Change Shipment Target Date"
+            "Shipment Target & Schedule Control"
         )
-        dialog.setMinimumWidth(560)
+        dialog.setMinimumWidth(650)
 
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(
@@ -4563,48 +5655,57 @@ class ShipmentOrdersPage(QWidget):
         layout.setSpacing(14)
 
         title = QLabel(
-            "Shipment Target Date Control"
+            "Shipment Target & Schedule Control"
         )
         title.setObjectName("SectionTitle")
 
         shipment_label = QLabel(
             "Shipment: "
-            f"{shipment.get('shipment_no') or shipment_id}"
+            f"{shipment.get('shipment_name') or shipment.get('shipment_no') or shipment_id}"
         )
-        shipment_label.setObjectName("InfoLabel")
+        shipment_label.setObjectName(
+            "InfoLabel"
+        )
 
         current_label = QLabel(
-            "Current Target Date: "
-            f"{self._fmt_date(current_target)}"
+            "Current Target: "
+            f"{self._fmt_date(shipment.get('target_date'))}"
+            f"  |  Source: {current_source or '-'}"
         )
-        current_label.setObjectName("InfoLabel")
+        current_label.setObjectName(
+            "InfoLabel"
+        )
 
-        receive_label = QLabel(
-            "Factory Can Receive Date: "
-            f"{self._fmt_date(factory_receive)}"
+        out_label = QLabel(
+            "Current Factory Can Out: "
+            f"{self._fmt_date(factory_out)}"
         )
-        receive_label.setObjectName("InfoLabel")
+        out_label.setObjectName(
+            "InfoLabel"
+        )
 
         note = QLabel(
-            "Changing the Target Date changes shipment priority. "
-            "All active shipments will be replanned so stock, mold, "
-            "casing and cavity capacity cannot be double-booked."
+            "Auto Target calculates the earliest feasible Factory Can Out "
+            "date from cumulative stock, mold, casing and cavity capacity. "
+            "Manual Target locks the selected date and changes shipment "
+            "priority. Saving always replans the complete active queue."
         )
         note.setObjectName("Hint")
         note.setWordWrap(True)
 
         automatic_checkbox = QCheckBox(
-            "Use automatic Target Date from "
-            "Factory Can Receive Date"
+            "Use Auto Target = earliest feasible Factory Can Out date"
         )
         automatic_checkbox.setChecked(
-            not is_manual
+            current_auto
         )
 
         date_label = QLabel(
-            "Manual Target Date"
+            "Manual Target / Priority Date"
         )
-        date_label.setObjectName("InfoLabel")
+        date_label.setObjectName(
+            "InfoLabel"
+        )
 
         target_editor = QDateEdit()
         target_editor.setCalendarPopup(True)
@@ -4617,19 +5718,50 @@ class ShipmentOrdersPage(QWidget):
         target_editor.setMaximumDate(
             QDate(2100, 12, 31)
         )
+        target_editor.setDate(
+            QDate(
+                current_target.year,
+                current_target.month,
+                current_target.day,
+            )
+        )
 
-        if hasattr(current_target, "year"):
-            target_editor.setDate(
-                QDate(
-                    current_target.year,
-                    current_target.month,
-                    current_target.day,
-                )
+        buffer_label = QLabel(
+            "Dispatch / handling buffer after Factory Can Receive"
+        )
+        buffer_label.setObjectName(
+            "InfoLabel"
+        )
+        dispatch_buffer = QSpinBox()
+        dispatch_buffer.setRange(0, 30)
+        dispatch_buffer.setSuffix(
+            " day"
+        )
+        dispatch_buffer.setSpecialValueText(
+            "0 days"
+        )
+        dispatch_buffer.setValue(
+            max(
+                0,
+                int(
+                    shipment.get(
+                        "dispatch_buffer_days"
+                    )
+                    or 0
+                ),
             )
-        else:
-            target_editor.setDate(
-                QDate.currentDate()
-            )
+        )
+
+        reason_label = QLabel(
+            "Reason / scheduling note"
+        )
+        reason_label.setObjectName(
+            "InfoLabel"
+        )
+        reason_input = QLineEdit()
+        reason_input.setPlaceholderText(
+            "Optional reason for manual date change or auto reset"
+        )
 
         def sync_editor_state(
             checked: bool,
@@ -4652,6 +5784,11 @@ class ShipmentOrdersPage(QWidget):
             QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Cancel
         )
+        buttons.button(
+            QDialogButtonBox.StandardButton.Save
+        ).setText(
+            "Save & Replan"
+        )
         buttons.accepted.connect(
             dialog.accept
         )
@@ -4662,13 +5799,17 @@ class ShipmentOrdersPage(QWidget):
         layout.addWidget(title)
         layout.addWidget(shipment_label)
         layout.addWidget(current_label)
-        layout.addWidget(receive_label)
+        layout.addWidget(out_label)
         layout.addWidget(note)
         layout.addWidget(
             automatic_checkbox
         )
         layout.addWidget(date_label)
         layout.addWidget(target_editor)
+        layout.addWidget(buffer_label)
+        layout.addWidget(dispatch_buffer)
+        layout.addWidget(reason_label)
+        layout.addWidget(reason_input)
         layout.addWidget(buttons)
 
         if (
@@ -4677,51 +5818,162 @@ class ShipmentOrdersPage(QWidget):
         ):
             return
 
-        automatic_target = (
+        auto_target = (
             automatic_checkbox.isChecked()
         )
+        new_target = (
+            None
+            if auto_target
+            else target_editor.date().toPython()
+        )
+        target_source = (
+            "Auto Earliest Feasible Factory Out"
+            if auto_target
+            else "Manual Approved"
+        )
 
-        if automatic_target:
-            new_target = factory_receive
+        self._save_target_mode_and_replan(
+            shipment_id=shipment_id,
+            new_target=new_target,
+            target_source=target_source,
+            is_manual=not auto_target,
+            dispatch_buffer_days=(
+                dispatch_buffer.value()
+            ),
+            change_note=(
+                reason_input.text().strip()
+            ),
+        )
 
-            if new_target is None:
-                QMessageBox.warning(
-                    self,
-                    "Target Date Not Available",
-                    "Factory Can Receive Date has not been "
-                    "calculated yet. Recalculate the shipment "
-                    "before enabling automatic Target Date.",
-                )
+    def _set_shipment_auto_target(
+        self,
+        shipment_id: int,
+        *,
+        confirmation_required: bool,
+    ) -> None:
+        shipment_row = self.get_shipment(
+            shipment_id
+        )
+        if not shipment_row:
+            return
+        shipment = dict(shipment_row)
+
+        if confirmation_required:
+            reply = QMessageBox.question(
+                self,
+                "Reset to Auto Target",
+                "Clear the locked target date and calculate the earliest "
+                "feasible Factory Can Out date? All active shipments will "
+                "be replanned.",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
                 return
 
-            target_source = (
-                "Automatic Factory Receive"
-            )
-        else:
-            new_target = (
-                target_editor.date().toPython()
-            )
-            target_source = "Manual"
+        self._save_target_mode_and_replan(
+            shipment_id=shipment_id,
+            new_target=None,
+            target_source=(
+                "Auto Earliest Feasible Factory Out"
+            ),
+            is_manual=False,
+            dispatch_buffer_days=max(
+                0,
+                int(
+                    shipment.get(
+                        "dispatch_buffer_days"
+                    )
+                    or 0
+                ),
+            ),
+            change_note=(
+                "Reset to automatic earliest feasible "
+                "Factory Can Out scheduling."
+            ),
+        )
 
+    def _save_target_mode_and_replan(
+        self,
+        *,
+        shipment_id: int,
+        new_target,
+        target_source: str,
+        is_manual: bool,
+        dispatch_buffer_days: int,
+        change_note: str,
+    ) -> None:
+        shipment_row = self.get_shipment(
+            shipment_id
+        )
+        if not shipment_row:
+            return
+        shipment = dict(shipment_row)
+
+        header_fields = [
+            "target_date",
+            "plan_date",
+            "status",
+            "planning_status",
+            "planning_note",
+            "target_date_is_manual",
+            "target_date_source",
+            "dispatch_buffer_days",
+            "factory_can_receive_date",
+            "factory_out_date",
+            "delivery_status",
+            "delay_days",
+            "early_days",
+            "last_replanned_at",
+        ]
         old_values = {
-            "target_date": shipment.get(
-                "target_date"
-            ),
-            "plan_date": shipment.get(
-                "plan_date"
-            ),
-            "manager_order_date": shipment.get(
-                "manager_order_date"
-            ),
-            "target_date_is_manual": bool(
-                shipment.get(
-                    "target_date_is_manual"
-                )
-            ),
-            "target_date_source": shipment.get(
-                "target_date_source"
-            ),
+            field: shipment.get(field)
+            for field in header_fields
         }
+
+        with engine.begin() as connection:
+            item_snapshots = [
+                dict(row)
+                for row in connection.execute(
+                    text(
+                        """
+                        SELECT
+                            id,
+                            start_date,
+                            end_date,
+                            item_status,
+                            allocated_cavity_count,
+                            allocated_cavities,
+                            daily_capacity,
+                            production_days,
+                            receive_date,
+                            item_receive_date,
+                            planning_note,
+                            schedule_reason,
+                            factory_out_reason,
+                            planning_version
+                        FROM mpps_shipment_items
+                        WHERE shipment_id = :shipment_id
+                        ORDER BY id
+                        """
+                    ),
+                    {
+                        "shipment_id": shipment_id
+                    },
+                ).mappings().all()
+            ]
+
+        planning_note = (
+            change_note
+            or (
+                "Manual target date saved; cumulative "
+                "planning requested."
+                if is_manual
+                else "Auto Target requested; earliest feasible "
+                "Factory Can Out calculation requested."
+            )
+        )
 
         try:
             with engine.begin() as connection:
@@ -4731,41 +5983,100 @@ class ShipmentOrdersPage(QWidget):
                         UPDATE mpps_shipments
                         SET
                             target_date = :target_date,
-                            plan_date = :target_date,
-                            manager_order_date =
+                            plan_date = COALESCE(
                                 :target_date,
+                                shipment_date,
+                                CURRENT_DATE
+                            ),
                             target_date_is_manual =
-                                :is_manual,
+                                :target_date_is_manual,
                             target_date_source =
-                                :target_source,
-                            updated_at =
-                                CURRENT_TIMESTAMP
+                                :target_date_source,
+                            dispatch_buffer_days =
+                                :dispatch_buffer_days,
+                            status = CASE
+                                WHEN LOWER(
+                                    COALESCE(status, '')
+                                ) IN (
+                                    'imported review',
+                                    'review required',
+                                    'draft import',
+                                    'excel review hold'
+                                )
+                                THEN 'Planned'
+                                ELSE status
+                            END,
+                            planning_status =
+                                'Pending Replan',
+                            planning_note =
+                                :planning_note,
+                            factory_can_receive_date = NULL,
+                            factory_out_date = NULL,
+                            delivery_status =
+                                'Pending Planning',
+                            delay_days = 0,
+                            early_days = 0,
+                            last_replanned_at = NULL,
+                            updated_at = CURRENT_TIMESTAMP
                         WHERE id = :shipment_id
                         """
                     ),
                     {
                         "shipment_id": shipment_id,
                         "target_date": new_target,
-                        "is_manual": (
-                            not automatic_target
+                        "target_date_is_manual": is_manual,
+                        "target_date_source": target_source,
+                        "dispatch_buffer_days": max(
+                            0,
+                            int(
+                                dispatch_buffer_days
+                                or 0
+                            ),
                         ),
-                        "target_source": (
-                            target_source
-                        ),
+                        "planning_note": planning_note,
+                    },
+                )
+                connection.execute(
+                    text(
+                        """
+                        UPDATE mpps_shipment_items
+                        SET
+                            start_date = NULL,
+                            end_date = NULL,
+                            item_status = 'Pending',
+                            allocated_cavity_count = 0,
+                            allocated_cavities = 0,
+                            daily_capacity = 0,
+                            production_days = 0,
+                            receive_date = NULL,
+                            item_receive_date = NULL,
+                            planning_note =
+                                'Waiting for cumulative replanning.',
+                            schedule_reason =
+                                'Waiting for cumulative replanning.',
+                            factory_out_reason = '',
+                            planning_version = 0,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE shipment_id = :shipment_id
+                        """
+                    ),
+                    {
+                        "shipment_id": shipment_id
                     },
                 )
 
-            self.planner.replan_all_open_shipments(
+            result = self.planner.replan_all_open_shipments(
                 trigger_reason=(
-                    "shipment_target_date_changed_"
-                    f"{shipment_id}"
-                ),
-                created_by="shipment_details",
+                    "shipment_manual_target_"
+                    if is_manual
+                    else "shipment_auto_target_"
+                )
+                + f"{shipment_id}",
+                created_by="shipment_schedule_control",
             )
 
         except Exception as exc:
             restore_error = ""
-
             try:
                 with engine.begin() as connection:
                     connection.execute(
@@ -4773,16 +6084,29 @@ class ShipmentOrdersPage(QWidget):
                             """
                             UPDATE mpps_shipments
                             SET
-                                target_date =
-                                    :target_date,
-                                plan_date =
-                                    :plan_date,
-                                manager_order_date =
-                                    :manager_order_date,
+                                target_date = :target_date,
+                                plan_date = :plan_date,
+                                status = :status,
+                                planning_status =
+                                    :planning_status,
+                                planning_note =
+                                    :planning_note,
                                 target_date_is_manual =
                                     :target_date_is_manual,
                                 target_date_source =
                                     :target_date_source,
+                                dispatch_buffer_days =
+                                    :dispatch_buffer_days,
+                                factory_can_receive_date =
+                                    :factory_can_receive_date,
+                                factory_out_date =
+                                    :factory_out_date,
+                                delivery_status =
+                                    :delivery_status,
+                                delay_days = :delay_days,
+                                early_days = :early_days,
+                                last_replanned_at =
+                                    :last_replanned_at,
                                 updated_at =
                                     CURRENT_TIMESTAMP
                             WHERE id = :shipment_id
@@ -4793,6 +6117,43 @@ class ShipmentOrdersPage(QWidget):
                             **old_values,
                         },
                     )
+
+                    if item_snapshots:
+                        connection.execute(
+                            text(
+                                """
+                                UPDATE mpps_shipment_items
+                                SET
+                                    start_date = :start_date,
+                                    end_date = :end_date,
+                                    item_status = :item_status,
+                                    allocated_cavity_count =
+                                        :allocated_cavity_count,
+                                    allocated_cavities =
+                                        :allocated_cavities,
+                                    daily_capacity =
+                                        :daily_capacity,
+                                    production_days =
+                                        :production_days,
+                                    receive_date =
+                                        :receive_date,
+                                    item_receive_date =
+                                        :item_receive_date,
+                                    planning_note =
+                                        :planning_note,
+                                    schedule_reason =
+                                        :schedule_reason,
+                                    factory_out_reason =
+                                        :factory_out_reason,
+                                    planning_version =
+                                        :planning_version,
+                                    updated_at =
+                                        CURRENT_TIMESTAMP
+                                WHERE id = :id
+                                """
+                            ),
+                            item_snapshots,
+                        )
             except Exception as restore_exc:
                 restore_error = (
                     "\n\nRollback warning: "
@@ -4801,31 +6162,49 @@ class ShipmentOrdersPage(QWidget):
 
             QMessageBox.critical(
                 self,
-                "Target Date Change Failed",
-                "The Target Date could not be changed. "
-                "The previous values were restored.\n\n"
+                "Target Scheduling Failed",
+                "The shipment could not be replanned. The previous "
+                "shipment and item values were restored.\n\n"
                 f"Reason: {exc}"
                 f"{restore_error}",
             )
             return
 
-        self.recalculate_shipment_factory_out_date(
-            shipment_id
-        )
         self.refresh_list()
         self.open_shipment_detail(
             shipment_id
         )
 
+        updated = dict(
+            self.get_shipment(
+                shipment_id
+            )
+            or {}
+        )
+        actual_target = updated.get(
+            "target_date"
+        )
+        actual_out = updated.get(
+            "factory_out_date"
+        )
+        actual_status = updated.get(
+            "planning_status"
+        )
+
         QMessageBox.information(
             self,
-            "Target Date Updated",
-            "Shipment Target Date was updated "
-            "successfully.\n\n"
-            f"Target Date: {self._fmt_date(new_target)}\n"
-            f"Target Source: {target_source}\n\n"
-            "All active shipments were replanned "
-            "using the new priority.",
+            (
+                "Manual Target Saved"
+                if is_manual
+                else "Auto Target Scheduled"
+            ),
+            (
+                f"Target Source: {target_source}\n"
+                f"Target Date: {self._fmt_date(actual_target)}\n"
+                f"Factory Can Out: {self._fmt_date(actual_out)}\n"
+                f"Planning Status: {actual_status or '-'}\n"
+                f"Planning Run: {result.planning_run_id or '-'}"
+            ),
         )
 
 class ShipmentDetailsPage(ShipmentOrdersPage):
