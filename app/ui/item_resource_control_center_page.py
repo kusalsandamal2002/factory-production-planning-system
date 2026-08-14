@@ -1829,24 +1829,6 @@ class ItemResourceControlCenterPage(QWidget):
             )
         elif (
             production_required > 0
-            and _norm(
-                self.smds.get(
-                    "planning_manager_approval_status"
-                )
-            ) != "approved"
-        ):
-            status = "MASTER APPROVAL REQUIRED"
-            style = "LifecycleBlocked"
-            summary = (
-                "The item has production demand, but its SMDS planning "
-                "approval is not Approved."
-            )
-            next_action = (
-                "Review the process standard in SMDS Master and approve "
-                "the item before replanning."
-            )
-        elif (
-            production_required > 0
             and d.get("process_standard_missing")
         ):
             status = "PROCESS STANDARD REQUIRED"

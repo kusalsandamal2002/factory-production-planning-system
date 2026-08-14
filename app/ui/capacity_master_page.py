@@ -57,7 +57,7 @@ class CapacityEditDialog(QDialog):
         self.active_checkbox = QCheckBox("Active Capacity Config")
         self.active_checkbox.setChecked(True)
 
-        self.save_btn = QPushButton("Save Capacity Link")
+        self.save_btn = QPushButton("Save Technical Baseline")
         self.save_btn.setObjectName("PrimaryButton")
         self.save_btn.clicked.connect(self.accept)
 
@@ -105,9 +105,9 @@ class CapacityEditDialog(QDialog):
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(12)
 
-        title = QLabel("Capacity Master Specification")
+        title = QLabel("Legacy / Technical Capacity Baseline")
         title.setObjectName("Title")
-        hint = QLabel("Set running moulds, mould productivity rate, and daily available capacity in units.")
+        hint = QLabel("Maintain technical fallback values only. V11 operational planning prefers learned real capacity when validated evidence exists.")
         hint.setObjectName("Hint")
         layout.addWidget(title)
         layout.addWidget(hint)
@@ -185,7 +185,7 @@ class CapacityMasterPage(QWidget):
         self.status_combo.addItems(["All Status", "Active Only", "Inactive Only"])
         self.status_combo.currentTextChanged.connect(self.refresh_table)
 
-        self.add_btn = QPushButton("+ Add Capacity Link")
+        self.add_btn = QPushButton("+ Add Technical Baseline")
         self.add_btn.setObjectName("PrimaryButton")
         self.add_btn.clicked.connect(self.add_capacity)
 
@@ -248,9 +248,9 @@ class CapacityMasterPage(QWidget):
         # Metrics grid
         metrics_layout = QHBoxLayout()
         metrics_layout.setSpacing(14)
-        metrics_layout.addWidget(self._metric_card("Total Running Moulds", self.total_moulds_value), 1)
-        metrics_layout.addWidget(self._metric_card("Total Daily Capacity (units)", self.total_capacity_value), 1)
-        metrics_layout.addWidget(self._metric_card("Mould Capacity Warnings", self.capacity_warnings_value), 1)
+        metrics_layout.addWidget(self._metric_card("Manual Running Moulds", self.total_moulds_value), 1)
+        metrics_layout.addWidget(self._metric_card("Manual Daily Reference", self.total_capacity_value), 1)
+        metrics_layout.addWidget(self._metric_card("Baseline Warnings", self.capacity_warnings_value), 1)
         root.addLayout(metrics_layout)
 
         # Controls card
@@ -263,9 +263,9 @@ class CapacityMasterPage(QWidget):
         header = QHBoxLayout()
         title_box = QVBoxLayout()
         title_box.setSpacing(4)
-        title = QLabel("Capacity Master Control")
+        title = QLabel("Technical Capacity Baseline")
         title.setObjectName("SectionTitle")
-        hint = QLabel("Define daily mould/category production capacities. Active items with zero capacity will raise warnings.")
+        hint = QLabel("Legacy/manual reference only. Real Capacity Intelligence learns from OVEN plans + verified PROD actuals and uses these values only as a fallback.")
         hint.setObjectName("SectionHint")
         title_box.addWidget(title)
         title_box.addWidget(hint)
@@ -292,7 +292,7 @@ class CapacityMasterPage(QWidget):
         table_layout.setContentsMargins(18, 16, 18, 18)
         table_layout.setSpacing(12)
 
-        table_title = QLabel("Capacity Specifications")
+        table_title = QLabel("Legacy Capacity Specifications")
         table_title.setObjectName("SectionTitle")
         table_layout.addWidget(table_title)
         table_layout.addWidget(self.table, 1)

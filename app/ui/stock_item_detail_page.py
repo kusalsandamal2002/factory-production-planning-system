@@ -414,7 +414,7 @@ class StockItemDetailPage(QWidget):
         title = QLabel("Stock Summary")
         title.setObjectName("SectionTitle")
 
-        hint = QLabel("FG + QC - Scrap - Blocked = Available Stock. Shortage becomes production required quantity.")
+        hint = QLabel("Usable Stock = FG + QC. Scrap and Blocked are separate non-usable buckets. Shortage becomes production required quantity.")
         hint.setObjectName("SectionHint")
         hint.setWordWrap(True)
 

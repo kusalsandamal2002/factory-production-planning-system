@@ -347,7 +347,7 @@ class ProductionLearningService:
                     "import_run_id": import_run_id,
                     "plan_date": observation_date,
                     "observation_type": "PRODUCTION_SIGNAL",
-                    "source_semantics": "WORKBOOK_PLAN_OR_UNCLASSIFIED",
+                    "source_semantics": "VERIFIED_ACTUAL_PRODUCTION",
                     "entity_key": sap,
                     "sap_code": sap,
                     "customer_key": "",
@@ -359,10 +359,11 @@ class ProductionLearningService:
                     "features_json": json.dumps(
                         {
                             "description": row.get("description", ""),
-                            "warning": (
-                                "The workbook does not consistently distinguish "
-                                "actual production from plan/forecast values."
-                            ),
+                            "day_actual_qty": row.get("day_actual_qty", 0),
+                            "night_actual_qty": row.get("night_actual_qty", 0),
+                            "source_day_column": row.get("source_day_column", ""),
+                            "source_night_column": row.get("source_night_column", ""),
+                            "semantics": "Workbook owner confirmed PROD dated pairs are actual production.",
                         },
                         default=str,
                     ),
@@ -418,17 +419,15 @@ class ProductionLearningService:
             physical = max(
                 0,
                 max(0, int(row.get("fg_stock") or 0))
-                + max(0, int(row.get("qc_stock") or 0))
-                - max(0, int(row.get("scrap_stock") or 0))
-                - max(0, int(row.get("blocked_stock") or 0)),
+                + max(0, int(row.get("qc_stock") or 0)),
             )
             self._insert_observation(
                 session,
                 {
                     "import_run_id": import_run_id,
                     "plan_date": plan_date,
-                    "observation_type": "STOCK_POSITION",
-                    "source_semantics": "WORKBOOK_STOCK_SNAPSHOT",
+                    "observation_type": "MONTHLY_OPENING_STOCK",
+                    "source_semantics": "MONTHLY_OPENING_STOCK",
                     "entity_key": sap,
                     "sap_code": sap,
                     "customer_key": "",
@@ -439,7 +438,7 @@ class ProductionLearningService:
                     "weight_kg": _number(row.get("weight_kg")),
                     "features_json": json.dumps(
                         {
-                            "source_fg": row.get("fg_stock", 0),
+                            "opening_stock_qty": row.get("opening_stock_qty", row.get("fg_stock", 0)),
                             "source_scrap": row.get("scrap_stock", 0),
                             "source_blocked": row.get("blocked_stock", 0),
                         },

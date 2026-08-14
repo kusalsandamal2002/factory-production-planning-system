@@ -11,6 +11,8 @@ import math
 from pathlib import Path
 import re
 import shutil
+import zipfile
+import xml.etree.ElementTree as ET
 from typing import Any, Callable, Iterable
 
 from openpyxl import load_workbook
@@ -20,6 +22,9 @@ from sqlalchemy import text
 from app.services.production_learning_service import (
     ProductionLearningService,
 )
+from app.services.ai_planning_service import AIPlanningService
+from app.services.factory_intelligence_service import FactoryIntelligenceService
+from app.services.factory_resource_intelligence_service import FactoryResourceIntelligenceService
 from app.services.workbook_continuous_sync_service import (
     WorkbookContinuousSyncService,
 )
@@ -28,6 +33,70 @@ from app.services.workbook_continuous_sync_service import (
 # INTELLIGENT CONTINUOUS EXCEL SYNC + LEARNING FOUNDATION V7.0
 # DELIVERY DATE INTEGRITY V6.3: imported reviews never receive promise dates
 ProgressCallback = Callable[[int, str], None]
+
+
+def _fast_xlsx_sheet_stats(path: Path) -> dict[str, dict[str, int]]:
+    """Count non-empty/formula/error cells directly from worksheet XML.
+
+    Large OVEN workbooks contain millions of cells. Iterating every cell twice
+    through openpyxl (data + formula workbooks) makes semantic profiling dominate
+    import time. The XML stream already tells us whether a cell exists, whether it
+    contains a formula and whether Excel cached an error. This path preserves exact
+    diagnostics without materializing Python Cell objects.
+    """
+    stats: dict[str, dict[str, int]] = {}
+    try:
+        with zipfile.ZipFile(path) as zf:
+            wb_root = ET.fromstring(zf.read('xl/workbook.xml'))
+            rel_root = ET.fromstring(zf.read('xl/_rels/workbook.xml.rels'))
+            rels = {}
+            for rel in rel_root:
+                rid = rel.attrib.get('Id')
+                target = rel.attrib.get('Target', '')
+                if rid and target:
+                    target = target.lstrip('/')
+                    if not target.startswith('xl/'):
+                        target = 'xl/' + target.replace('\\', '/')
+                    rels[rid] = target
+            ns_rel = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id'
+            sheets = []
+            for node in wb_root.iter():
+                if node.tag.endswith('}sheet'):
+                    name = node.attrib.get('name', '')
+                    rid = node.attrib.get(ns_rel, '')
+                    target = rels.get(rid)
+                    if name and target:
+                        sheets.append((name, target))
+            for name, target in sheets:
+                nonempty = formulas = errors = 0
+                try:
+                    with zf.open(target) as stream:
+                        for _event, elem in ET.iterparse(stream, events=('end',)):
+                            if elem.tag.endswith('}c'):
+                                has_formula = False
+                                has_value = False
+                                for child in list(elem):
+                                    if child.tag.endswith('}f'):
+                                        has_formula = True
+                                    elif child.tag.endswith('}v') or child.tag.endswith('}is'):
+                                        has_value = True
+                                if has_formula:
+                                    formulas += 1
+                                if has_formula or has_value:
+                                    nonempty += 1
+                                if elem.attrib.get('t') == 'e':
+                                    errors += 1
+                                elem.clear()
+                    stats[name] = {
+                        'nonempty_cells': nonempty,
+                        'formula_cells': formulas,
+                        'cached_error_cells': errors,
+                    }
+                except KeyError:
+                    continue
+    except Exception:
+        return {}
+    return stats
 
 
 ROLE_DEFINITIONS: dict[str, dict[str, Any]] = {
@@ -160,6 +229,10 @@ LIVE_TABLE_COLUMNS: dict[str, set[str]] = {
         "source_sheet",
         "source_row",
         "source_note",
+        "line_name",
+        "cavity_code",
+        "allocation_slot",
+        "mold_code",
         "updated_at",
     },
     "mpps_compound_master": {
@@ -321,10 +394,13 @@ class WorkbookAnalysis:
     stock_rows: list[dict[str, Any]] = field(default_factory=list)
     shipment_rows: list[dict[str, Any]] = field(default_factory=list)
     oven_rows: list[dict[str, Any]] = field(default_factory=list)
+    oven_resource_rows: list[dict[str, Any]] = field(default_factory=list)
     compound_rows: list[dict[str, Any]] = field(default_factory=list)
     bead_rows: list[dict[str, Any]] = field(default_factory=list)
+    band_rows: list[dict[str, Any]] = field(default_factory=list)
     material_plan_rows: list[dict[str, Any]] = field(default_factory=list)
     production_history_rows: list[dict[str, Any]] = field(default_factory=list)
+    actual_production_dates: list[dict[str, Any]] = field(default_factory=list)
     summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self, *, include_rows: bool = True) -> dict[str, Any]:
@@ -334,10 +410,13 @@ class WorkbookAnalysis:
                 "stock_rows",
                 "shipment_rows",
                 "oven_rows",
+                "oven_resource_rows",
                 "compound_rows",
                 "bead_rows",
+                "band_rows",
                 "material_plan_rows",
                 "production_history_rows",
+                "actual_production_dates",
             ):
                 payload.pop(key, None)
         return payload
@@ -376,6 +455,9 @@ class IntelligentExcelImportService:
         self._progress(progress, 2, "Calculating workbook checksum")
         digest = _sha256_file(path)
 
+        self._progress(progress, 4, "Indexing workbook XML for fast formula/error statistics")
+        xml_sheet_stats = _fast_xlsx_sheet_stats(path)
+
         self._progress(progress, 6, "Opening workbook in streaming mode")
         formula_wb = load_workbook(
             path,
@@ -405,7 +487,7 @@ class IntelligentExcelImportService:
                 )
                 vws = value_wb[sheet_name]
                 fws = formula_wb[sheet_name]
-                profile = self._profile_sheet(vws, fws)
+                profile = self._profile_sheet(vws, fws, xml_sheet_stats.get(sheet_name))
                 profiles.append(profile)
                 roles[profile.role] = sheet_name
 
@@ -433,14 +515,15 @@ class IntelligentExcelImportService:
             self._progress(progress, 38, "Extracting weight master")
             weights = self._extract_weights(value_wb, roles, issues)
 
-            self._progress(progress, 46, "Extracting stock, shipment and production history")
-            stock_rows, shipment_rows, history_rows = self._extract_prod(
+            self._progress(progress, 46, "Reading production, stock and shipment headers")
+            stock_rows, shipment_rows, history_rows, actual_dates = self._extract_prod(
                 value_wb,
                 formula_wb,
                 roles,
                 plan_date,
                 weights,
                 issues,
+                progress=progress,
             )
 
             for stock_row in stock_rows:
@@ -481,13 +564,19 @@ class IntelligentExcelImportService:
                     )
 
             self._progress(progress, 58, "Extracting oven/cavity day and night plan")
+            oven_resource_rows = self._extract_oven_resource_structure(value_wb, roles)
             oven_rows = self._extract_oven(value_wb, roles, plan_date, issues)
 
             self._progress(progress, 68, "Extracting compound and BOM mappings")
-            compound_rows = self._extract_compound(value_wb, roles, issues)
+            compound_rows = self._extract_compound(
+                value_wb, roles, issues, progress=progress
+            )
 
             self._progress(progress, 76, "Extracting bead requirements")
             bead_rows = self._extract_bead(value_wb, roles, issues)
+
+            self._progress(progress, 79, "Extracting BAND mold-code master")
+            band_rows = self._extract_band_master(value_wb, roles)
 
             self._progress(progress, 82, "Extracting band, core and shift material plans")
             material_rows = self._extract_material_plans(
@@ -495,6 +584,7 @@ class IntelligentExcelImportService:
                 roles,
                 plan_date,
                 issues,
+                progress=progress,
             )
 
             self._add_cross_validation_issues(
@@ -517,6 +607,14 @@ class IntelligentExcelImportService:
                 history_rows=history_rows,
                 issues=issues,
             )
+            # Factory rule confirmed from the OVEN workbook: PROD column D is
+            # monthly opening-stock evidence, not a fresh daily stock count.
+            summary["stock_source_semantics"] = "MONTHLY_OPENING_STOCK"
+            summary["stock_source_sheet"] = roles.get("PRODUCTION_STOCK_SHIPMENTS", "PROD")
+            summary["stock_source_column"] = "D"
+            summary["physical_line_count"] = len({r.get("line_name") for r in oven_resource_rows if r.get("line_name")})
+            summary["physical_cavity_position_count"] = len(oven_resource_rows)
+            summary["band_mold_code_count"] = len(band_rows)
 
             self._progress(progress, 96, "Building professional import preview")
             analysis = WorkbookAnalysis(
@@ -532,10 +630,13 @@ class IntelligentExcelImportService:
                 stock_rows=stock_rows,
                 shipment_rows=shipment_rows,
                 oven_rows=oven_rows,
+                oven_resource_rows=oven_resource_rows,
                 compound_rows=compound_rows,
                 bead_rows=bead_rows,
+                band_rows=band_rows,
                 material_plan_rows=material_rows,
                 production_history_rows=history_rows,
+                actual_production_dates=actual_dates,
                 summary=summary,
             )
             self._progress(progress, 100, "Analysis complete")
@@ -557,8 +658,12 @@ class IntelligentExcelImportService:
 
         options = {
             "archive_source": True,
-            "update_stock": True,
-            "update_daily_stock": True,
+            # PROD column D is monthly opening-stock evidence, not a daily/live
+            # stock snapshot.  V10 captures it through FactoryIntelligenceService;
+            # legacy stock-cache writes stay disabled unless an old integration
+            # explicitly opts in.
+            "update_stock": False,
+            "update_daily_stock": False,
             "update_blank_weights": True,
             "overwrite_existing_weights": False,
             "import_oven_plan": True,
@@ -570,7 +675,8 @@ class IntelligentExcelImportService:
             "force_historical_snapshot": False,
             "force_live_revision": False,
             "mark_missing_shipments": True,
-            "sync_deferred_shipments": False,
+            "sync_deferred_shipments": True,
+            "authoritative_latest_shipments": True,
             "protect_manual_fields": True,
             "capture_learning_observations": True,
             "rebuild_learning_models": True,
@@ -580,6 +686,12 @@ class IntelligentExcelImportService:
         # Backward-compatible alias used by V6 screens/installations.
         if options.get("create_draft_shipments"):
             options["sync_live_shipments"] = True
+        if options.get("authoritative_latest_shipments", False):
+            # Business rule: the newest workbook is the FINAL shipment truth.
+            # Every non-zero shipment column participates in the live snapshot.
+            options["sync_live_shipments"] = True
+            options["mark_missing_shipments"] = True
+            options["sync_deferred_shipments"] = True
 
         if analysis.confidence_score < 0.55:
             raise RuntimeError(
@@ -609,6 +721,28 @@ class IntelligentExcelImportService:
             sync_service.ensure_schema(session)
             learning_service = ProductionLearningService()
             learning_service.ensure_schema(session)
+            ai_planning_service = AIPlanningService()
+            ai_planning_service.ensure_schema(session)
+            factory_intelligence = FactoryIntelligenceService()
+            factory_intelligence.ensure_schema(session)
+            resource_intelligence = FactoryResourceIntelligenceService()
+            resource_intelligence.ensure_schema(session)
+
+            # Resolve recoverable SAP/description mismatches before shipment-sync
+            # preview.  Only very-high-confidence matches are auto-corrected;
+            # ambiguous rows stay unchanged and are retained for review/history.
+            identity_preview = factory_intelligence.resolve_analysis(
+                session, analysis, import_run_id=None, persist=False
+            )
+
+            # A few long-lived local MPPS databases were restored/imported
+            # from backups over time.  PostgreSQL row data can then be ahead
+            # of the SERIAL/BIGSERIAL sequence even though the table itself is
+            # healthy.  Advancing a sequence to the current MAX(id) is safe
+            # and prevents false duplicate-primary-key IntegrityErrors during
+            # the transactional import.
+            self._repair_serial_sequences(session)
+
             sync_preview = sync_service.preview_with_session(
                 session,
                 analysis,
@@ -618,10 +752,16 @@ class IntelligentExcelImportService:
             effective_options["resolved_import_mode"] = sync_preview.mode
             effective_options["resolved_import_reason"] = sync_preview.reason
             if sync_preview.mode == "HISTORICAL":
-                # Old workbooks remain valuable snapshots but may not roll live
-                # stock or live shipments backwards automatically.
+                # Older workbooks are ML/history evidence only. They may enrich
+                # plan-vs-actual learning and dated snapshots, but they must never
+                # move the operational factory state backwards or overwrite current
+                # material/weight masters from the newest live OVEN workbook.
                 effective_options["update_stock"] = False
+                effective_options["update_daily_stock"] = False
                 effective_options["sync_live_shipments"] = False
+                effective_options["update_blank_weights"] = False
+                effective_options["overwrite_existing_weights"] = False
+                effective_options["import_materials"] = False
 
             duplicate = session.execute(
                 text(
@@ -705,6 +845,13 @@ class IntelligentExcelImportService:
                     self._progress(progress, 8, "Archiving the exact original workbook")
                     archive_path = self._archive_workbook(workbook_path, analysis.workbook_hash)
 
+                # Persist the identity-resolution evidence inside the same
+                # transaction as the workbook import.  A rollback therefore also
+                # rolls back learned aliases from this workbook.
+                identity_result = factory_intelligence.resolve_analysis(
+                    session, analysis, import_run_id=run_id, persist=True
+                )
+
                 self._save_profiles_and_issues(session, run_id, analysis)
                 self._save_workbook_registry(
                     session,
@@ -744,6 +891,9 @@ class IntelligentExcelImportService:
                     )
 
                 if options["import_oven_plan"]:
+                    # V11.2 adds first-class mold_code/line/cavity columns used by
+                    # the import itself, so migrate before writing mpps_oven_plan.
+                    resource_intelligence.ensure_schema(session)
                     self._progress(progress, 53, "Importing oven, cavity, day and night plans")
                     self._commit_oven_plan(
                         session,
@@ -751,6 +901,25 @@ class IntelligentExcelImportService:
                         analysis,
                         counters,
                     )
+                    # V11 stores the resource configuration before aggregation so
+                    # future ML can learn line/cavity/mold/casing effects without
+                    # reparsing 5 years of raw Excel on every model run.
+                    self._progress(progress, 58, "Capturing lossless factory resource allocations")
+                    resource_result = resource_intelligence.capture_workbook_resources(
+                        session,
+                        import_run_id=run_id,
+                        analysis=analysis,
+                        import_mode=sync_preview.mode,
+                    )
+                    resource_intelligence.sync_operational_oven_columns(
+                        session,
+                        import_run_id=run_id,
+                    )
+                    counters.update({
+                        k: v for k, v in resource_result.items()
+                        if isinstance(v, int)
+                    })
+                    learning_result["factory_resources"] = resource_result
 
                 if options["import_materials"]:
                     self._progress(progress, 68, "Updating compound, BOM, bead, band and core data")
@@ -762,13 +931,27 @@ class IntelligentExcelImportService:
                     )
 
                 if options["import_production_history"]:
-                    self._progress(progress, 82, "Importing dated production history")
+                    self._progress(progress, 82, "Importing verified day/night actual production history")
                     self._commit_production_history(
                         session,
                         run_id,
                         analysis,
                         counters,
                     )
+
+                # PROD column D is the factory's monthly opening-stock source.
+                # Capture it as dated evidence for every workbook; only a LIVE
+                # workbook can update the month's operational opening authority.
+                self._progress(progress, 86, "Capturing monthly opening stock from PROD STOCK")
+                opening_result = factory_intelligence.capture_opening_stock(
+                    session,
+                    import_run_id=run_id,
+                    analysis=analysis,
+                    import_mode=sync_preview.mode,
+                )
+                for key, value in opening_result.items():
+                    if isinstance(value, int):
+                        counters[key] += value
 
                 if options.get("capture_learning_observations", True):
                     self._progress(
@@ -785,10 +968,62 @@ class IntelligentExcelImportService:
                     )
                     learning_result.update(observation_result)
                     counters.update(observation_result)
+                    # Save the human FINAL Excel planning decision against the
+                    # workbook's own shipment/production requirement. This becomes
+                    # training data for the V10 planner-policy model.
+                    reconciliation_result = learning_service.save_reconciliation(
+                        session,
+                        import_run_id=run_id,
+                        analysis=analysis,
+                    )
+                    learning_result.update(reconciliation_result)
+                    counters.update(reconciliation_result)
                     if options.get("rebuild_learning_models", True):
                         model_result = learning_service.rebuild_models(session)
                         learning_result.update(model_result)
                         counters.update(model_result)
+
+                self._progress(
+                    progress,
+                    96,
+                    "Reconciling final Excel plan, verified actuals and AI shadow plan",
+                )
+                ai_result = ai_planning_service.post_excel_import(
+                    session,
+                    import_run_id=run_id,
+                    analysis=analysis,
+                    import_mode=sync_preview.mode,
+                )
+                learning_result["ai_planner"] = ai_result
+                for key, value in ai_result.items():
+                    if isinstance(value, int):
+                        counters[key] += value
+
+                self._progress(progress, 98, "Training real factory capacity and resource-intelligence models")
+                capacity_result = factory_intelligence.train_capacity_models(session)
+                planner_policy_result = factory_intelligence.train_planner_policy(session)
+                resource_capacity_result = resource_intelligence.train_profiles(session)
+                intelligence_state = factory_intelligence.refresh_state(session)
+                learning_result["factory_intelligence"] = {
+                    **capacity_result,
+                    **planner_policy_result,
+                    **resource_capacity_result,
+                    **intelligence_state,
+                    **{k: v for k, v in identity_result.items() if not k.startswith("_")},
+                    **opening_result,
+                }
+                for key, value in capacity_result.items():
+                    if isinstance(value, int):
+                        counters[key] += value
+                for key, value in planner_policy_result.items():
+                    if isinstance(value, int):
+                        counters[key] += value
+                for key, value in resource_capacity_result.items():
+                    if isinstance(value, int):
+                        counters[key] += value
+                for key, value in identity_result.items():
+                    if isinstance(value, int):
+                        counters[key] += value
 
                 warning_count = sum(
                     1 for issue in analysis.issues if issue.severity != "INFO"
@@ -942,7 +1177,7 @@ class IntelligentExcelImportService:
                 before_data = _json_object(change["before_json"])
                 if change["action"] == "INSERT":
                     removed += self._delete_by_key(session, table_name, key_data)
-                elif change["action"] == "UPDATE" and before_data:
+                elif change["action"] in {"UPDATE", "DELETE"} and before_data:
                     restored += self._restore_by_key(
                         session,
                         table_name,
@@ -1003,6 +1238,78 @@ class IntelligentExcelImportService:
                 "restored_rows": restored,
                 "removed_rows": removed,
             }
+
+    @staticmethod
+    def _repair_serial_sequences(session) -> None:
+        tables = (
+            "excel_import_runs",
+            "excel_import_sheet_profiles",
+            "excel_import_issues",
+            "excel_import_changes",
+            "excel_import_shipment_snapshots",
+            "excel_import_material_plans",
+            "excel_import_production_history",
+            "excel_shipment_identities",
+            "excel_shipment_sync_runs",
+            "excel_shipment_sync_rows",
+            "excel_shipment_item_revisions",
+            "excel_authoritative_shipment_archive",
+            "mpps_sap_stock_items",
+            "mpps_stock_items",
+            "mpps_daily_stock_entries",
+            "mpps_oven_plan",
+            "mpps_compound_master",
+            "mpps_bom_items",
+            "mpps_bead_master",
+            "mpps_shipments",
+            "mpps_shipment_items",
+            "mpps_final_plan_history",
+            "mpps_actual_production",
+            "mpps_plan_actual_reconciliation",
+            "mpps_ai_model_state",
+            "mpps_ai_plan_runs",
+            "mpps_ai_plan_items",
+            "mpps_ai_plan_evaluation",
+        )
+        for table_name in tables:
+            # Keep every optional probe behind a SAVEPOINT.  If an old install
+            # does not have a table/sequence, only this probe is rolled back;
+            # the outer import transaction remains healthy.
+            try:
+                with session.begin_nested():
+                    sequence_name = session.execute(
+                        text(
+                            "SELECT pg_get_serial_sequence(:table_name, 'id')"
+                        ),
+                        {"table_name": table_name},
+                    ).scalar()
+                    if not sequence_name:
+                        continue
+                    max_id = session.execute(
+                        text(f"SELECT COALESCE(MAX(id), 0) FROM {table_name}")
+                    ).scalar()
+                    max_id = int(max_id or 0)
+                    if max_id > 0:
+                        session.execute(
+                            text(
+                                "SELECT setval(CAST(:sequence_name AS regclass), "
+                                ":max_id, TRUE)"
+                            ),
+                            {
+                                "sequence_name": str(sequence_name),
+                                "max_id": max_id,
+                            },
+                        )
+                    else:
+                        session.execute(
+                            text(
+                                "SELECT setval(CAST(:sequence_name AS regclass), "
+                                "1, FALSE)"
+                            ),
+                            {"sequence_name": str(sequence_name)},
+                        )
+            except Exception:
+                continue
 
     @staticmethod
     def ensure_schema(session) -> None:
@@ -1204,7 +1511,7 @@ class IntelligentExcelImportService:
         WorkbookContinuousSyncService.ensure_schema(session)
         ProductionLearningService.ensure_schema(session)
 
-    def _profile_sheet(self, value_ws, formula_ws) -> SheetProfile:
+    def _profile_sheet(self, value_ws, formula_ws, fast_stats: dict[str, int] | None = None) -> SheetProfile:
         sample_values: list[str] = []
         nonempty = 0
         errors = 0
@@ -1249,18 +1556,26 @@ class IntelligentExcelImportService:
             sample_values,
         )
 
-        for row in value_ws.iter_rows():
-            for cell in row:
-                value = cell.value
-                if value not in (None, ""):
-                    nonempty += 1
-                    if isinstance(value, str) and value.startswith("#"):
-                        errors += 1
-        for row in formula_ws.iter_rows():
-            for cell in row:
-                value = cell.value
-                if isinstance(value, str) and value.startswith("="):
-                    formula_count += 1
+        if fast_stats:
+            nonempty = int(fast_stats.get("nonempty_cells", 0) or 0)
+            formula_count = int(fast_stats.get("formula_cells", 0) or 0)
+            errors = int(fast_stats.get("cached_error_cells", 0) or 0)
+        else:
+            # Fallback for unusual non-OOXML inputs. Keep the scan bounded on large
+            # sheets so diagnostics can never freeze the import UI.
+            max_profile_rows = min(value_ws.max_row, 250)
+            for row in value_ws.iter_rows(min_row=1, max_row=max_profile_rows):
+                for cell in row:
+                    value = cell.value
+                    if value not in (None, ""):
+                        nonempty += 1
+                        if isinstance(value, str) and value.startswith("#"):
+                            errors += 1
+            for row in formula_ws.iter_rows(min_row=1, max_row=max_profile_rows):
+                for cell in row:
+                    value = cell.value
+                    if isinstance(value, str) and value.startswith("="):
+                        formula_count += 1
 
         return SheetProfile(
             sheet_name=value_ws.title,
@@ -1336,13 +1651,14 @@ class IntelligentExcelImportService:
             "june": 6,
             "july": 7,
             "august": 8,
+            "auguest": 8,  # common spelling in the factory workbook filenames
             "september": 9,
             "october": 10,
             "november": 11,
             "december": 12,
         }
         match = re.search(
-            r"(?i)(january|february|march|april|may|june|july|august|"
+            r"(?i)(january|february|march|april|may|june|july|august|auguest|"
             r"september|october|november|december)\D+(\d{1,2})\D+(20\d{2})",
             path.stem,
         )
@@ -1409,7 +1725,17 @@ class IntelligentExcelImportService:
         plan_date: date | None,
         weights: dict[str, float],
         issues: list[ImportIssue],
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        *,
+        progress: ProgressCallback | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """Extract PROD data without random-access scans on read-only worksheets.
+
+        openpyxl read-only worksheets are optimized for sequential iteration. Calling
+        ``ws.cell()`` repeatedly can replay the XML stream for every coordinate and
+        made the 46% analysis stage appear frozen on large OVEN workbooks.  This
+        implementation reads the header rows once, resolves any referenced shipment
+        dates in one sequential pass, then processes the production rows once.
+        """
         sheet_name = roles.get("PRODUCTION_STOCK_SHIPMENTS")
         if not sheet_name:
             issues.append(
@@ -1423,38 +1749,118 @@ class IntelligentExcelImportService:
                     "Map the sheet containing SAP, stock and shipment columns.",
                 )
             )
-            return [], [], []
+            return [], [], [], []
+
         ws = workbook[sheet_name]
         formula_ws = formula_workbook[sheet_name]
         shipment_start = column_index_from_string("BY")
         shipment_end = min(column_index_from_string("HP"), ws.max_column)
-        shipment_headers: list[
-            tuple[int, str, str, str, date | None, str]
-        ] = []
+        history_start = column_index_from_string("G")
+        history_end = min(column_index_from_string("BT"), ws.max_column)
+        max_header_col = max(shipment_end, history_end)
+
+        self._progress(progress, 47, "Caching PROD header rows")
+        value_headers = list(
+            ws.iter_rows(
+                min_row=1,
+                max_row=3,
+                min_col=1,
+                max_col=max_header_col,
+                values_only=True,
+            )
+        )
+        formula_headers = list(
+            formula_ws.iter_rows(
+                min_row=1,
+                max_row=3,
+                min_col=1,
+                max_col=max_header_col,
+                values_only=True,
+            )
+        )
+        while len(value_headers) < 3:
+            value_headers.append(tuple())
+        while len(formula_headers) < 3:
+            formula_headers.append(tuple())
+
+        def header_value(rows, row_number: int, column: int):
+            row = rows[row_number - 1]
+            index = column - 1
+            if 0 <= index < len(row):
+                return row[index]
+            return None
+
+        # Build shipment metadata from cached rows.  Formula references to rows
+        # below the header are collected first and resolved in one sequential read.
+        raw_shipment_headers: list[dict[str, Any]] = []
+        referenced_cells: dict[int, set[int]] = defaultdict(set)
         for column in range(shipment_start, shipment_end + 1):
-            status = _text(ws.cell(1, column).value).upper()
-            name = _text(ws.cell(3, column).value)
+            status = _text(header_value(value_headers, 1, column)).upper()
+            name = _text(header_value(value_headers, 3, column))
             if not name:
                 continue
-            formula_text = _text(formula_ws.cell(1, column).value)
+            formula_text = _text(header_value(formula_headers, 1, column))
+            column_letter = get_column_letter(column)
             referenced_rows = [
                 int(value)
                 for value in re.findall(
-                    rf"{get_column_letter(column)}(\d+)",
+                    rf"{column_letter}(\d+)",
                     formula_text,
                     flags=re.IGNORECASE,
                 )
             ]
-            target_candidates = [_as_date(ws.cell(2, column).value)]
+            direct_date = _as_date(header_value(value_headers, 2, column))
             for referenced_row in referenced_rows:
-                if referenced_row > 3 and referenced_row <= ws.max_row:
-                    target_candidates.append(
-                        _as_date(ws.cell(referenced_row, column).value)
-                    )
-            source_target_date = next(
-                (candidate for candidate in target_candidates if candidate),
-                None,
+                if 3 < referenced_row <= ws.max_row:
+                    referenced_cells[referenced_row].add(column)
+            raw_shipment_headers.append(
+                {
+                    "column": column,
+                    "column_letter": column_letter,
+                    "name": name,
+                    "status": status,
+                    "direct_date": direct_date,
+                    "referenced_rows": referenced_rows,
+                }
             )
+
+        referenced_dates: dict[tuple[int, int], date] = {}
+        if referenced_cells:
+            self._progress(progress, 48, "Resolving shipment target-date references")
+            min_ref_row = min(referenced_cells)
+            max_ref_row = max(referenced_cells)
+            # Reading BY:HP sequentially is much faster than hundreds of ws.cell()
+            # calls on a read-only worksheet.
+            for row_number, values in enumerate(
+                ws.iter_rows(
+                    min_row=min_ref_row,
+                    max_row=max_ref_row,
+                    min_col=shipment_start,
+                    max_col=shipment_end,
+                    values_only=True,
+                ),
+                start=min_ref_row,
+            ):
+                wanted_columns = referenced_cells.get(row_number)
+                if not wanted_columns:
+                    continue
+                for column in wanted_columns:
+                    index = column - shipment_start
+                    value = values[index] if 0 <= index < len(values) else None
+                    parsed = _as_date(value)
+                    if parsed:
+                        referenced_dates[(row_number, column)] = parsed
+
+        shipment_headers: list[tuple[int, str, str, str, date | None, str]] = []
+        for meta in raw_shipment_headers:
+            source_target_date = meta["direct_date"]
+            if source_target_date is None:
+                for referenced_row in meta["referenced_rows"]:
+                    source_target_date = referenced_dates.get(
+                        (referenced_row, meta["column"])
+                    )
+                    if source_target_date:
+                        break
             if source_target_date and 2020 <= source_target_date.year <= 2035:
                 source_date_class = "EXCEL_APPROVED"
             elif source_target_date and source_target_date.year == 2060:
@@ -1465,33 +1871,80 @@ class IntelligentExcelImportService:
                 source_date_class = "DATE_MISSING"
             shipment_headers.append(
                 (
-                    column,
-                    get_column_letter(column),
-                    name,
-                    status,
+                    meta["column"],
+                    meta["column_letter"],
+                    meta["name"],
+                    meta["status"],
                     source_target_date,
                     source_date_class,
                 )
             )
 
-        history_columns: list[tuple[int, date]] = []
-        for column in range(
-            column_index_from_string("G"),
-            min(column_index_from_string("BT"), ws.max_column) + 1,
-        ):
-            history_date = _as_date(ws.cell(3, column).value)
-            if history_date:
-                history_columns.append((column, history_date))
+        # PROD production history is stored as paired shift columns. The first
+        # column carries the date header and represents DAY; the following column
+        # represents NIGHT. Only dates before the workbook plan date are verified
+        # actual production.
+        self._progress(progress, 49, "Mapping verified DAY/NIGHT actual-production columns")
+        history_pairs: list[tuple[int, int | None, date]] = []
+        column = history_start
+        while column <= history_end:
+            history_date = _as_date(header_value(value_headers, 3, column))
+            if not history_date:
+                column += 1
+                continue
+            next_column = column + 1 if column + 1 <= history_end else None
+            next_date = (
+                _as_date(header_value(value_headers, 3, next_column))
+                if next_column is not None
+                else None
+            )
+            night_column = (
+                next_column
+                if next_column is not None and next_date is None
+                else None
+            )
+            if plan_date is None or history_date < plan_date:
+                history_pairs.append((column, night_column, history_date))
+            column += 2 if night_column is not None else 1
+
+        actual_dates = [
+            {
+                "production_date": history_date.isoformat(),
+                "source_day_column": get_column_letter(day_column),
+                "source_night_column": (
+                    get_column_letter(night_column)
+                    if night_column is not None
+                    else ""
+                ),
+                "source_sheet": sheet_name,
+                "is_complete": True,
+            }
+            for day_column, night_column, history_date in history_pairs
+        ]
 
         stock_rows: list[dict[str, Any]] = []
         shipment_rows: list[dict[str, Any]] = []
         history_rows: list[dict[str, Any]] = []
         duplicate_rows: dict[str, dict[str, Any]] = {}
 
-        for row_number, row in enumerate(
+        self._progress(progress, 50, "Scanning PROD items, shipments and actual production")
+        total_data_rows = max(1, ws.max_row - 3)
+        last_progress = -1
+        for row_offset, row in enumerate(
             ws.iter_rows(min_row=4, values_only=True),
-            start=4,
+            start=0,
         ):
+            row_number = row_offset + 4
+            # Give the UI genuine activity through the formerly long 46% plateau.
+            local_progress = 50 + min(7, int((row_offset / total_data_rows) * 8))
+            if local_progress != last_progress:
+                self._progress(
+                    progress,
+                    local_progress,
+                    f"Scanning PROD rows {row_offset + 1:,}/{total_data_rows:,}",
+                )
+                last_progress = local_progress
+
             code = _code(_value_at(row, 2))
             description = _text(_value_at(row, 3))
             if not code or not description:
@@ -1513,6 +1966,8 @@ class IntelligentExcelImportService:
                 "sap_code": code,
                 "description": description,
                 "fg_stock": _integer(_value_at(row, 4)),
+                "opening_stock_qty": _integer(_value_at(row, 4)),
+                "stock_source_semantics": "MONTHLY_OPENING_STOCK",
                 "scrap_stock": _integer(_value_at(row, 5)),
                 "blocked_stock": _integer(_value_at(row, 6)),
                 "qc_stock": 0,
@@ -1544,14 +1999,14 @@ class IntelligentExcelImportService:
             stock_rows.append(record)
 
             for (
-                column,
+                shipment_column,
                 column_letter,
                 shipment_name,
                 status,
                 source_target_date,
                 source_date_class,
             ) in shipment_headers:
-                qty = _integer(_value_at(row, column))
+                qty = _integer(_value_at(row, shipment_column))
                 if qty <= 0:
                     continue
                 shipment_rows.append(
@@ -1573,8 +2028,14 @@ class IntelligentExcelImportService:
                     }
                 )
 
-            for column, production_date in history_columns:
-                qty = _integer(_value_at(row, column))
+            for day_column, night_column, production_date in history_pairs:
+                day_qty = max(0, _integer(_value_at(row, day_column)))
+                night_qty = (
+                    max(0, _integer(_value_at(row, night_column)))
+                    if night_column is not None
+                    else 0
+                )
+                qty = day_qty + night_qty
                 if qty <= 0:
                     continue
                 history_rows.append(
@@ -1583,12 +2044,62 @@ class IntelligentExcelImportService:
                         "sap_code": code,
                         "description": description,
                         "production_qty": qty,
+                        "day_actual_qty": day_qty,
+                        "night_actual_qty": night_qty,
+                        "source_day_column": get_column_letter(day_column),
+                        "source_night_column": (
+                            get_column_letter(night_column)
+                            if night_column is not None
+                            else ""
+                        ),
+                        "source_semantics": "VERIFIED_ACTUAL_PRODUCTION",
                         "source_sheet": sheet_name,
                         "source_row": row_number,
                     }
                 )
 
-        return stock_rows, shipment_rows, history_rows
+        self._progress(
+            progress,
+            57,
+            f"PROD extraction complete: {len(stock_rows):,} items, "
+            f"{len(shipment_rows):,} shipment rows, {len(history_rows):,} actual rows",
+        )
+        return stock_rows, shipment_rows, history_rows, actual_dates
+
+    def _extract_oven_resource_structure(self, workbook, roles) -> list[dict[str, Any]]:
+        """Capture the physical line/cavity-position skeleton losslessly.
+
+        The OVEN workbook repeats each physical position across several allocation
+        rows, including blank rows. Positive SAP rows alone therefore undercount
+        the factory resource registry. This extractor keeps one record per exact
+        (line, oven/cavity) identity plus the number of allocation slots printed
+        for that position.
+        """
+        sheet_name = roles.get("OVEN_CAVITY_PLAN")
+        if not sheet_name:
+            return []
+        ws = workbook[sheet_name]
+        seen: dict[tuple[str, str], dict[str, Any]] = {}
+        for row_number, row in enumerate(ws.iter_rows(min_row=3, values_only=True), start=3):
+            line_name = _text(_value_at(row, 2))
+            cavity_code = _text(_value_at(row, 3))
+            if not line_name or not cavity_code:
+                continue
+            key = (line_name, cavity_code)
+            rec = seen.setdefault(
+                key,
+                {
+                    "line_name": line_name,
+                    "cavity_code": cavity_code,
+                    "first_source_row": row_number,
+                    "last_source_row": row_number,
+                    "allocation_slot_capacity": 0,
+                    "source_sheet": sheet_name,
+                },
+            )
+            rec["last_source_row"] = row_number
+            rec["allocation_slot_capacity"] += 1
+        return list(seen.values())
 
     def _extract_oven(self, workbook, roles, plan_date, issues) -> list[dict[str, Any]]:
         sheet_name = roles.get("OVEN_CAVITY_PLAN")
@@ -1617,11 +2128,21 @@ class IntelligentExcelImportService:
             description = _text(_value_at(row, 5))
             line_name = _text(_value_at(row, 2))
             oven_code = _text(_value_at(row, 3))
+            total_to_produce_qty = _integer(_value_at(row, 10))
+            today_qty = _integer(_value_at(row, 11))
             day_qty = _integer(_value_at(row, 12))
             night_qty = _integer(_value_at(row, 13))
             next_qty = _integer(_value_at(row, 15))
             unit_weight = _number(_value_at(row, 17)) or 0.0
+            balance_qty = _integer(_value_at(row, 21))
             casing_evidence = _text(_value_at(row, 22))
+            # Factory rule: BAND!A Material Description is the Mold Code.
+            # OVEN column AA carries that BAND material description for the
+            # planned SAP/resource row. Keep it as a separate identity from the
+            # older tyre-size/key-code field.
+            mold_code = _text(_value_at(row, 27))
+            if mold_code.startswith("#"):
+                mold_code = ""
 
             if not oven_code:
                 issues.append(
@@ -1654,31 +2175,71 @@ class IntelligentExcelImportService:
                         "sap_code": code,
                         "description": description,
                         "planned_qty": qty,
+                        # Row-level resource evidence retained for V11 capacity
+                        # learning. TODAY/total/balance are not treated as verified
+                        # actuals; verified actual production still comes from PROD.
+                        "today_qty": today_qty,
+                        "total_to_produce_qty": total_to_produce_qty,
+                        "next_day_qty": next_qty,
+                        "balance_qty": balance_qty,
                         "planned_weight_kg": round(qty * unit_weight, 5),
                         "unit_weight_kg": unit_weight,
                         "casing_evidence": casing_evidence,
+                        "mold_code": mold_code,
                         "source_sheet": sheet_name,
                         "source_row": row_number,
                     }
                 )
         return result
 
-    def _extract_compound(self, workbook, roles, issues) -> list[dict[str, Any]]:
+    def _extract_compound(
+        self,
+        workbook,
+        roles,
+        issues,
+        *,
+        progress: ProgressCallback | None = None,
+    ) -> list[dict[str, Any]]:
+        """Extract the per-tyre compound master using sequential streaming reads."""
         sheet_name = roles.get("COMPOUND_BOM")
         if not sheet_name:
             return []
         ws = workbook[sheet_name]
-        headers: list[tuple[int, str]] = []
-        first_compound_column = column_index_from_string("D")
-        last_compound_column = min(
-            column_index_from_string("CU"),
-            ws.max_column,
+
+        max_material_column = min(column_index_from_string("CV"), ws.max_column)
+        header_scan_last = min(ws.max_row, 12)
+        self._progress(progress, 69, "Reading compound master headers")
+        header_rows = list(
+            ws.iter_rows(
+                min_row=1,
+                max_row=header_scan_last,
+                min_col=1,
+                max_col=max_material_column,
+                values_only=True,
+            )
         )
-        for column in range(first_compound_column, last_compound_column + 1):
-            header = _text(ws.cell(1, column).value)
-            if header:
-                headers.append((column, header))
-        if not headers:
+        header_row = None
+        header_values: tuple[Any, ...] | None = None
+        for row_number, values in enumerate(header_rows, start=1):
+            material_description = _normalize(_value_at(values, 2))
+            candidate_headers = [
+                _text(_value_at(values, column))
+                for column in range(4, max_material_column + 1)
+            ]
+            compound_header_count = sum(
+                bool(value)
+                and (
+                    "compound" in _normalize(value)
+                    or "friction cord" in _normalize(value)
+                )
+                for value in candidate_headers
+            )
+            if material_description == "material description" and compound_header_count >= 3:
+                header_row = row_number
+                header_values = values
+                break
+
+        if header_row is None or header_values is None:
             issues.append(
                 ImportIssue(
                     "WARNING",
@@ -1686,26 +2247,89 @@ class IntelligentExcelImportService:
                     sheet_name,
                     "",
                     "",
-                    "Compound sheet was detected but compound headers were not recognized.",
-                    "The exact workbook is archived; review its header layout.",
+                    "Compound sheet was detected but the per-tyre master header was not recognized.",
+                    "The exact workbook is archived; review its header layout before promoting compound data.",
+                )
+            )
+            return []
+
+        ignored_headers = {
+            "material",
+            "material description",
+            "altbom",
+            "total to be produced",
+            "day",
+            "night",
+            "key 01",
+            "key 02",
+            "total prodution",
+            "total production",
+            "inner core",
+            "compound weight",
+            "bead wire weight",
+            "total tyre weight",
+            "total tire weight",
+            "band",
+            "bead weight",
+        }
+        headers: list[tuple[int, str]] = []
+        for column in range(column_index_from_string("D"), max_material_column + 1):
+            header = _text(_value_at(header_values, column))
+            normalized = _normalize(header)
+            if not header or normalized in ignored_headers:
+                continue
+            headers.append((column, header))
+
+        if not headers:
+            issues.append(
+                ImportIssue(
+                    "WARNING",
+                    "COMPOUND_HEADERS_NOT_FOUND",
+                    sheet_name,
+                    f"A{header_row}",
+                    "",
+                    "Compound master header row was found but no material columns were usable.",
+                    "Review the workbook header names before import.",
                 )
             )
             return []
 
         result: list[dict[str, Any]] = []
-        for row_number, row in enumerate(
+        max_scan_row = min(ws.max_row, 7000)
+        total_rows = max(1, max_scan_row - header_row)
+        last_progress = -1
+        self._progress(progress, 70, "Scanning per-tyre compound usage")
+        for offset, values in enumerate(
             ws.iter_rows(
-                min_row=2,
-                max_row=min(ws.max_row, 3300),
+                min_row=header_row + 1,
+                max_row=max_scan_row,
+                min_col=1,
+                max_col=max_material_column,
                 values_only=True,
             ),
-            start=2,
+            start=0,
         ):
-            code = _code(_value_at(row, 1))
+            row_number = header_row + 1 + offset
+            local_progress = 70 + min(5, int((offset / total_rows) * 6))
+            if local_progress != last_progress:
+                self._progress(
+                    progress,
+                    local_progress,
+                    f"Scanning compound rows {offset + 1:,}/{total_rows:,}",
+                )
+                last_progress = local_progress
+
+            first = _normalize(_value_at(values, 1))
+            day_label = _normalize(_value_at(values, 4))
+            night_label = _normalize(_value_at(values, 5))
+            if first == "material" and day_label == "day" and night_label == "night":
+                break
+
+            code = _code(_value_at(values, 1))
             if not code or not _looks_like_item_code(code):
                 continue
             for column, compound_name in headers:
-                usage = _number(_value_at(row, column))
+                usage = _number(_value_at(values, column))
                 if usage is None or usage <= 0:
                     continue
                 compound_code = "CMP-" + sha256(
@@ -1722,6 +2346,11 @@ class IntelligentExcelImportService:
                         "source_row": row_number,
                     }
                 )
+        self._progress(
+            progress,
+            75,
+            f"Compound extraction complete: {len(result):,} BOM usage rows",
+        )
         return result
 
     def _extract_bead(self, workbook, roles, issues) -> list[dict[str, Any]]:
@@ -1752,15 +2381,125 @@ class IntelligentExcelImportService:
             )
         return result
 
+    def _extract_band_master(self, workbook, roles) -> list[dict[str, Any]]:
+        """Read every unique BAND Material Description as a learned Mold Code.
+
+        Unlike the daily material-plan extractor, zero-plan/STOP rows are retained
+        because they are still valid mold identities that may reappear later.
+        """
+        sheet_name = roles.get("BAND_PLAN")
+        if not sheet_name:
+            return []
+        ws = workbook[sheet_name]
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row_number, row in enumerate(ws.iter_rows(min_row=4, values_only=True), start=4):
+            description = _text(_value_at(row, 1))
+            if not description:
+                continue
+            key = _normalize(description)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            result.append({
+                "mold_code": description,
+                "day_qty": _number(_value_at(row, 2)) or 0.0,
+                "night_qty": _number(_value_at(row, 3)) or 0.0,
+                "total_qty": _number(_value_at(row, 4)) or 0.0,
+                "stop_flag": _text(_value_at(row, 5)),
+                "stock_qty": _number(_value_at(row, 6)) or 0.0,
+                "produced_qty": _number(_value_at(row, 7)) or 0.0,
+                "next_day_qty": _number(_value_at(row, 8)) or 0.0,
+                "source_sheet": sheet_name,
+                "source_row": row_number,
+            })
+        return result
+
     def _extract_material_plans(
         self,
         workbook,
         roles,
         plan_date,
         issues,
+        *,
+        progress: ProgressCallback | None = None,
     ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         default_date = plan_date or date.today()
+
+        # The OVEN workbook contains a compact daily compound summary beside the
+        # second calculated material block. Read DD:DI once sequentially; repeated
+        # random ws.cell() access is very slow in openpyxl read-only mode.
+        compound_sheet = roles.get("COMPOUND_BOM")
+        if compound_sheet:
+            ws = workbook[compound_sheet]
+            compound_type_col = column_index_from_string("DD")
+            balance_col = column_index_from_string("DI")
+            max_scan_row = min(ws.max_row, 7000)
+            self._progress(progress, 83, "Scanning compound daily requirement summary")
+            header_found = False
+            started = False
+            blank_streak = 0
+            for row_number, values in enumerate(
+                ws.iter_rows(
+                    min_row=1,
+                    max_row=max_scan_row,
+                    min_col=compound_type_col,
+                    max_col=balance_col,
+                    values_only=True,
+                ),
+                start=1,
+            ):
+                material_key = _text(_value_at(values, 1))
+                requirement_text = _text(_value_at(values, 2))
+                if not header_found:
+                    if (
+                        _normalize(material_key) == "compound type"
+                        and "requirement" in _normalize(requirement_text)
+                    ):
+                        header_found = True
+                    continue
+
+                requirement = _number(_value_at(values, 2))
+                if not material_key or requirement is None:
+                    if started:
+                        blank_streak += 1
+                        if blank_streak >= 12:
+                            break
+                    continue
+                if requirement < 0:
+                    continue
+                started = True
+                blank_streak = 0
+                first_stage = _number(_value_at(values, 3)) or 0.0
+                batch = _number(_value_at(values, 4)) or 0.0
+                stock = _number(_value_at(values, 5)) or 0.0
+                balance = _number(_value_at(values, 6))
+                description_bits = []
+                if first_stage:
+                    description_bits.append(f"1st stage eq. {first_stage:.3f} kg")
+                if batch:
+                    description_bits.append(f"Batch {batch:g}")
+                if balance is not None:
+                    description_bits.append(f"Excel balance {balance:.3f}")
+                result.append(
+                    {
+                        "plan_date": default_date.isoformat(),
+                        "material_type": "COMPOUND",
+                        "material_key": material_key,
+                        "material_description": "; ".join(description_bits),
+                        "day_qty": 0.0,
+                        "night_qty": 0.0,
+                        "total_qty": requirement,
+                        "produced_qty": 0.0,
+                        "stock_qty": stock,
+                        "next_day_qty": 0.0,
+                        "unit": "KG",
+                        "source_sheet": compound_sheet,
+                        "source_row": row_number,
+                    }
+                )
+            self._progress(progress, 89, "Compound daily summary mapped")
 
         band_sheet = roles.get("BAND_PLAN")
         if band_sheet:
@@ -2331,6 +3070,10 @@ class IntelligentExcelImportService:
                     f"Intelligent import run #{run_id}; line={row['line_name']}; "
                     f"casing evidence retained={row['casing_evidence'] or '-'}"
                 ),
+                "line_name": row.get("line_name") or "",
+                "cavity_code": row.get("oven_code") or "",
+                "allocation_slot": 1,
+                "mold_code": row.get("mold_code") or "",
                 "updated_at": datetime.now(),
             }
             self._upsert_with_change(session, run_id, "mpps_oven_plan", key, values)
@@ -2468,10 +3211,32 @@ class IntelligentExcelImportService:
             params,
         ).mappings().first()
 
+    _NATIVE_UPSERT_KEYS = {
+        "mpps_sap_stock_items": ("sap_code",),
+        "mpps_stock_items": ("material_code",),
+        "mpps_daily_stock_entries": ("stock_date", "sap_code"),
+        # Shipment identities have a database UNIQUE(source_family, identity_key)
+        # constraint.  Treat them as an atomic natural-key entity as well so
+        # legacy/partial V7->V8 registries can self-heal without SELECT/INSERT
+        # races or stale preview assumptions.
+        "excel_shipment_identities": ("source_family", "identity_key"),
+    }
+
     def _upsert_with_change(self, session, run_id, table_name, key_fields, values):
+        conflict_keys = self._NATIVE_UPSERT_KEYS.get(table_name)
+        if conflict_keys and set(conflict_keys) == set(key_fields):
+            return self._native_upsert_with_change(
+                session,
+                run_id,
+                table_name,
+                key_fields,
+                values,
+                conflict_keys=conflict_keys,
+            )
+
         existing = self._fetch_existing(session, table_name, key_fields)
         if existing:
-            self._update_existing_by_id(
+            return self._update_existing_by_id(
                 session,
                 run_id,
                 table_name,
@@ -2480,14 +3245,100 @@ class IntelligentExcelImportService:
                 key_fields=key_fields,
                 existing=dict(existing),
             )
-        else:
-            self._insert_with_change(
-                session,
-                run_id,
-                table_name,
-                values,
-                key_fields=key_fields,
+        return self._insert_with_change(
+            session,
+            run_id,
+            table_name,
+            values,
+            key_fields=key_fields,
+        )
+
+    def _native_upsert_with_change(
+        self,
+        session,
+        run_id,
+        table_name,
+        key_fields,
+        values,
+        *,
+        conflict_keys,
+    ):
+        """Atomic PostgreSQL UPSERT for stable natural-key tables.
+
+        The old SELECT-then-INSERT path could lose a race against another
+        stock synchronizer (or a legacy trigger/workflow) and raise a unique
+        violation even though the desired operation was simply to refresh the
+        existing SAP row.  ON CONFLICT makes that operation atomic.
+        """
+        self._validate_table_and_columns(table_name, key_fields)
+        existing = self._fetch_existing(session, table_name, key_fields)
+        before = dict(existing) if existing else {}
+
+        clean_values = self._clean_values(table_name, values)
+        for key, value in key_fields.items():
+            clean_values.setdefault(key, value)
+        if not clean_values:
+            return
+
+        columns = list(clean_values)
+        placeholders = [f":value_{column}" for column in columns]
+        params = {f"value_{column}": clean_values[column] for column in columns}
+        update_columns = [
+            column for column in columns
+            if column not in conflict_keys and column != "id"
+        ]
+        conflict_clause = ", ".join(conflict_keys)
+
+        if update_columns:
+            update_clause = ", ".join(
+                f"{column} = EXCLUDED.{column}" for column in update_columns
             )
+            sql = (
+                f"INSERT INTO {table_name} ({', '.join(columns)}) "
+                f"VALUES ({', '.join(placeholders)}) "
+                f"ON CONFLICT ({conflict_clause}) DO UPDATE SET {update_clause} "
+                "RETURNING *"
+            )
+            returned = session.execute(text(sql), params).mappings().first()
+            if returned is None:
+                returned = self._fetch_existing(session, table_name, key_fields)
+            if returned is None:
+                raise RuntimeError(
+                    f"Import consistency error: PostgreSQL UPSERT for {table_name} "
+                    f"returned no row for key {key_fields}. Re-analyze the workbook "
+                    "and retry the import."
+                )
+            after = dict(returned)
+        else:
+            sql = (
+                f"INSERT INTO {table_name} ({', '.join(columns)}) "
+                f"VALUES ({', '.join(placeholders)}) "
+                f"ON CONFLICT ({conflict_clause}) DO NOTHING "
+                "RETURNING *"
+            )
+            returned = session.execute(text(sql), params).mappings().first()
+            after = dict(returned) if returned else dict(
+                self._fetch_existing(session, table_name, key_fields) or {}
+            )
+
+        if before:
+            comparable_after = {key: after.get(key) for key in after}
+            if _json_safe(before) == _json_safe(comparable_after):
+                return after
+            action = "UPDATE"
+        else:
+            action = "INSERT"
+
+        self._record_change(
+            session,
+            run_id,
+            table_name,
+            action,
+            key_fields,
+            before,
+            after,
+        )
+        return after
 
     def _update_existing_by_id(
         self,
@@ -2501,22 +3352,37 @@ class IntelligentExcelImportService:
         existing=None,
     ):
         key_fields = key_fields or {"id": row_id}
-        existing = existing or dict(
-            session.execute(
+        if existing is None:
+            current = session.execute(
                 text(f"SELECT * FROM {table_name} WHERE id = :id"),
                 {"id": row_id},
-            ).mappings().one()
-        )
+            ).mappings().first()
+            # A preview can legitimately become stale when a legacy repair,
+            # trigger, or another sync path has re-keyed a natural-key row.
+            # Recover by its stable key instead of raising NoResultFound.
+            if current is None and key_fields and set(key_fields) != {"id"}:
+                current = self._fetch_existing(session, table_name, key_fields)
+                if current is not None and current.get("id") is not None:
+                    row_id = int(current["id"])
+            if current is None:
+                raise RuntimeError(
+                    f"Import consistency error: {table_name} row id={row_id} "
+                    f"was not found for key {key_fields}. The transaction was "
+                    "left unchanged; re-analyze and retry."
+                )
+            existing = dict(current)
+        else:
+            existing = dict(existing)
         clean_values = self._clean_values(table_name, values)
         if not clean_values:
-            return
+            return existing
         changed_values = {
             key: value
             for key, value in clean_values.items()
             if _json_safe(existing.get(key)) != _json_safe(value)
         }
         if not changed_values:
-            return
+            return existing
         set_clause = ", ".join(f"{key} = :value_{key}" for key in changed_values)
         params = {f"value_{key}": value for key, value in changed_values.items()}
         params["id"] = row_id
@@ -2534,6 +3400,7 @@ class IntelligentExcelImportService:
             existing,
             after,
         )
+        return after
 
     def _insert_with_change(
         self,
@@ -2554,16 +3421,33 @@ class IntelligentExcelImportService:
                 f"VALUES ({', '.join(placeholders)}) RETURNING *"
             ),
             params,
-        ).mappings().one()
+        ).mappings().first()
+        if inserted is None:
+            inserted = self._fetch_existing(session, table_name, key_fields)
+        if inserted is None:
+            raise RuntimeError(
+                f"Import consistency error: INSERT into {table_name} returned "
+                f"no row for key {key_fields}."
+            )
+        inserted_dict = dict(inserted)
+        # Prefer the actual returned primary key for rollback. This remains
+        # correct even when a legacy PostgreSQL trigger normalizes a natural
+        # key such as an SAP code during INSERT.
+        change_key = (
+            {"id": int(inserted_dict["id"])}
+            if inserted_dict.get("id") is not None
+            else key_fields
+        )
         self._record_change(
             session,
             run_id,
             table_name,
             "INSERT",
-            key_fields,
+            change_key,
             {},
-            dict(inserted),
+            inserted_dict,
         )
+        return inserted_dict
 
     def _record_change(
         self,
@@ -2661,10 +3545,13 @@ def _analysis_from_dict(payload: dict[str, Any]) -> WorkbookAnalysis:
         stock_rows=list(payload.get("stock_rows", [])),
         shipment_rows=list(payload.get("shipment_rows", [])),
         oven_rows=list(payload.get("oven_rows", [])),
+        oven_resource_rows=list(payload.get("oven_resource_rows", [])),
         compound_rows=list(payload.get("compound_rows", [])),
         bead_rows=list(payload.get("bead_rows", [])),
+        band_rows=list(payload.get("band_rows", [])),
         material_plan_rows=list(payload.get("material_plan_rows", [])),
         production_history_rows=list(payload.get("production_history_rows", [])),
+        actual_production_dates=list(payload.get("actual_production_dates", [])),
         summary=dict(payload.get("summary", {})),
     )
 

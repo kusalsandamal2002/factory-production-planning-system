@@ -1738,13 +1738,8 @@ class OrderEntryPage(QWidget):
             self.item_search_input.setFocus()
             return
 
-        if str(item.get("approval_status", "")).strip().lower() != "approved":
-            dialog = ShipmentApprovalDialog(self, item)
-            if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.approved:
-                QMessageBox.warning(self, "Approval Required", "This item was not added to the cart because it is not approved.")
-                return
-            self.save_item_approval_to_smds(item)
-            self.refresh_master_items(show_warning=False)
+        # V10.4: planning-manager approval is retained as audit metadata only;
+        # it no longer blocks shipment entry or downstream planning.
 
         qty = int(self.quantity_input.value())
         sap_code = str(item["sap_code"])
@@ -2006,7 +2001,7 @@ class OrderEntryPage(QWidget):
         try:
             with engine.connect() as connection:
                 available = int(connection.execute(text("""
-                    SELECT COALESCE(MAX(fg_stock + qc_stock - scrap_stock - blocked_stock), 0)
+                    SELECT COALESCE(MAX(GREATEST(fg_stock, 0) + GREATEST(qc_stock, 0)), 0)
                     FROM mpps_sap_stock_items
                     WHERE sap_code = :sap_code
                 """), {"sap_code": sap_code}).scalar() or 0)

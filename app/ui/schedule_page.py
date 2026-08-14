@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.database import get_session
+from app.services.operational_source_service import OperationalSourceService
 from app.services.cavity_daily_plan_service import (
     BlockedDemand,
     CavityPlanRow,
@@ -150,7 +151,16 @@ class SchedulePage(QWidget):
         self.plan_date = QDateEdit()
         self.plan_date.setCalendarPopup(True)
         self.plan_date.setDisplayFormat("yyyy-MM-dd")
-        self.plan_date.setDate(QDate.currentDate())
+        initial_date = date.today()
+        try:
+            with get_session() as session:
+                initial_date = OperationalSourceService.next_plan_date(session, fallback=date.today())
+        except Exception:
+            initial_date = date.today()
+        self.plan_date.setDate(QDate(initial_date.year, initial_date.month, initial_date.day))
+        self.plan_date.setToolTip(
+            "Defaults to the day after the newest LIVE OVEN workbook. Older workbooks remain history/ML only."
+        )
         self.plan_date.dateChanged.connect(
             self._load_saved_or_preview
         )

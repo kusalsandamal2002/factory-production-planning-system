@@ -8,6 +8,9 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.services.production_requirement_service import ProductionRequirementRow
+from app.services.factory_resource_intelligence_service import (
+    FactoryResourceIntelligenceService,
+)
 
 
 @dataclass(frozen=True)
@@ -28,71 +31,78 @@ class CapacityAnalysisRow:
     warning: str
 
 
+def _legacy_reference(session: Session, *keys: str) -> dict:
+    normalized = {str(k or "").strip().upper() for k in keys if str(k or "").strip()}
+    if not normalized:
+        return {}
+    try:
+        with session.begin_nested():
+            rows = session.execute(
+                text(
+                    """
+                    SELECT item_code, running_moulds, per_mould_capacity,
+                           available_capacity_per_day
+                    FROM mpps_capacity_master
+                    WHERE is_active=TRUE
+                    """
+                )
+            ).mappings().all()
+    except Exception:
+        return {}
+    for row in rows:
+        if str(row.get("item_code") or "").strip().upper() in normalized:
+            return dict(row)
+    return {}
+
+
 def build_capacity_analysis(
     session: Session,
     *,
     production_rows: list[ProductionRequirementRow],
     planning_date: date,
 ) -> list[CapacityAnalysisRow]:
+    """Build capacity feasibility using the V11 authoritative resolver.
+
+    Legacy running-mould/per-mould fields remain visible as labelled technical
+    reference only; available capacity comes from learned real output adjusted by
+    current mold/casing/cavity constraints.
+    """
     required = [row for row in production_rows if row.production_required_qty > 0]
     if not required:
         return []
 
-    capacity_keys = sorted({row.capacity_key for row in required if row.capacity_key})
-    capacity_rows = session.execute(
-        text(
-            """
-            SELECT item_code, running_moulds, per_mould_capacity,
-                   available_capacity_per_day, target_date
-            FROM mpps_capacity_master
-            WHERE is_active = TRUE
-              AND item_code = ANY(:capacity_keys);
-            """
-        ),
-        {"capacity_keys": capacity_keys},
-    ).mappings()
-    capacity_map = {str(row["item_code"]): row for row in capacity_rows}
+    FactoryResourceIntelligenceService.ensure_schema(session)
     output: list[CapacityAnalysisRow] = []
 
     for production in required:
-        master = capacity_map.get(production.capacity_key)
-        if master is None:
-            output.append(
-                CapacityAnalysisRow(
-                    item_code=production.material_code,
-                    item_description=production.item_description,
-                    capacity_key=production.capacity_key,
-                    production_required_qty=production.production_required_qty,
-                    running_moulds=0.0,
-                    per_mould_capacity=0.0,
-                    calculated_daily_capacity=0.0,
-                    available_capacity=0.0,
-                    required_days=None,
-                    capacity_gap=-float(production.production_required_qty),
-                    target_date=production.earliest_due_date,
-                    estimated_completion_date=None,
-                    status="CANNOT COMPLETE",
-                    warning=(
-                        "MISSING CAPACITY KEY"
-                        if not production.capacity_key
-                        else f"MISSING CAPACITY FOR {production.capacity_key}"
-                    ),
-                )
-            )
-            continue
-
-        moulds = float(master["running_moulds"] or 0)
-        per_mould = float(master["per_mould_capacity"] or 0)
+        resolution = FactoryResourceIntelligenceService.resolve_capacity(
+            session,
+            production.material_code,
+            on_date=planning_date,
+            ensure_schema=False,
+        )
+        legacy = _legacy_reference(
+            session,
+            production.material_code,
+            production.capacity_key,
+            resolution.mold_key,
+        )
+        moulds = float(legacy.get("running_moulds") or 0.0)
+        per_mould = float(legacy.get("per_mould_capacity") or 0.0)
         calculated = moulds * per_mould
-        approved = float(master["available_capacity_per_day"] or 0)
-        daily = approved if approved > 0 else calculated
-        target = production.earliest_due_date or master["target_date"]
+        daily = float(
+            resolution.available_capacity
+            or resolution.safe_capacity
+            or resolution.technical_capacity
+            or 0
+        )
+        target = production.earliest_due_date
 
         if daily <= 0:
             required_days = None
             completion = None
             status = "CANNOT COMPLETE"
-            warning = "ZERO CAPACITY"
+            warning = resolution.constraint_reason or "NO CAPACITY EVIDENCE"
         else:
             required_days = int(ceil(production.production_required_qty / daily))
             completion = planning_date + timedelta(days=max(required_days - 1, 0))
@@ -100,7 +110,10 @@ def build_capacity_analysis(
             warning = ""
             if target is not None and completion > target:
                 status = "CANNOT COMPLETE"
-                warning = "CAPACITY COMPLETION AFTER DUE DATE"
+                warning = (
+                    "CONSTRAINT-ADJUSTED CAPACITY COMPLETION AFTER DUE DATE. "
+                    + resolution.constraint_reason
+                ).strip()
 
         output.append(
             CapacityAnalysisRow(

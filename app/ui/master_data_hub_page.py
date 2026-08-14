@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from collections.abc import Callable
 
@@ -164,8 +164,8 @@ class MasterDataHubPage(QWidget):
             )
         )
 
-        self.root.addLayout(self._build_metrics())
-
+        # V11: remove decorative summary cards. The Master Data Center is now
+        # module-first so the working area starts immediately below the header.
         panel = QFrame()
         panel.setObjectName("HeaderCard")
 
@@ -184,7 +184,7 @@ class MasterDataHubPage(QWidget):
             (
                 "Factory Capacity",
                 "CAPACITY DATA",
-                "Open factory capacity page for production lines, molds, casings and capacity/time data.",
+                "Open factory resource page for production lines, cavities, molds and casings.",
                 "Factory Capacity",
                 "capacity",
             ),

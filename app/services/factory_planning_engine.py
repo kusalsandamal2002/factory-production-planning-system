@@ -12,6 +12,9 @@ from app.services.process_standard_resolution import (
     process_standard_complete,
     resolve_process_standard_from_connection,
 )
+from app.services.factory_resource_intelligence_service import (
+    FactoryResourceIntelligenceService,
+)
 
 from app.services.master_data_normalization import (
     is_no_casing,
@@ -410,6 +413,10 @@ class FactoryPlanningEngine:
                 "CREATE INDEX IF NOT EXISTS ix_planning_resource_reservations_shipment_item_id ON planning_resource_reservations (shipment_item_id)",
             ]:
                 conn.execute(text(sql))
+
+            # V11 capacity intelligence schema is part of planning preflight so
+            # operational callers can use one resolver without per-item DDL.
+            FactoryResourceIntelligenceService.ensure_schema(conn)
 
     def replan_all_open_shipments(self, trigger_reason: str = "", created_by: str = "") -> PlanningRunResult:
         self.ensure_schema()
@@ -1056,31 +1063,9 @@ class FactoryPlanningEngine:
                 self._persist_item_result(conn, shipment, shipment_item_id, result, planning_version)
             return result
 
-        approval = str(smds.get("planning_manager_approval_status") or "Pending").strip().lower()
-        if approval != "approved":
-            result = ShipmentItemPlanResult(
-                shipment_id=int(shipment.get("id") or 0),
-                shipment_item_id=shipment_item_id,
-                sap_code=sap_code,
-                description=str(smds.get("material_description") or description),
-                order_qty=order_qty,
-                stock_allocated_qty=stock_allocated_qty,
-                produced_qty=produced_qty,
-                completed_qty=min(order_qty, stock_allocated_qty + produced_qty),
-                remaining_qty=max(order_qty - stock_allocated_qty - produced_qty, 0),
-                allocated_cavity_count=0,
-                daily_capacity=0,
-                production_days=0,
-                item_receive_date=None,
-                receive_date=None,
-                progress_pct=0.0,
-                item_status="Blocked",
-                schedule_reason="Planning manager approval is not Approved.",
-                factory_out_reason="Planning manager approval is not Approved.",
-            )
-            if not preview:
-                self._persist_item_result(conn, shipment, shipment_item_id, result, planning_version)
-            return result
+        # V10.4: approval status no longer gates production planning.  Keep the
+        # SMDS field for audit/UI history, but calculate from actual stock,
+        # process standards and physical capacity.
 
         completed_qty = min(order_qty, stock_allocated_qty + produced_qty)
         remaining_qty = max(order_qty - stock_allocated_qty - produced_qty, 0)
@@ -1110,7 +1095,36 @@ class FactoryPlanningEngine:
             return result
 
         total_plan = max(0.0, float(smds.get("total_plan") or 0))
-        if total_plan <= 0:
+        # V11: real learned capacity is the primary production-rate source.
+        # The legacy SMDS total_plan remains a technical fallback/reference.
+        line_hint = normalize_line_name(smds.get("line"))
+        learned_capacity = FactoryResourceIntelligenceService.resolve_capacity(
+            conn,
+            sap_code,
+            on_date=self.start_date,
+            line_name=line_hint,
+            ensure_schema=False,
+        )
+        stable_cavities = max(0, int(learned_capacity.stable_cavity_count or 0))
+        learned_per_cavity = 0.0
+        if learned_capacity.safe_capacity > 0:
+            if stable_cavities > 0:
+                learned_per_cavity = learned_capacity.safe_capacity / stable_cavities
+            elif total_plan > 0:
+                # With no learned stable-cavity count, never inflate the technical
+                # per-cavity standard; use learned evidence as a conservative cap.
+                learned_per_cavity = min(float(total_plan), float(learned_capacity.safe_capacity))
+            else:
+                learned_per_cavity = float(learned_capacity.safe_capacity)
+
+        effective_per_cavity = learned_per_cavity if learned_per_cavity > 0 else total_plan
+        smds["_v11_effective_per_cavity"] = effective_per_cavity
+        smds["_v11_capacity_source"] = learned_capacity.source
+        smds["_v11_capacity_confidence"] = learned_capacity.confidence_score
+        smds["_v11_stable_cavities"] = stable_cavities
+        smds["_v11_available_capacity"] = learned_capacity.available_capacity
+
+        if effective_per_cavity <= 0:
             result = ShipmentItemPlanResult(
                 shipment_id=int(shipment.get("id") or 0),
                 shipment_item_id=shipment_item_id,
@@ -1129,13 +1143,12 @@ class FactoryPlanningEngine:
                 progress_pct=round((completed_qty / order_qty * 100) if order_qty else 0.0, 2),
                 item_status="Blocked",
                 schedule_reason=(
-                    "SMDS process standard is missing or unresolved: "
-                    "curing cycle, handling time and total plan are required. "
-                    "Physical mold/casing/cavity capacity alone cannot create "
-                    "a production date."
+                    "No learned real-capacity evidence or usable technical "
+                    "capacity is available for this SAP. Import historical OVEN "
+                    "plans/PROD actuals or maintain a technical baseline."
                 ),
                 factory_out_reason=(
-                    "SMDS process standard is missing or unresolved."
+                    "No learned or technical production-capacity evidence is available."
                 ),
             )
             if not preview:
@@ -1175,7 +1188,17 @@ class FactoryPlanningEngine:
         smds: dict[str, Any],
         preview: bool = False,
     ) -> ShipmentItemPlanResult:
-        total_plan = max(0.0, float(smds.get("total_plan") or 0))
+        total_plan = max(
+            0.0,
+            float(
+                smds.get("_v11_effective_per_cavity")
+                or smds.get("total_plan")
+                or 0
+            ),
+        )
+        capacity_source = str(smds.get("_v11_capacity_source") or "TECHNICAL")
+        capacity_confidence = float(smds.get("_v11_capacity_confidence") or 0.0)
+        stable_cavity_hint = max(0, int(smds.get("_v11_stable_cavities") or 0))
         mold_key = normalize_mold_key(
             smds.get("key_code"),
         )
@@ -1427,7 +1450,18 @@ class FactoryPlanningEngine:
                     )
 
             item_status = "Planned"
-            reason = "Planned within available capacity."
+            reason = (
+                "Planned within physical resource limits using "
+                f"{capacity_source} capacity"
+                + (
+                    f" ({capacity_confidence * 100:.0f}% confidence)"
+                    if capacity_confidence > 0 else ""
+                )
+                + (
+                    f"; learned stable cavity setup {stable_cavity_hint}."
+                    if stable_cavity_hint > 0 else "."
+                )
+            )
         progress_pct = round((completed_qty / order_qty * 100) if order_qty else 0.0, 2)
         result = ShipmentItemPlanResult(
             shipment_id=int(shipment.get("id") or 0),

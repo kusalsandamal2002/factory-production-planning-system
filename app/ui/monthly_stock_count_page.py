@@ -322,7 +322,7 @@ class MonthlyStockCountPage(QWidget):
         layout.setContentsMargins(22, 20, 22, 20)
         layout.setSpacing(0)
 
-        title = QLabel("Monthly Stock Count")
+        title = QLabel("Monthly Opening Stock")
         title.setObjectName("PageTitle")
 
         self.file_badge = QLabel("")
@@ -347,7 +347,7 @@ class MonthlyStockCountPage(QWidget):
         layout.setHorizontalSpacing(12)
         layout.setVerticalSpacing(8)
 
-        section_title = "Month Selection" if self.is_viewer_mode else "Upload & Month Selection"
+        section_title = "Month Selection" if self.is_viewer_mode else "OVEN Auto Source & Manual Override"
 
         title = QLabel(section_title)
         title.setObjectName("SectionTitle")
@@ -385,7 +385,7 @@ class MonthlyStockCountPage(QWidget):
         self.search_input.setPlaceholderText("Search by Material or Description")
         self.search_input.textChanged.connect(self._on_search_changed)
 
-        self.upload_button = QPushButton("Upload Excel")
+        self.upload_button = QPushButton("Manual Override Excel")
         self.upload_button.setObjectName("PrimaryButton")
         self.upload_button.clicked.connect(self._upload_excel)
 
@@ -579,8 +579,8 @@ class MonthlyStockCountPage(QWidget):
         self._clear_table()
         self._reset_summary_cards()
 
-        self.file_badge.setText(f"{stock_month_label} | Need to upload stock count")
-        self._set_badge(self.mode_badge, "Need to upload", "ReadonlyBadge")
+        self.file_badge.setText(f"{stock_month_label} | Waiting for OVEN PROD STOCK or manual override")
+        self._set_badge(self.mode_badge, "Waiting for OVEN", "ReadonlyBadge")
         self._set_badge(self.save_badge, "Ready", "ReadonlyBadge")
 
     def _load_month_selector(self, preferred_stock_count_id: int | None = None) -> None:
@@ -619,7 +619,7 @@ class MonthlyStockCountPage(QWidget):
         if not records:
             self.current_stock_count_id = None
             self.month_selector.addItem(
-                f"{selected_month_label}  |  Need to upload stock count",
+                f"{selected_month_label}  |  Waiting for OVEN PROD STOCK",
                 None,
             )
             self.month_selector.setEnabled(False)
@@ -772,7 +772,7 @@ class MonthlyStockCountPage(QWidget):
             QMessageBox.critical(self, "Stock Import Failed", str(exc))
         finally:
             self.upload_button.setEnabled(True)
-            self.upload_button.setText("Upload Excel")
+            self.upload_button.setText("Manual Override Excel")
 
     def _populate_table(self, rows: list[dict[str, Any]]) -> None:
         self._loading_table = True

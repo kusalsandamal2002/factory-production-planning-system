@@ -9,6 +9,8 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.services.factory_resource_intelligence_service import FactoryResourceIntelligenceService
+
 
 ACTIVE_DEMAND_STATUSES = ("PENDING", "CONFIRMED", "PLANNED", "PARTIALLY_PLANNED")
 EXCLUDED_DEMAND_STATUSES = ("CANCELLED", "COMPLETED", "REJECTED")
@@ -160,7 +162,7 @@ def calculate_available_stock(
     scrap_stock: int,
     blocked_stock: int,
 ) -> int:
-    return int(fg_stock) + int(qc_stock) - int(scrap_stock) - int(blocked_stock)
+    return max(int(fg_stock), 0) + max(int(qc_stock), 0)
 
 
 def calculate_shortage(
@@ -719,73 +721,69 @@ def build_capacity_preview(
     session: Session,
     stock: StockPlanningRow,
 ) -> CapacityPreviewRow:
-    row = session.execute(
-        text(
-            """
-            SELECT
-                item_code,
-                running_moulds,
-                per_mould_capacity,
-                available_capacity_per_day,
-                target_date
-            FROM mpps_capacity_master
-            WHERE item_code = :material_code
-              AND is_active = TRUE
-            LIMIT 1;
-            """
-        ),
-        {"material_code": stock.material_code},
-    ).mappings().first()
+    """Capacity preview routed through the V11 real-capacity resolver."""
+    FactoryResourceIntelligenceService.ensure_schema(session)
+    resolved = FactoryResourceIntelligenceService.resolve_capacity(
+        session,
+        stock.material_code,
+        ensure_schema=False,
+    )
 
-    if row is None:
-        return CapacityPreviewRow(
-            item_code=stock.material_code,
-            item_description=stock.item_description,
-            production_required_qty=stock.production_required_qty,
-            running_moulds=0,
-            per_mould_capacity=0,
-            daily_capacity=0,
-            production_days=0,
-            target_date=None,
-            capacity_status="CAPACITY_DATA_MISSING",
-        )
+    # Preserve legacy technical values in the old UI fields for comparison only.
+    legacy = {}
+    try:
+        with session.begin_nested():
+            legacy = (
+                session.execute(
+                    text(
+                        """
+                        SELECT running_moulds, per_mould_capacity,
+                               available_capacity_per_day
+                        FROM mpps_capacity_master
+                        WHERE item_code=:material_code AND is_active=TRUE
+                        LIMIT 1
+                        """
+                    ),
+                    {"material_code": stock.material_code},
+                ).mappings().first()
+                or {}
+            )
+    except Exception:
+        legacy = {}
 
-    running_moulds = _to_float(row["running_moulds"])
-    per_mould_capacity = _to_float(row["per_mould_capacity"])
-    available_capacity_per_day = _to_float(row["available_capacity_per_day"])
-    target_date = row["target_date"]
-
-    calculated_daily_capacity = running_moulds * per_mould_capacity
-    daily_capacity = available_capacity_per_day or calculated_daily_capacity
-
+    running_moulds = _to_float(legacy.get("running_moulds"))
+    per_mould_capacity = _to_float(legacy.get("per_mould_capacity"))
+    daily_capacity = float(
+        resolved.available_capacity
+        or resolved.safe_capacity
+        or resolved.technical_capacity
+        or 0
+    )
     production_days = 0
-
     if stock.production_required_qty > 0 and daily_capacity > 0:
         production_days = int(ceil(stock.production_required_qty / daily_capacity))
 
-    capacity_status = "NO_PRODUCTION_REQUIRED"
-
-    if stock.production_required_qty > 0 and daily_capacity <= 0:
-        capacity_status = "CAPACITY_DATA_MISSING"
-    elif stock.production_required_qty > 0:
-        capacity_status = "CAPACITY_OK"
-
-        if target_date is not None:
-            days_available = (target_date - date.today()).days + 1
-
-            if days_available < production_days:
-                capacity_status = "CANNOT_COMPLETE_BY_TARGET"
+    if stock.production_required_qty <= 0:
+        status = "NO_PRODUCTION_REQUIRED"
+    elif daily_capacity <= 0:
+        status = "CAPACITY_DATA_MISSING"
+    elif resolved.available_capacity <= 0 and resolved.safe_capacity > 0:
+        status = "RESOURCE_CONSTRAINED"
+    elif resolved.confidence_band in {"COLD START", "TECHNICAL BASELINE"}:
+        status = "LOW_CONFIDENCE_CAPACITY"
+    else:
+        status = "REAL_CAPACITY_READY"
 
     return CapacityPreviewRow(
         item_code=stock.material_code,
         item_description=stock.item_description,
         production_required_qty=stock.production_required_qty,
-        running_moulds=round(running_moulds, 4),
-        per_mould_capacity=round(per_mould_capacity, 4),
-        daily_capacity=round(daily_capacity, 4),
+        running_moulds=running_moulds,
+        per_mould_capacity=per_mould_capacity,
+        daily_capacity=daily_capacity,
         production_days=production_days,
-        target_date=target_date,
-        capacity_status=capacity_status,
+        target_date=None,
+        capacity_status=status,
     )
 
 

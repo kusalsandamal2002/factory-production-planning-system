@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from app.config import settings
 from app.database import get_session
+from app.services.operational_source_service import OperationalSourceService
 from app.models import Role, User
 from app.ui.bead_master_page import BeadMasterPage
 from app.ui.bom_master_page import BomMasterPage
@@ -64,6 +65,7 @@ from app.ui.intelligent_operations_pages import (
 from app.ui.workbook_learning_center_page import (
     WorkbookLearningCenterPage,
 )
+from app.ui.factory_intelligence_page import FactoryIntelligencePage
 
 
 def _resolve_page_class(module_path: str, candidates: list[str]):
@@ -255,6 +257,7 @@ class MainWindow(QMainWindow):
     CAVITIES_MASTER_INDEX = 37
     DAILY_STOCK_INDEX = 38
     WORKBOOK_LEARNING_INDEX = 39
+    FACTORY_INTELLIGENCE_INDEX = 40
     MONTHLY_STOCK_MANAGER_ROLE = "Monthly Stock Manager"
     MONTHLY_STOCK_VIEWER_ROLE = "Monthly Stock Viewer"
 
@@ -478,6 +481,8 @@ class MainWindow(QMainWindow):
 
         self._add_caption(layout, "Data")
         self._add_nav_button(layout, "Master Data", self.TYRE_PRODUCT_TREE_INDEX)
+        self._add_nav_button(layout, "Monthly Opening Stock", self.MONTHLY_STOCK_COUNT_INDEX)
+        self._add_nav_button(layout, "Stock Control", self.STOCK_MASTER_INDEX)
 
         self._add_caption(layout, "Planning")
         self._add_nav_button(layout, "Production Planning", self.SCHEDULE_INDEX)
@@ -492,9 +497,11 @@ class MainWindow(QMainWindow):
         self._add_nav_button(layout, "Reports", self.REPORTS_INDEX)
         self._add_nav_button(layout, "Admin Settings", self.ADMIN_CONTROL_INDEX)
         self._add_nav_button(layout, "Intelligent Excel Import", self.RAW_EXCEL_VIEWER_INDEX)
-        self._add_nav_button(layout, "AI Learning Center", self.WORKBOOK_LEARNING_INDEX)
+        self._add_nav_button(layout, "AI Planning Center", self.WORKBOOK_LEARNING_INDEX)
+        self._add_nav_button(layout, "Factory Intelligence", self.FACTORY_INTELLIGENCE_INDEX)
 
         layout.addStretch()
+        layout.addWidget(self._build_live_source_badge())
         layout.addWidget(self._build_connection_badge())
 
         return sidebar
@@ -692,7 +699,7 @@ class MainWindow(QMainWindow):
             (
                 self.STOCK_MASTER_INDEX,
                 "stock_master_page",
-                "Stock Master",
+                "Stock Control Center",
                 StockMasterPage,
             ),
             (
@@ -791,9 +798,18 @@ class MainWindow(QMainWindow):
             (
                 self.WORKBOOK_LEARNING_INDEX,
                 "workbook_learning_center_page",
-                "AI Learning Center",
+                "AI Planning Center",
                 lambda: self._safe_create_page(
                     WorkbookLearningCenterPage,
+                    self.current_user,
+                ),
+            ),
+            (
+                self.FACTORY_INTELLIGENCE_INDEX,
+                "factory_intelligence_page",
+                "Factory Intelligence",
+                lambda: self._safe_create_page(
+                    FactoryIntelligencePage,
                     self.current_user,
                 ),
             ),
@@ -1164,13 +1180,24 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(
             stack_index
         )
-        QApplication.setOverrideCursor(
-            Qt.CursorShape.WaitCursor
+        # Shipment Details now owns a fully non-blocking background loader.
+        # Do not apply a global wait cursor while its lightweight page shell is
+        # being created; sidebar navigation must remain immediately usable.
+        use_wait_cursor = (
+            stack_index != self.SHIPMENT_DETAILS_INDEX
         )
+        if use_wait_cursor:
+            QApplication.setOverrideCursor(
+                Qt.CursorShape.WaitCursor
+            )
         self._set_loading_progress(
             placeholder,
             5,
-            "Opening workspace...",
+            (
+                "Opening workspace shell; data will load in background..."
+                if stack_index == self.SHIPMENT_DETAILS_INDEX
+                else "Opening workspace..."
+            ),
         )
 
         started = perf_counter()
@@ -1184,7 +1211,11 @@ class MainWindow(QMainWindow):
             self._set_loading_progress(
                 placeholder,
                 20,
-                "Building page controls and loading initial data...",
+                (
+                    "Building page controls; database load continues in background..."
+                    if stack_index == self.SHIPMENT_DETAILS_INDEX
+                    else "Building page controls and loading initial data..."
+                ),
             )
             page = factory()
             self._set_loading_progress(
@@ -1268,7 +1299,8 @@ class MainWindow(QMainWindow):
             return None, False
 
         finally:
-            QApplication.restoreOverrideCursor()
+            if use_wait_cursor:
+                QApplication.restoreOverrideCursor()
 
     def _safe_create_page(self, page_class, *args) -> QWidget:
         try:
@@ -1376,6 +1408,32 @@ class MainWindow(QMainWindow):
         layout.addWidget(role)
 
         return box
+
+    def _build_live_source_badge(self) -> QLabel:
+        self.live_source_badge = QLabel("Live OVEN: -")
+        self.live_source_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.live_source_badge.setWordWrap(True)
+        self.live_source_badge.setStyleSheet(
+            "background:#052e2b;color:#a7f3d0;border:1px solid #115e59;"
+            "border-radius:8px;padding:7px 8px;font-size:9px;font-weight:900;"
+        )
+        self._refresh_live_source_badge()
+        return self.live_source_badge
+
+    def _refresh_live_source_badge(self) -> None:
+        if not hasattr(self, "live_source_badge"):
+            return
+        try:
+            with get_session() as session:
+                source = OperationalSourceService.latest(session)
+            if source.plan_date:
+                self.live_source_badge.setText(f"Live OVEN\n{source.plan_date.isoformat()}")
+                self.live_source_badge.setToolTip(source.workbook_name or source.label)
+            else:
+                self.live_source_badge.setText("Live OVEN\nnot imported")
+                self.live_source_badge.setToolTip("No committed live OVEN workbook found.")
+        except Exception:
+            self.live_source_badge.setText("Live OVEN\nunknown")
 
     def _build_connection_badge(self) -> QLabel:
         badge = QLabel("PostgreSQL Connected")
@@ -1547,6 +1605,7 @@ class MainWindow(QMainWindow):
         self,
         index: int,
     ) -> None:
+        self._refresh_live_source_badge()
         self._sync_sidebar_selection(index)
 
         if self.monthly_stock_only_mode:

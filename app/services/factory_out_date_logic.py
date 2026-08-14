@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy import text
 
 from app.database import engine
+from app.services.factory_resource_intelligence_service import FactoryResourceIntelligenceService
 
 
 OPEN_SHIPMENT_STATUSES = {"planned", "pending", "open", "saved", "in progress", "processing"}
@@ -199,25 +200,9 @@ class FactoryOutDateCalculator:
                 reason="SMDS item data not found.",
             )
 
-        approval = self._norm(str(smds.get("planning_manager_approval_status") or "Pending"))
-        if approval != "approved":
-            return FactoryOutItemResult(
-                sap_code=sap_code,
-                description=description,
-                order_qty=order_qty,
-                stock_allocated_qty=0,
-                production_required_qty=order_qty,
-                allocated_cavity_count=0,
-                daily_capacity=0,
-                production_days=0,
-                receive_date=None,
-                status="Blocked",
-                reason="Planning Manager Approval Status is not Approved.",
-                mold_key_code=str(smds.get("key_code") or ""),
-                casing_type=str(smds.get("casing_type") or ""),
-                line=str(smds.get("line") or ""),
-                smds_total_plan=self._int(smds.get("total_plan"), 0),
-            )
+        # V10.4: Planning-manager approval is audit metadata only.  Factory-out
+        # feasibility is driven by real operational evidence (stock, process
+        # standard, resources and learned capacity), never by an approval flag.
 
         stock_alloc = min(order_qty, max(0, available_stock))
         balance_qty = max(0, order_qty - stock_alloc)
@@ -246,24 +231,15 @@ class FactoryOutDateCalculator:
                 smds_total_plan=total_plan,
             )
 
-        if total_plan <= 0:
-            return FactoryOutItemResult(
-                sap_code=sap_code,
-                description=description,
-                order_qty=order_qty,
-                stock_allocated_qty=stock_alloc,
-                production_required_qty=balance_qty,
-                allocated_cavity_count=0,
-                daily_capacity=0,
-                production_days=0,
-                receive_date=None,
-                status="Blocked",
-                reason="SMDS Total Plan is missing or zero.",
-                mold_key_code=mold_key,
-                casing_type=casing_type,
-                line=line,
-                smds_total_plan=total_plan,
-            )
+        # V11: the same authoritative Real Capacity Resolver used by planning
+        # drives Factory Can Out.  SMDS total_plan is only a technical fallback.
+        base_resolution = FactoryResourceIntelligenceService.resolve_capacity(
+            conn,
+            sap_code,
+            on_date=self.start_date,
+            line_name=line,
+            ensure_schema=False,
+        )
 
         resource = self._allocated_cavity_count(conn, mold_key, casing_type, line)
         available_cavities = int(resource["allocated_cavity_count"])
@@ -287,24 +263,69 @@ class FactoryOutDateCalculator:
                 smds_total_plan=total_plan,
             )
 
-        # Allocate only the cavities required for this item's production quantity.
-        # Example: qty 1 and total_plan 2 means only 1 cavity is needed, not all free cavities.
-        required_cavities = max(1, int(ceil(balance_qty / total_plan)))
+        stable_cavities = max(0, int(base_resolution.stable_cavity_count or 0))
+        learned_total = max(
+            0.0,
+            float(base_resolution.safe_capacity or 0),
+            float(base_resolution.available_capacity or 0),
+        )
+        if learned_total > 0 and stable_cavities > 0:
+            effective_per_cavity = learned_total / stable_cavities
+        elif total_plan > 0 and learned_total > 0:
+            effective_per_cavity = min(float(total_plan), learned_total)
+        elif learned_total > 0:
+            effective_per_cavity = learned_total
+        else:
+            effective_per_cavity = float(total_plan or 0)
+
+        if effective_per_cavity <= 0:
+            return FactoryOutItemResult(
+                sap_code=sap_code,
+                description=description,
+                order_qty=order_qty,
+                stock_allocated_qty=stock_alloc,
+                production_required_qty=balance_qty,
+                allocated_cavity_count=0,
+                daily_capacity=0,
+                production_days=0,
+                receive_date=None,
+                status="Blocked",
+                reason="No learned real-capacity evidence or usable technical baseline is available.",
+                mold_key_code=mold_key,
+                casing_type=casing_type,
+                line=line,
+                smds_total_plan=total_plan,
+            )
+
+        required_cavities = max(1, int(ceil(balance_qty / effective_per_cavity)))
         cavities = min(available_cavities, required_cavities)
 
-        daily_capacity = max(0, total_plan * cavities)
+        resolved = FactoryResourceIntelligenceService.resolve_capacity(
+            conn,
+            sap_code,
+            on_date=self.start_date,
+            line_name=line,
+            requested_cavities=cavities,
+            ensure_schema=False,
+        )
+        daily_capacity = int(round(max(
+            0.0,
+            float(resolved.available_capacity or 0),
+            effective_per_cavity * cavities,
+        )))
         if daily_capacity <= 0:
             production_days = 0
             receive_date = None
             status = "Blocked"
-            reason = "Daily production capacity is zero."
+            reason = "Constraint-adjusted real production capacity is zero."
         else:
             production_days = int(ceil(balance_qty / daily_capacity))
             receive_date = self.start_date + timedelta(days=max(0, production_days - 1))
-            status = "Calculated"
+            status = "Forecast" if resolved.sample_days > 0 else "Calculated"
             reason = (
                 f"Stock {stock_alloc}; production {balance_qty}; "
-                f"capacity {total_plan} × {cavities} cavities = {daily_capacity}/day."
+                f"V11 capacity {daily_capacity}/day using {cavities} cavity position(s); "
+                f"source {resolved.source}; confidence {resolved.confidence_score:.0%}."
             )
 
         return FactoryOutItemResult(
@@ -381,8 +402,8 @@ class FactoryOutDateCalculator:
             return 0
         try:
             row = conn.execute(text("""
-                SELECT COALESCE(fg_stock, 0) + COALESCE(qc_stock, 0)
-                     - COALESCE(scrap_stock, 0) - COALESCE(blocked_stock, 0) AS available_stock
+                SELECT GREATEST(COALESCE(fg_stock, 0), 0)
+                     + GREATEST(COALESCE(qc_stock, 0), 0) AS available_stock
                 FROM mpps_sap_stock_items
                 WHERE TRIM(sap_code) = :sap_code
                 LIMIT 1

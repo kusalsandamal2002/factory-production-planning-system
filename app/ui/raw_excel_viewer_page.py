@@ -41,6 +41,9 @@ from app.services.intelligent_excel_import_service import (
 )
 
 
+from app.utils.import_error_utils import extract_task_error_reason
+
+
 class _TaskWorker(QThread):
     progress = Signal(int, str)
     completed = Signal(object)
@@ -72,20 +75,28 @@ class RawExcelViewerPage(QWidget):
         self.sync_preview: dict[str, Any] = {}
         self.worker: _TaskWorker | None = None
         self.selected_file = ""
+        self._task_kind = "idle"
+        self._pipeline_active_index = -1
+        self._pipeline_labels: list[QLabel] = []
+        self.setMinimumWidth(0)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self._build_ui()
         self.refresh_history()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(22, 18, 22, 20)
-        root.setSpacing(12)
+        root.setContentsMargins(18, 16, 18, 18)
+        root.setSpacing(10)
 
         header = QHBoxLayout()
         title_box = QVBoxLayout()
         title = QLabel("Intelligent Excel Import Center")
         title.setObjectName("ExcelImportTitle")
         title.setStyleSheet(
-            "font-size:26px;font-weight:900;color:#0f172a;"
+            "font-size:24px;font-weight:900;color:#0f172a;"
         )
         subtitle = QLabel(
             "One workbook → stock, shipment demand, production history, "
@@ -103,7 +114,8 @@ class RawExcelViewerPage(QWidget):
 
         self.status_badge = QLabel("READY FOR ANALYSIS")
         self.status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_badge.setMinimumWidth(190)
+        self.status_badge.setMinimumWidth(155)
+        self.status_badge.setMaximumWidth(210)
         self.status_badge.setStyleSheet(
             "background:#e0f2fe;color:#075985;border:1px solid #7dd3fc;"
             "border-radius:16px;padding:8px 14px;font-weight:900;"
@@ -121,20 +133,23 @@ class RawExcelViewerPage(QWidget):
         source_layout.addWidget(source_title)
 
         source_row = QHBoxLayout()
+        source_row.setSpacing(8)
         self.file_box = QLineEdit()
         self.file_box.setPlaceholderText(
             "Select OVEN / MPPS production workbook (.xlsx or .xlsm)"
         )
         self.file_box.setMinimumHeight(38)
+        self.file_box.setMinimumWidth(220)
         source_row.addWidget(self.file_box, 1)
 
-        browse_btn = QPushButton("Browse Workbook")
+        browse_btn = QPushButton("Browse")
         browse_btn.setMinimumHeight(38)
         browse_btn.clicked.connect(self.browse_file)
         source_row.addWidget(browse_btn)
 
-        self.analyze_btn = QPushButton("Analyze with Semantic Engine")
+        self.analyze_btn = QPushButton("Analyze Workbook")
         self.analyze_btn.setMinimumHeight(38)
+        self.analyze_btn.setMinimumWidth(160)
         self.analyze_btn.setStyleSheet(
             "background:#0f766e;color:white;font-weight:900;padding:0 18px;"
         )
@@ -150,6 +165,48 @@ class RawExcelViewerPage(QWidget):
         self.progress_label.setStyleSheet("color:#64748b;")
         source_layout.addWidget(self.progress)
         source_layout.addWidget(self.progress_label)
+
+        # Compact live pipeline directly under the progress bar.  The operator can
+        # see which data domain is currently being scanned/written instead of only
+        # watching a percentage move.  Stage labels are reconfigured for ANALYZE,
+        # COMMIT and ROLLBACK tasks.
+        self.pipeline_frame = QFrame()
+        self.pipeline_frame.setStyleSheet(
+            "QFrame {background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;}"
+        )
+        pipeline_layout = QVBoxLayout(self.pipeline_frame)
+        pipeline_layout.setContentsMargins(10, 8, 10, 8)
+        pipeline_layout.setSpacing(6)
+
+        pipeline_header = QHBoxLayout()
+        pipeline_title = QLabel("LIVE DATA PIPELINE")
+        pipeline_title.setStyleSheet("font-size:10px;font-weight:900;color:#475569;")
+        self.pipeline_mode = QLabel("IDLE")
+        self.pipeline_mode.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.pipeline_mode.setStyleSheet("font-size:10px;font-weight:900;color:#64748b;")
+        pipeline_header.addWidget(pipeline_title)
+        pipeline_header.addStretch()
+        pipeline_header.addWidget(self.pipeline_mode)
+        pipeline_layout.addLayout(pipeline_header)
+
+        self.pipeline_row = QHBoxLayout()
+        self.pipeline_row.setSpacing(6)
+        for _ in range(8):
+            label = QLabel("—")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setMinimumWidth(0)
+            label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            label.setMinimumHeight(28)
+            self._pipeline_labels.append(label)
+            self.pipeline_row.addWidget(label, 1)
+        pipeline_layout.addLayout(self.pipeline_row)
+
+        self.pipeline_activity = QLabel("Waiting for a workbook task.")
+        self.pipeline_activity.setWordWrap(True)
+        self.pipeline_activity.setStyleSheet("font-size:10px;color:#475569;font-weight:700;")
+        pipeline_layout.addWidget(self.pipeline_activity)
+        source_layout.addWidget(self.pipeline_frame)
+        self._configure_pipeline("idle")
         root.addWidget(source_card)
 
         self.kpi_grid = QGridLayout()
@@ -158,7 +215,7 @@ class RawExcelViewerPage(QWidget):
         kpi_specs = [
             ("confidence", "Workbook Confidence"),
             ("sheets", "Mapped Sheets"),
-            ("stock", "Stock Items"),
+            ("stock", "Opening Stock Items"),
             ("shipments", "Shipment Orders"),
             ("demand", "Shipment Qty"),
             ("required", "Production Required"),
@@ -174,7 +231,7 @@ class RawExcelViewerPage(QWidget):
         ]
         for index, (key, caption) in enumerate(kpi_specs):
             card = self._metric_card(key, caption)
-            self.kpi_grid.addWidget(card, index // 5, index % 5)
+            self.kpi_grid.addWidget(card, index // 4, index % 4)
         root.addLayout(self.kpi_grid)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -209,7 +266,7 @@ class RawExcelViewerPage(QWidget):
             [
                 "SAP Code",
                 "Description",
-                "FG Stock",
+                "PROD Opening",
                 "Scrap",
                 "Blocked",
                 "Shipment",
@@ -307,40 +364,49 @@ class RawExcelViewerPage(QWidget):
         options = QGridLayout()
         self.option_boxes: dict[str, QCheckBox] = {}
         option_specs = [
-            ("archive_source", "Archive exact source workbook", True),
-            ("auto_detect_import_mode", "Auto-detect historical vs live revision", True),
-            ("update_stock", "Update current stock only for latest live revision", True),
-            ("update_daily_stock", "Create dated daily-stock snapshot", True),
-            ("sync_live_shipments", "Auto-sync live shipments (new / update / remove safely)", True),
-            ("mark_missing_shipments", "Mark shipments missing from latest workbook", True),
-            ("sync_deferred_shipments", "Sync deferred / inactive Excel shipments", False),
-            ("update_blank_weights", "Fill blank/zero approved weights", True),
+            ("archive_source", "Archive source workbook", True),
+            ("auto_detect_import_mode", "Auto-detect live / history", True),
+            ("authoritative_latest_shipments", "Latest workbook = FINAL shipment truth", True),
+            ("sync_live_shipments", "Update live shipments", True),
+            ("mark_missing_shipments", "Remove old Excel shipments from live plan", True),
+            ("sync_deferred_shipments", "Include all non-zero Excel shipments", True),
+            ("update_blank_weights", "Fill missing approved weights", True),
             ("overwrite_existing_weights", "Overwrite existing weights", False),
-            ("import_oven_plan", "Import oven/cavity day-night plan", True),
-            ("import_materials", "Import compound/BOM/bead/band/core", True),
-            ("import_shipment_snapshots", "Import all shipment snapshots", True),
-            ("import_production_history", "Import dated production history", True),
-            ("capture_learning_observations", "Capture ML learning observations", True),
-            ("rebuild_learning_models", "Rebuild advisory learning models", True),
+            ("import_oven_plan", "Import oven / shift plan", True),
+            ("import_materials", "Import materials / BOM", True),
+            ("import_shipment_snapshots", "Import shipment snapshots", True),
+            ("import_production_history", "Import actual production history", True),
+            ("capture_learning_observations", "Capture AI learning data", True),
+            ("rebuild_learning_models", "Rebuild advisory AI models", True),
         ]
         for index, (key, text, checked) in enumerate(option_specs):
             checkbox = QCheckBox(text)
             checkbox.setChecked(checked)
             if key in {
                 "overwrite_existing_weights",
-                "sync_deferred_shipments",
             }:
                 checkbox.setStyleSheet("color:#b45309;font-weight:800;")
+            if key == "authoritative_latest_shipments":
+                checkbox.setStyleSheet("color:#166534;font-weight:900;")
+            checkbox.setMinimumWidth(0)
+            checkbox.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Preferred,
+            )
             self.option_boxes[key] = checkbox
-            options.addWidget(checkbox, index // 5, index % 5)
+            options.addWidget(checkbox, index // 3, index % 3)
         control_layout.addLayout(options)
 
         warning = QLabel(
-            "Continuous-sync protection: the newest workbook updates one stable "
-            "live shipment instead of creating duplicates. Older workbooks become "
-            "historical snapshots. Manual target dates, holds, produced/completed "
-            "quantities and manually locked items are never overwritten. ML models "
-            "remain advisory and do not change the live production plan automatically."
+            "FINAL Excel authority: the newest OVEN workbook by plan date is the "
+            "real live shipment list. Previous Excel-managed live shipments are "
+            "archived and removed from operational planning, then the newest workbook "
+            "is rebuilt exactly from its non-zero shipment quantities. Older workbooks "
+            "remain history / ML training only and never move live operations backwards. "
+            "PROD column D (TOTAL STOCK) is treated as monthly opening-stock evidence, "
+            "while dated DAY/NIGHT pairs are verified actual production. Actual production, "
+            "opening-stock evidence, import history and AI learning history are preserved. "
+            "AI remains advisory until forward validation proves it reliable."
         )
         warning.setWordWrap(True)
         warning.setStyleSheet(
@@ -391,7 +457,12 @@ class RawExcelViewerPage(QWidget):
 
     def _metric_card(self, key: str, caption: str) -> QFrame:
         card = self._card()
-        card.setMinimumHeight(84)
+        card.setMinimumWidth(0)
+        card.setMinimumHeight(76)
+        card.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
         layout = QVBoxLayout(card)
         layout.setContentsMargins(12, 9, 12, 9)
         value = QLabel("—")
@@ -414,7 +485,14 @@ class RawExcelViewerPage(QWidget):
         table.verticalHeader().setVisible(False)
         header = table.horizontalHeader()
         header.setStretchLastSection(True)
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setDefaultSectionSize(125)
+        header.setMinimumSectionSize(70)
+        table.setMinimumWidth(0)
+        table.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         table.setStyleSheet(
             "QTableWidget {border:0;background:white;gridline-color:#e2e8f0;}"
             "QHeaderView::section {background:#f8fafc;color:#334155;"
@@ -462,16 +540,18 @@ class RawExcelViewerPage(QWidget):
             )
             return
         live_sync = self.option_boxes["sync_live_shipments"].isChecked()
+        authoritative = self.option_boxes["authoritative_latest_shipments"].isChecked()
         overwrite_weights = self.option_boxes["overwrite_existing_weights"].isChecked()
         sync_deferred = self.option_boxes["sync_deferred_shipments"].isChecked()
-        if live_sync or overwrite_weights or sync_deferred:
+        if live_sync or authoritative or overwrite_weights or sync_deferred:
             reply = QMessageBox.warning(
                 self,
-                "Controlled Update Confirmation",
-                "You enabled live revision synchronization, deferred-shipment sync "
-                "or approved-weight overwrite. The preview shows the exact new, "
-                "updated, removed and protected rows. The import remains reversible. "
-                "Continue?",
+                "FINAL Excel Shipment Update",
+                "The newest workbook will become the FINAL live shipment truth. "
+                "Previous Excel-managed live shipments will be archived and removed "
+                "from operational planning before this workbook is rebuilt. Actual "
+                "production, stock history, import history and AI learning are kept. "
+                "The import remains rollback-capable. Continue?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -618,21 +698,147 @@ class RawExcelViewerPage(QWidget):
         if self.worker and self.worker.isRunning():
             QMessageBox.information(self, "Task Running", "Wait for the current task to finish.")
             return
+        lower_label = label.lower()
+        if "commit" in lower_label or "update" in lower_label:
+            self._task_kind = "commit"
+            badge = ("COMMITTING UPDATE", "#dbeafe", "#1d4ed8", "#93c5fd")
+        elif "rollback" in lower_label:
+            self._task_kind = "rollback"
+            badge = ("ROLLING BACK", "#fef3c7", "#92400e", "#fde68a")
+        else:
+            self._task_kind = "analyze"
+            badge = ("ANALYZING", "#e0f2fe", "#075985", "#7dd3fc")
+
         self._set_busy(True)
         self.progress.setValue(0)
+        self.progress.setFormat("%p%")
         self.progress_label.setText(label)
+        self._configure_pipeline(self._task_kind)
+        self._set_status(*badge)
         self.output.setPlainText(label + "...")
-        self.worker = _TaskWorker(action)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.completed.connect(completed)
-        self.worker.completed.connect(lambda _: self._set_busy(False))
-        self.worker.failed.connect(self._task_failed)
-        self.worker.failed.connect(lambda _: self._set_busy(False))
-        self.worker.start()
+        worker = _TaskWorker(action)
+        self.worker = worker
+        worker.progress.connect(self._on_progress)
+        worker.completed.connect(completed)
+        worker.failed.connect(self._task_failed)
+        # Re-enable controls only after QThread.run() has actually returned.
+        # Enabling them from completed/failed can let a second task overwrite
+        # self.worker while the first QThread is still finishing, which causes
+        # "QThread: Destroyed while thread is still running".
+        worker.finished.connect(self._worker_finished)
+        worker.start()
+
+    def _worker_finished(self) -> None:
+        sender = self.sender()
+        if sender is self.worker:
+            self.worker = None
+        self._set_busy(False)
 
     def _on_progress(self, percent: int, message: str) -> None:
-        self.progress.setValue(percent)
-        self.progress_label.setText(message)
+        value = max(0, min(100, int(percent)))
+        self.progress.setValue(value)
+        self.progress_label.setText(f"{message}  •  {value}%")
+        self._update_pipeline(value, message)
+
+    def _configure_pipeline(self, task_kind: str) -> None:
+        stages = {
+            "analyze": [
+                "Workbook", "PROD / Stock", "Shipments", "Oven / Shift",
+                "Materials", "Actuals", "Validation", "Ready",
+            ],
+            "commit": [
+                "Schema / Archive", "Shipments", "Oven / Shift", "Materials",
+                "Opening Stock", "Actuals + AI", "Replan", "Commit",
+            ],
+            "rollback": [
+                "Load Ledger", "Restore Data", "Restore Stock", "Restore Plans",
+                "Restore History", "Validate", "Refresh", "Complete",
+            ],
+            "idle": [
+                "Workbook", "Shipments", "Plans", "Materials",
+                "Opening Stock", "Actuals + AI", "Replan", "Commit",
+            ],
+        }.get(task_kind, [])
+        self._pipeline_active_index = -1
+        self.pipeline_mode.setText(task_kind.upper())
+        self.pipeline_activity.setText(
+            "Waiting for a workbook task." if task_kind == "idle"
+            else "Pipeline initialized; waiting for the first data stage."
+        )
+        for index, label in enumerate(self._pipeline_labels):
+            label.setText(stages[index] if index < len(stages) else "—")
+            self._style_pipeline_label(label, "pending")
+
+    @staticmethod
+    def _style_pipeline_label(label: QLabel, state: str) -> None:
+        styles = {
+            "pending": ("#ffffff", "#64748b", "#cbd5e1"),
+            "active": ("#dbeafe", "#1d4ed8", "#60a5fa"),
+            "done": ("#dcfce7", "#166534", "#86efac"),
+            "failed": ("#fee2e2", "#991b1b", "#fca5a5"),
+        }
+        background, color, border = styles.get(state, styles["pending"])
+        label.setStyleSheet(
+            f"background:{background};color:{color};border:1px solid {border};"
+            "border-radius:7px;padding:4px 5px;font-size:9px;font-weight:900;"
+        )
+
+    def _pipeline_stage_index(self, percent: int, message: str) -> int:
+        text_value = str(message or "").lower()
+        if self._task_kind == "analyze":
+            if percent >= 100 or "analysis complete" in text_value:
+                return 7
+            if "professional import preview" in text_value or "validat" in text_value:
+                return 6
+            if "actual" in text_value:
+                return 5
+            if any(word in text_value for word in ("compound", "bom", "bead", "band", "core", "material")):
+                return 4
+            if any(word in text_value for word in ("oven", "cavity", "shift")):
+                return 3
+            if "shipment" in text_value:
+                return 2
+            if any(word in text_value for word in ("prod", "stock")):
+                return 1
+            return 0
+        if self._task_kind == "rollback":
+            return min(7, max(0, int(percent / 14.3)))
+
+        # Commit / update pipeline.  Keyword mapping is more useful than a raw
+        # percentage because the service progress is scaled before final replanning.
+        if percent >= 100 or "complete" in text_value or "committed" in text_value:
+            return 7
+        if "replan" in text_value or "reallocating" in text_value:
+            return 6
+        if any(word in text_value for word in ("actual production", "learning", "ai ", "reconcil", "capacity")):
+            return 5
+        if "opening stock" in text_value:
+            return 4
+        if any(word in text_value for word in ("compound", "bom", "bead", "band", "core", "material")):
+            return 3
+        if any(word in text_value for word in ("oven", "cavity", "day and night", "shift plan")):
+            return 2
+        if "shipment" in text_value:
+            return 1
+        return 0
+
+    def _update_pipeline(self, percent: int, message: str) -> None:
+        index = self._pipeline_stage_index(percent, message)
+        self._pipeline_active_index = index
+        for stage_index, label in enumerate(self._pipeline_labels):
+            if percent >= 100:
+                state = "done"
+            elif stage_index < index:
+                state = "done"
+            elif stage_index == index:
+                state = "active"
+            else:
+                state = "pending"
+            self._style_pipeline_label(label, state)
+        stage_name = self._pipeline_labels[index].text() if 0 <= index < len(self._pipeline_labels) else "Task"
+        self.pipeline_activity.setText(
+            f"CURRENT DATA STAGE: {stage_name}  •  {message}  •  overall {percent}%"
+        )
 
     def _analysis_complete(self, analysis: WorkbookAnalysis) -> None:
         self.analysis = analysis
@@ -715,13 +921,26 @@ class RawExcelViewerPage(QWidget):
     def _task_failed(self, details: str) -> None:
         self._set_status("TASK FAILED", "#fee2e2", "#991b1b", "#fecaca")
         self.output.setPlainText(details)
-        lines = [line.strip() for line in details.splitlines() if line.strip()]
-        exact_reason = lines[-1] if lines else "Unknown import error"
+        exact_reason = extract_task_error_reason(details)
+        if 0 <= self._pipeline_active_index < len(self._pipeline_labels):
+            self._style_pipeline_label(self._pipeline_labels[self._pipeline_active_index], "failed")
+        self.pipeline_mode.setText("FAILED / ROLLED BACK")
+        self.pipeline_activity.setText(
+            f"FAILED SAFELY: {exact_reason} • No partial workbook update was committed."
+        )
+        guidance = ""
+        if "uq_monthly_stock_line_material" in details:
+            guidance = (
+                "\n\nOpening-stock key conflict: the same month + SAP already exists in the "
+                "monthly stock ledger. The V10.6 importer uses an atomic database UPSERT "
+                "for this key, so re-analyze and commit after installing the fix."
+            )
         QMessageBox.critical(
             self,
             "Intelligent Excel Import Error",
             "The task was stopped and the database transaction was rolled back.\n\n"
-            f"Exact reason:\n{exact_reason}\n\n"
+            f"Exact reason:\n{exact_reason}"
+            f"{guidance}\n\n"
             "The complete traceback remains in Technical Output.",
         )
 
@@ -901,38 +1120,44 @@ class RawExcelViewerPage(QWidget):
         self._fill_table(self.sync_table, rows)
 
     def _fill_issues(self, analysis: WorkbookAnalysis) -> None:
-        self.issue_table.setRowCount(0)
-        colors = {
-            "BLOCKER": QColor("#fee2e2"),
-            "WARNING": QColor("#fef3c7"),
-            "INFO": QColor("#e0f2fe"),
-        }
-        for issue in analysis.issues:
-            row = self.issue_table.rowCount()
-            self.issue_table.insertRow(row)
-            values = [
-                issue.severity,
-                issue.category,
-                issue.sheet_name,
-                issue.cell_address,
-                issue.item_key,
-                issue.message,
-                issue.recommendation,
-            ]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(_display(value))
-                item.setBackground(colors.get(issue.severity, QColor("#ffffff")))
-                self.issue_table.setItem(row, column, item)
+        self.issue_table.setSortingEnabled(False)
+        self.issue_table.setUpdatesEnabled(False)
+        try:
+            self.issue_table.setRowCount(len(analysis.issues))
+            colors = {
+                "BLOCKER": QColor("#fee2e2"),
+                "WARNING": QColor("#fef3c7"),
+                "INFO": QColor("#e0f2fe"),
+            }
+            for row, issue in enumerate(analysis.issues):
+                values = [
+                    issue.severity,
+                    issue.category,
+                    issue.sheet_name,
+                    issue.cell_address,
+                    issue.item_key,
+                    issue.message,
+                    issue.recommendation,
+                ]
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(_display(value))
+                    item.setBackground(colors.get(issue.severity, QColor("#ffffff")))
+                    self.issue_table.setItem(row, column, item)
+        finally:
+            self.issue_table.setUpdatesEnabled(True)
+            self.issue_table.setSortingEnabled(True)
 
     def _fill_table(self, table: QTableWidget, rows: list[list[Any]]) -> None:
         table.setSortingEnabled(False)
-        table.setRowCount(0)
-        for values in rows:
-            row = table.rowCount()
-            table.insertRow(row)
-            for column, value in enumerate(values):
-                table.setItem(row, column, QTableWidgetItem(_display(value)))
-        table.setSortingEnabled(True)
+        table.setUpdatesEnabled(False)
+        try:
+            table.setRowCount(len(rows))
+            for row, values in enumerate(rows):
+                for column, value in enumerate(values):
+                    table.setItem(row, column, QTableWidgetItem(_display(value)))
+        finally:
+            table.setUpdatesEnabled(True)
+            table.setSortingEnabled(True)
 
     def _metric(self, key: str, value: str) -> None:
         self.kpi_labels[key][0].setText(value)

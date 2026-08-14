@@ -711,75 +711,25 @@ class CasingRepository:
         self,
         casing_type: str,
     ) -> None:
-        casing_type = normalize_casing_type(
-            casing_type
-        )
-
+        """V11 lifecycle action: retire casing resources, never hard-delete history."""
+        casing_type = normalize_casing_type(casing_type)
         if is_no_casing(casing_type):
-            raise ValueError(
-                "'No Casing' is a protected planning rule."
-            )
+            raise ValueError("'No Casing' is a protected planning rule.")
 
         with engine.begin() as conn:
-            references = conn.execute(
-                text(
-                    """
-                    SELECT
-                        (
-                            SELECT COUNT(*)
-                            FROM smds
-                            WHERE mpps_identifier_key(
-                                    casing_type
-                                  )
-                                = mpps_identifier_key(
-                                    :casing_type
-                                  )
-                        )
-                        + (
-                            SELECT COUNT(*)
-                            FROM mold_master
-                            WHERE mpps_identifier_key(
-                                    casing_type
-                                  )
-                                = mpps_identifier_key(
-                                    :casing_type
-                                  )
-                        )
-                        + (
-                            SELECT COUNT(*)
-                            FROM
-                                planning_resource_reservations
-                            WHERE resource_type = 'casing'
-                              AND mpps_identifier_key(
-                                    resource_key
-                                  )
-                                  = mpps_identifier_key(
-                                    :casing_type
-                                  )
-                        )
-                    """
-                ),
-                {"casing_type": casing_type},
-            ).scalar_one()
-
-            if int(references or 0) > 0:
-                raise ValueError(
-                    "This casing type is still referenced "
-                    "by SMDS, Mold Master, or planning "
-                    "reservations. Rename or correct those "
-                    "records before deletion."
-                )
-
             conn.execute(
                 text(
                     """
-                    DELETE FROM casing_units
-                    WHERE mpps_identifier_key(
-                            casing_type
-                          )
-                        = mpps_identifier_key(
-                            :casing_type
-                          )
+                    UPDATE casing_master
+                    SET status='Retired',
+                        is_active=FALSE,
+                        remarks=CASE
+                            WHEN TRIM(COALESCE(remarks,''))=''
+                            THEN 'Retired from technical register; historical ML evidence retained.'
+                            ELSE remarks END,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE mpps_identifier_key(casing_type)
+                        = mpps_identifier_key(:casing_type)
                     """
                 ),
                 {"casing_type": casing_type},
@@ -787,17 +737,17 @@ class CasingRepository:
             conn.execute(
                 text(
                     """
-                    DELETE FROM casing_master
-                    WHERE mpps_identifier_key(
-                            casing_type
-                          )
-                        = mpps_identifier_key(
-                            :casing_type
-                          )
+                    UPDATE casing_units
+                    SET condition_status='Retired',
+                        stock_status='Reserved',
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE mpps_identifier_key(casing_type)
+                        = mpps_identifier_key(:casing_type)
                     """
                 ),
                 {"casing_type": casing_type},
             )
+
 
     def list_units(self, casing_type: str, search_text: str = "") -> list[dict]:
         search = (search_text or "").strip().lower()
@@ -1579,7 +1529,7 @@ class CasingMasterPage(QWidget):
         edit_type_button.setObjectName("SecondaryButton")
         edit_type_button.clicked.connect(self.edit_current_type)
 
-        delete_type_button = QPushButton("Delete Type")
+        delete_type_button = QPushButton("Retire Type")
         delete_type_button.setObjectName("DangerButton")
         delete_type_button.clicked.connect(self.delete_current_type)
 
@@ -1971,8 +1921,8 @@ class CasingMasterPage(QWidget):
 
         answer = QMessageBox.question(
             self,
-            "Delete Casing Type",
-            f"Delete {casing_type} and all its casing units?",
+            "Retire Casing Type",
+            f"Retire {casing_type}? Historical units and ML evidence will be retained.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
 

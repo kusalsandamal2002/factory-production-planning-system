@@ -1379,12 +1379,8 @@ def _validate_demand(
 ) -> str:
     if not demand.source:
         return "SMDS technical data was not found."
-    if demand.approval_status.strip().lower() != (
-        "approved"
-    ):
-        return (
-            "Planning Manager Approval is not Approved."
-        )
+    # Planning-manager approval is intentionally non-blocking.  Cavity
+    # feasibility is validated from technical/process/resource evidence only.
     if not demand.line_names:
         return "No compatible production line is defined."
     if demand.effective_cycle_minutes <= 0:

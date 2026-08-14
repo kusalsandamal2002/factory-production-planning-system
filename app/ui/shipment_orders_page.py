@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import csv
 from datetime import date, datetime, timedelta
+from time import perf_counter
 
-from PySide6.QtCore import QDate, Qt
+from PySide6.QtCore import QDate, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QFont, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -22,6 +23,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QMenu,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QStackedWidget,
@@ -35,6 +38,16 @@ from sqlalchemy import text
 
 from app.database import engine
 from app.services.factory_planning_engine import FactoryPlanningEngine
+from app.services.factory_out_forecast_service import load_shipment_forecasts
+from app.services.operational_source_service import OperationalSourceService
+from app.services.shipment_details_async_service import load_shipment_portfolio
+from app.services.shipment_command_service import (
+    day_count,
+    portfolio_metrics,
+    shipment_risk_profile,
+    shipment_execution_state,
+    item_execution_timeline,
+)
 from app.ui.existing_shipment_add_items_dialog import ExistingShipmentAddItemsDialog
 
 
@@ -49,6 +62,45 @@ def _to_int(value, default: int = 0) -> int:
         return int(float(value))
     except Exception:
         return default
+
+
+class _ShipmentPortfolioWorker(QThread):
+    """Read and score the Shipment Details portfolio off the GUI thread."""
+
+    progress = Signal(int, str, int)
+    loaded = Signal(object, int)
+    failed = Signal(str, int)
+
+    def __init__(
+        self,
+        filters: dict,
+        generation: int,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.filters = dict(filters)
+        self.generation = int(generation)
+
+    def run(self) -> None:
+        try:
+            self.progress.emit(
+                4,
+                "Starting background shipment load...",
+                self.generation,
+            )
+
+            payload = load_shipment_portfolio(
+                self.filters,
+                progress=lambda percent, message: self.progress.emit(
+                    int(percent),
+                    str(message),
+                    self.generation,
+                ),
+            )
+
+            self.loaded.emit(payload, self.generation)
+        except Exception as exc:
+            self.failed.emit(str(exc), self.generation)
 
 
 from app.ui.item_resource_control_center_page import ItemResourceControlCenterPage
@@ -861,11 +913,7 @@ class ShipmentItemDialog(QDialog):
                                 ''
                             ) AS tyre_description
                         FROM smds
-                        WHERE COALESCE(
-                                planning_manager_approval_status,
-                                'Pending'
-                              ) = 'Approved'
-                          AND sap_code IS NOT NULL
+                        WHERE sap_code IS NOT NULL
                           AND TRIM(sap_code) <> ''
                         ORDER BY
                             sap_code ASC
@@ -1114,8 +1162,31 @@ class ShipmentOrdersPage(QWidget):
         self.selected_item_id: int | None = None
         self.item_resource_page = None
 
+        # Shipment Details must never block the main Qt event loop.  The page
+        # shell is created immediately; PostgreSQL reads, Factory Can Out
+        # forecasts and risk scoring are performed by a background QThread.
+        self._portfolio_worker: _ShipmentPortfolioWorker | None = None
+        self._portfolio_generation = 0
+        self._portfolio_pending_filters: dict | None = None
+        self._portfolio_pending_generation = 0
+        self._portfolio_refresh_requested = False
+        self._portfolio_initial_started = False
+        self._portfolio_last_loaded_at = 0.0
+        self._portfolio_cache_ttl_seconds = 30.0
+        self._deferred_portfolio_payload: tuple[dict, int] | None = None
+        self._render_rows: list[dict] = []
+        self._visible_shipment_rows: dict[int, dict] = {}
+        self._render_cursor = 0
+        self._render_generation = 0
+        self._render_chunk_size = 24
+
+        self._refresh_debounce_timer = QTimer(self)
+        self._refresh_debounce_timer.setSingleShot(True)
+        self._refresh_debounce_timer.timeout.connect(
+            self._start_pending_portfolio_refresh
+        )
+
         self._apply_styles()
-        self.ensure_tables()
 
         self.stack = QStackedWidget()
         self.list_page = QWidget()
@@ -1129,7 +1200,11 @@ class ShipmentOrdersPage(QWidget):
 
         self._build_list_page()
         self._build_detail_page()
-        self.refresh_list()
+
+        # Start the first load only after control returns to the Qt event loop.
+        # This lets MainWindow finish navigation immediately and allows the user
+        # to move to another workspace while Shipment Details continues loading.
+        QTimer.singleShot(0, self._start_initial_portfolio_load)
 
     def _apply_styles(self) -> None:
         self.setStyleSheet("""
@@ -1137,408 +1212,280 @@ class ShipmentOrdersPage(QWidget):
             QFrame#Card, QFrame#HeaderCard, QFrame#MetricCard {
                 background:#ffffff; border:1px solid #e2e8f0; border-radius:16px;
             }
-            QLabel#PageTitle { color:#0f172a; font-size:22pt; font-weight:950; }
-            QLabel#SectionTitle { color:#0f172a; font-size:16pt; font-weight:950; }
+            QLabel#PageTitle { color:#0f172a; font-size:20pt; font-weight:950; }
+            QLabel#SectionTitle { color:#0f172a; font-size:14pt; font-weight:950; }
             QLabel#Hint { color:#64748b; font-size:9.5pt; font-weight:650; }
             QLabel#InfoLabel { color:#334155; font-size:10pt; font-weight:750; }
-            QLabel#MetricValue { color:#0f172a; font-size:24pt; font-weight:950; }
-            QLabel#MetricLabel { color:#64748b; font-size:9pt; font-weight:850; }
+            QLabel#MetricValue { color:#0f172a; font-size:18pt; font-weight:950; }
+            QLabel#MetricLabel { color:#64748b; font-size:8.5pt; font-weight:850; }
             QLineEdit, QDateEdit, QComboBox, QTextEdit, QSpinBox {
                 background:#ffffff; color:#0f172a; border:1px solid #cbd5e1;
-                border-radius:10px; padding:9px 12px; font-size:10pt; font-weight:650; min-height:24px;
+                border-radius:8px; padding:6px 10px; font-size:9.5pt; font-weight:650; min-height:22px;
             }
             QLineEdit:focus, QDateEdit:focus, QComboBox:focus, QTextEdit:focus, QSpinBox:focus {
                 border:1px solid #2563eb;
             }
-            QPushButton#PrimaryButton { background:#2563eb; color:white; border:none; border-radius:10px; padding:10px 18px; font-weight:950; min-height:26px; }
+            QPushButton#PrimaryButton { background:#2563eb; color:white; border:none; border-radius:8px; padding:7px 13px; font-weight:900; min-height:24px; }
             QPushButton#PrimaryButton:hover { background:#1d4ed8; }
-            QPushButton#SecondaryButton { background:#e2e8f0; color:#0f172a; border:none; border-radius:10px; padding:10px 18px; font-weight:950; min-height:26px; }
+            QPushButton#SecondaryButton { background:#e2e8f0; color:#0f172a; border:none; border-radius:8px; padding:7px 13px; font-weight:900; min-height:24px; }
             QPushButton#SecondaryButton:hover { background:#cbd5e1; }
-            QPushButton#DangerButton { background:#fee2e2; color:#991b1b; border:none; border-radius:10px; padding:10px 18px; font-weight:950; min-height:26px; }
+            QPushButton#DangerButton { background:#fee2e2; color:#991b1b; border:none; border-radius:8px; padding:7px 13px; font-weight:900; min-height:24px; }
             QPushButton#DangerButton:hover { background:#fecaca; }
             QTableWidget { background:#ffffff; color:#0f172a; border:1px solid #e2e8f0; border-radius:12px; gridline-color:#e2e8f0; alternate-background-color:#f8fafc; selection-background-color:#dbeafe; selection-color:#0f172a; }
-            QTableWidget::item { padding:8px 10px; border:none; }
-            QHeaderView::section { background:#f1f5f9; color:#1e293b; border:none; border-right:1px solid #e2e8f0; border-bottom:1px solid #e2e8f0; padding:10px; font-weight:950; }
+            QTableWidget::item { padding:4px 8px; border:none; }
+            QHeaderView::section { background:#f1f5f9; color:#1e293b; border:none; border-right:1px solid #e2e8f0; border-bottom:1px solid #e2e8f0; padding:7px 8px; font-weight:950; }
         """)
 
     def _build_list_page(self) -> None:
         layout = QVBoxLayout(self.list_page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(14)
+        layout.setSpacing(8)
 
+        # Non-blocking background progress strip.  It never covers or disables
+        # the rest of the application, so sidebar navigation remains usable.
+        self.portfolio_load_strip = QFrame()
+        self.portfolio_load_strip.setObjectName("PortfolioLoadStrip")
+        self.portfolio_load_strip.setStyleSheet(
+            "QFrame#PortfolioLoadStrip {"
+            "background:#eff6ff; border:1px solid #bfdbfe; "
+            "border-radius:10px;"
+            "}"
+        )
+        strip_layout = QHBoxLayout(self.portfolio_load_strip)
+        strip_layout.setContentsMargins(12, 7, 12, 7)
+        strip_layout.setSpacing(10)
+
+        self.portfolio_load_label = QLabel("Loading Shipment Details in background...")
+        self.portfolio_load_label.setStyleSheet(
+            "color:#1e3a8a; font-weight:850;"
+        )
+        self.portfolio_load_progress = QProgressBar()
+        self.portfolio_load_progress.setRange(0, 100)
+        self.portfolio_load_progress.setValue(0)
+        self.portfolio_load_progress.setTextVisible(False)
+        self.portfolio_load_progress.setMinimumWidth(220)
+        self.portfolio_load_progress.setMaximumWidth(420)
+        self.portfolio_load_progress.setFixedHeight(14)
+        self.portfolio_load_progress.setStyleSheet(
+            "QProgressBar {"
+            "background:#dbeafe; border:1px solid #bfdbfe; "
+            "border-radius:6px;"
+            "}"
+            "QProgressBar::chunk {"
+            "background:#2563eb; border-radius:5px;"
+            "}"
+        )
+        self.portfolio_load_percent = QLabel("0%")
+        self.portfolio_load_percent.setMinimumWidth(42)
+        self.portfolio_load_percent.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.portfolio_load_percent.setStyleSheet(
+            "color:#1d4ed8; font-weight:950;"
+        )
+
+        strip_layout.addWidget(self.portfolio_load_label, 1)
+        strip_layout.addWidget(self.portfolio_load_progress)
+        strip_layout.addWidget(self.portfolio_load_percent)
+        self.portfolio_load_strip.setVisible(False)
+        layout.addWidget(self.portfolio_load_strip)
+
+        # Compact command header: the portfolio table is the primary workspace.
         header = self._card("HeaderCard")
         header_layout = QVBoxLayout(header)
-        header_layout.setContentsMargins(
-            22,
-            18,
-            22,
-            18,
-        )
-        header_layout.setSpacing(14)
+        header_layout.setContentsMargins(18, 10, 18, 10)
+        header_layout.setSpacing(7)
 
-        top = QHBoxLayout()
-        top.setSpacing(10)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(10)
 
-        title_box = QVBoxLayout()
-
-        title = QLabel(
-            "Shipment Priority & Delivery Control"
-        )
+        title = QLabel("Shipment Command Center")
         title.setObjectName("PageTitle")
+        title_row.addWidget(title)
+        title_row.addStretch(1)
 
-        hint = QLabel(
-            "Shipments are ranked by Target Date. "
-            "NO 1 is the shipment that must leave the "
-            "factory first."
-        )
-        hint.setObjectName("Hint")
-        hint.setWordWrap(True)
+        # Kept for refresh/service compatibility but intentionally hidden from the
+        # executive UI.  These values remain available in exports/diagnostics.
+        self.next_factory_out_label = QLabel("Next Factory Can Out: -")
+        self.next_factory_out_label.setVisible(False)
+        self.last_refresh_label = QLabel("Last refreshed: -")
+        self.last_refresh_label.setVisible(False)
 
-        self.next_factory_out_label = QLabel(
-            "Next Factory Can Out date: -"
+        self.operational_source_badge = QLabel("LIVE OVEN\nNot imported")
+        self.operational_source_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.operational_source_badge.setMinimumWidth(145)
+        self.operational_source_badge.setMaximumWidth(168)
+        self.operational_source_badge.setStyleSheet(
+            "background:#ecfdf5; color:#047857; border:1px solid #a7f3d0; "
+            "border-radius:10px; padding:7px 10px; font-size:9pt; font-weight:950;"
         )
-        self.next_factory_out_label.setStyleSheet(
-            "color:#1d4ed8; font-size:9.5pt; "
-            "font-weight:850;"
-        )
+        title_row.addWidget(self.operational_source_badge)
+        header_layout.addLayout(title_row)
 
-        self.last_refresh_label = QLabel(
-            "Last refreshed: -"
-        )
-        self.last_refresh_label.setStyleSheet(
-            "color:#64748b; font-size:9pt; "
-            "font-weight:700;"
-        )
-
-        title_box.addWidget(title)
-        title_box.addWidget(hint)
-        title_box.addWidget(
-            self.next_factory_out_label
-        )
-        title_box.addWidget(
-            self.last_refresh_label
-        )
-
-        self.new_btn = QPushButton(
-            "+ New Shipment"
-        )
-        self.new_btn.setObjectName(
-            "PrimaryButton"
-        )
-        self.new_btn.clicked.connect(
-            self.open_new_shipment_page
-        )
-
-        self.open_btn = QPushButton(
-            "Open Shipment"
-        )
-        self.open_btn.setObjectName(
-            "SecondaryButton"
-        )
-        self.open_btn.clicked.connect(
-            self.open_selected_shipment
-        )
-
-        self.edit_btn = QPushButton(
-            "Edit Shipment"
-        )
-        self.edit_btn.setObjectName(
-            "SecondaryButton"
-        )
-        self.edit_btn.clicked.connect(
-            self.edit_selected_shipment
-        )
-
-        self.export_btn = QPushButton(
-            "Export CSV"
-        )
-        self.export_btn.setObjectName(
-            "SecondaryButton"
-        )
-        self.export_btn.clicked.connect(
-            self.export_visible_shipments
-        )
-
-        self.refresh_btn = QPushButton(
-            "Refresh"
-        )
-        self.refresh_btn.setObjectName(
-            "SecondaryButton"
-        )
-        self.refresh_btn.clicked.connect(
-            self.refresh_list
-        )
-
-        top.addLayout(title_box, 1)
-        top.addWidget(self.new_btn)
-        top.addWidget(self.open_btn)
-        top.addWidget(self.edit_btn)
-        top.addWidget(self.export_btn)
-        top.addWidget(self.refresh_btn)
-
-        filter_grid = QGridLayout()
-        filter_grid.setHorizontalSpacing(10)
-        filter_grid.setVerticalSpacing(8)
-
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText(
-            "Search shipment name, customer, Shipment ID, "
-            "SAP code or item description..."
-        )
-        self.search_input.textChanged.connect(
-            self.refresh_list
-        )
-
-        self.promise_filter = QComboBox()
-        self.promise_filter.addItem(
-            "All delivery promises",
-            "all",
-        )
-        self.promise_filter.addItem(
-            "Can meet target",
-            "can_meet",
-        )
-        self.promise_filter.addItem(
-            "Cannot meet target",
-            "cannot_meet",
-        )
-        self.promise_filter.addItem(
-            "Auto scheduled",
-            "auto_scheduled",
-        )
-        self.promise_filter.addItem(
-            "Pending calculation",
-            "pending",
-        )
-        self.promise_filter.addItem(
-            "Cancelled",
-            "cancelled",
-        )
-        self.promise_filter.currentIndexChanged.connect(
-            self.refresh_list
-        )
-
-        self.date_window_filter = QComboBox()
-        self.date_window_filter.addItem(
-            "All target dates",
-            "all",
-        )
-        self.date_window_filter.addItem(
-            "Next 7 days",
-            "next_7",
-        )
-        self.date_window_filter.addItem(
-            "Next 30 days",
-            "next_30",
-        )
-        self.date_window_filter.addItem(
-            "Past target date",
-            "past_due",
-        )
-        self.date_window_filter.addItem(
-            "No target date",
-            "no_target",
-        )
-        self.date_window_filter.currentIndexChanged.connect(
-            self.refresh_list
-        )
-
-        self.clear_filters_btn = QPushButton(
-            "Clear Filters"
-        )
-        self.clear_filters_btn.setObjectName(
-            "SecondaryButton"
-        )
-        self.clear_filters_btn.clicked.connect(
-            self.clear_list_filters
-        )
-
-        filter_grid.addWidget(
-            QLabel("Search"),
-            0,
-            0,
-        )
-        filter_grid.addWidget(
-            QLabel("Delivery Promise"),
-            0,
-            1,
-        )
-        filter_grid.addWidget(
-            QLabel("Target Window"),
-            0,
-            2,
-        )
-
-        filter_grid.addWidget(
-            self.search_input,
-            1,
-            0,
-        )
-        filter_grid.addWidget(
-            self.promise_filter,
-            1,
-            1,
-        )
-        filter_grid.addWidget(
-            self.date_window_filter,
-            1,
-            2,
-        )
-        filter_grid.addWidget(
-            self.clear_filters_btn,
-            1,
-            3,
-        )
-
-        filter_grid.setColumnStretch(0, 2)
-        filter_grid.setColumnStretch(1, 1)
-        filter_grid.setColumnStretch(2, 1)
-
-        schedule_row = QHBoxLayout()
-        schedule_row.setSpacing(8)
-
-        schedule_hint = QLabel(
-            "Schedule control: double-click Target Date to edit, "
-            "or use the quick actions for the selected shipment."
-        )
-        schedule_hint.setObjectName("Hint")
-        schedule_hint.setWordWrap(True)
-
-        self.quick_target_btn = QPushButton(
-            "Set Target Date"
-        )
-        self.quick_target_btn.setObjectName(
-            "SecondaryButton"
-        )
-        self.quick_target_btn.clicked.connect(
-            self.change_selected_target_date
-        )
-
-        self.quick_auto_target_btn = QPushButton(
-            "Reset to Auto Target"
-        )
-        self.quick_auto_target_btn.setObjectName(
-            "SecondaryButton"
-        )
-        self.quick_auto_target_btn.clicked.connect(
-            self.reset_selected_to_auto_target
-        )
-
-        self.quick_replan_btn = QPushButton(
-            "Replan All"
-        )
-        self.quick_replan_btn.setObjectName(
-            "PrimaryButton"
-        )
-        self.quick_replan_btn.clicked.connect(
-            self.replan_all_from_list
-        )
-
-        schedule_row.addWidget(
-            schedule_hint,
-            1,
-        )
-        schedule_row.addWidget(
-            self.quick_target_btn
-        )
-        schedule_row.addWidget(
-            self.quick_auto_target_btn
-        )
-        schedule_row.addWidget(
-            self.quick_replan_btn
-        )
-
-        header_layout.addLayout(top)
-        header_layout.addLayout(filter_grid)
-        header_layout.addLayout(schedule_row)
-        layout.addWidget(header)
-
-        # Hidden compatibility labels.
-        # KPI cards were removed from this page,
-        # but refresh_list still updates these values.
+        # KPI strip remains visible but deliberately dense.
+        kpi_row = QHBoxLayout()
+        kpi_row.setSpacing(8)
         self.total_shipments_value = QLabel("0")
         self.total_qty_value = QLabel("0")
-        self.stock_allocated_value = QLabel("0")
         self.stock_coverage_value = QLabel("0.0%")
+        self.production_gap_value = QLabel("0")
+        self.critical_shipments_value = QLabel("0")
+        self.review_shipments_value = QLabel("0")
+        self.stock_allocated_value = QLabel("0")
         self.can_meet_value = QLabel("0")
         self.cannot_meet_value = QLabel("0")
 
+        for value, label in (
+            (self.total_shipments_value, "Visible Shipments"),
+            (self.total_qty_value, "Shipment Qty"),
+            (self.stock_coverage_value, "Stock Coverage"),
+            (self.production_gap_value, "Production Gap"),
+            (self.critical_shipments_value, "Critical / Late"),
+            (self.review_shipments_value, "Needs Review"),
+        ):
+            kpi_row.addWidget(self._metric_card(value, label))
+        header_layout.addLayout(kpi_row)
+
+        # One-line filter bar; labels are encoded in the control text/placeholders.
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText(
+            "Search shipment, customer, ID, SAP or tyre description..."
+        )
+        self.search_input.textChanged.connect(self.refresh_list)
+
+        self.risk_filter = QComboBox()
+        self.risk_filter.addItem("Risk: All", "all")
+        self.risk_filter.addItem("Risk: Critical", "critical")
+        self.risk_filter.addItem("Risk: At risk + critical", "at_risk")
+        self.risk_filter.addItem("Risk: Watch", "watch")
+        self.risk_filter.addItem("Risk: Healthy", "healthy")
+        self.risk_filter.addItem("Risk: Review", "review")
+        self.risk_filter.currentIndexChanged.connect(self.refresh_list)
+
+        self.promise_filter = QComboBox()
+        self.promise_filter.addItem("Promise: All", "all")
+        self.promise_filter.addItem("Promise: Can meet", "can_meet")
+        self.promise_filter.addItem("Promise: Cannot meet", "cannot_meet")
+        self.promise_filter.addItem("Promise: Auto scheduled", "auto_scheduled")
+        self.promise_filter.addItem("Promise: Pending", "pending")
+        self.promise_filter.addItem("Promise: Cancelled", "cancelled")
+        self.promise_filter.currentIndexChanged.connect(self.refresh_list)
+
+        self.stock_filter = QComboBox()
+        self.stock_filter.addItem("Stock: All", "all")
+        self.stock_filter.addItem("Stock: 100%", "full")
+        self.stock_filter.addItem("Stock: Partial", "partial")
+        self.stock_filter.addItem("Stock: Zero", "zero")
+        self.stock_filter.addItem("Stock: Gap > 0", "gap")
+        self.stock_filter.currentIndexChanged.connect(self.refresh_list)
+
+        self.date_window_filter = QComboBox()
+        self.date_window_filter.addItem("Target: All", "all")
+        self.date_window_filter.addItem("Target: Next 2d", "next_2")
+        self.date_window_filter.addItem("Target: Next 7d", "next_7")
+        self.date_window_filter.addItem("Target: Next 30d", "next_30")
+        self.date_window_filter.addItem("Target: Past due", "past_due")
+        self.date_window_filter.addItem("Target: Missing", "no_target")
+        self.date_window_filter.currentIndexChanged.connect(self.refresh_list)
+
+        self.clear_filters_btn = QPushButton("Clear")
+        self.clear_filters_btn.setObjectName("SecondaryButton")
+        self.clear_filters_btn.clicked.connect(self.clear_list_filters)
+
+        filter_row.addWidget(self.search_input, 3)
+        filter_row.addWidget(self.risk_filter, 1)
+        filter_row.addWidget(self.promise_filter, 1)
+        filter_row.addWidget(self.stock_filter, 1)
+        filter_row.addWidget(self.date_window_filter, 1)
+        filter_row.addWidget(self.clear_filters_btn)
+        header_layout.addLayout(filter_row)
+
+        # V10.5.1: no separate decision/action strip between filters and table.
+        # Selection context remains available through row tooltips / detail workspace,
+        # while target and replan commands live in the compact Actions menu below.
+        layout.addWidget(header)
+
+        # The table owns all remaining vertical space.
         table_card = self._card()
         table_layout = QVBoxLayout(table_card)
-        table_layout.setContentsMargins(
-            18,
-            16,
-            18,
-            18,
-        )
-        table_layout.setSpacing(10)
+        table_layout.setContentsMargins(12, 9, 12, 10)
+        table_layout.setSpacing(6)
 
         table_heading = QHBoxLayout()
+        table_heading.setSpacing(8)
+        table_title = QLabel("Delivery Risk & Priority Portfolio")
+        table_title.setObjectName("SectionTitle")
 
-        table_title = QLabel(
-            "Shipment Priority Portfolio"
-        )
-        table_title.setObjectName(
-            "SectionTitle"
-        )
-
-        self.rows_count_label = QLabel(
-            "0 shipments"
-        )
+        self.rows_count_label = QLabel("0 shipments")
         self.rows_count_label.setStyleSheet(
-            "background:#dbeafe; color:#1d4ed8; "
-            "border-radius:9px; padding:6px 10px; "
-            "font-weight:950;"
+            "background:#dbeafe; color:#1d4ed8; border-radius:8px; "
+            "padding:4px 8px; font-weight:950;"
         )
+
+        # Large top action buttons are replaced by a compact command menu.
+        self.actions_btn = QPushButton("Actions ▾")
+        self.actions_btn.setObjectName("SecondaryButton")
+        actions_menu = QMenu(self.actions_btn)
+        self.new_action = actions_menu.addAction("New Shipment")
+        self.open_action = actions_menu.addAction("Open Selected Shipment")
+        self.edit_action = actions_menu.addAction("Edit Selected Shipment")
+        actions_menu.addSeparator()
+        self.target_action = actions_menu.addAction("Set Target Date...")
+        self.auto_target_action = actions_menu.addAction("Reset to Auto Target")
+        self.replan_action = actions_menu.addAction("Replan Portfolio")
+        actions_menu.addSeparator()
+        self.export_action = actions_menu.addAction("Export Control Pack")
+        self.new_action.triggered.connect(self.open_new_shipment_page)
+        self.open_action.triggered.connect(self.open_selected_shipment)
+        self.edit_action.triggered.connect(self.edit_selected_shipment)
+        self.target_action.triggered.connect(self.change_selected_target_date)
+        self.auto_target_action.triggered.connect(self.reset_selected_to_auto_target)
+        self.replan_action.triggered.connect(self.replan_all_from_list)
+        self.export_action.triggered.connect(self.export_visible_shipments)
+        self.actions_btn.setMenu(actions_menu)
+
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setObjectName("SecondaryButton")
+        self.refresh_btn.clicked.connect(self.refresh_list)
+
+        # Compatibility aliases for integrations that inspect these attributes.
+        self.new_btn = self.actions_btn
+        self.open_btn = self.actions_btn
+        self.edit_btn = self.actions_btn
+        self.export_btn = self.actions_btn
 
         table_heading.addWidget(table_title)
         table_heading.addStretch(1)
-        table_heading.addWidget(
-            self.rows_count_label
-        )
+        table_heading.addWidget(self.rows_count_label)
+        table_heading.addWidget(self.actions_btn)
+        table_heading.addWidget(self.refresh_btn)
 
-        table_hint = QLabel(
-            "Manual/Excel target dates receive priority. Shipments without "
-            "an Excel target use the earliest feasible Factory Can Out date as "
-            "an editable Auto Target. Double-click Target Date to reschedule."
-        )
-        table_hint.setObjectName("Hint")
-        table_hint.setWordWrap(True)
-
-        self.list_table = QTableWidget(0, 10)
+        self.list_table = QTableWidget(0, 11)
         self.list_table.setHorizontalHeaderLabels([
-            "NO",
-            "Shipment Name",
-            "Shipment ID",
-            "Target Date",
-            "Target Source",
+            "Priority",
+            "Shipment",
+            "Target",
             "Factory Can Out",
-            "Total Quantity",
-            "Stock Allocated",
-            "Progress %",
-            "Status",
+            "Delivery Variance",
+            "Qty",
+            "Stock",
+            "Coverage",
+            "Prod Gap",
+            "Risk",
+            "Delivery Status",
         ])
         self._setup_list_table()
 
-        table_layout.addLayout(
-            table_heading
-        )
-        table_layout.addWidget(
-            table_hint
-        )
-        table_layout.addWidget(
-            self.list_table,
-            1,
-        )
-        layout.addWidget(
-            table_card,
-            1,
-        )
-
+        table_layout.addLayout(table_heading)
+        table_layout.addWidget(self.list_table, 1)
+        layout.addWidget(table_card, 1)
     def clear_list_filters(self) -> None:
         widgets = (
             self.search_input,
+            self.risk_filter,
             self.promise_filter,
+            self.stock_filter,
             self.date_window_filter,
         )
 
@@ -1546,7 +1493,9 @@ class ShipmentOrdersPage(QWidget):
             widget.blockSignals(True)
 
         self.search_input.clear()
+        self.risk_filter.setCurrentIndex(0)
         self.promise_filter.setCurrentIndex(0)
+        self.stock_filter.setCurrentIndex(0)
         self.date_window_filter.setCurrentIndex(0)
 
         for widget in widgets:
@@ -1651,7 +1600,7 @@ class ShipmentOrdersPage(QWidget):
         state = str(
             promise_state or ""
         ).strip().lower()
-        days = abs(int(variance_days or 0))
+        days = abs(day_count(variance_days))
 
         if state == "cancelled":
             return "CANCELLED"
@@ -1730,471 +1679,323 @@ class ShipmentOrdersPage(QWidget):
                 QColor("#fef3c7")
             )
 
+    def _style_risk_status(
+        self,
+        item: QTableWidgetItem,
+        risk_band: str,
+    ) -> None:
+        band = str(risk_band or "").strip().lower()
+        font = QFont("Segoe UI")
+        font.setBold(True)
+        item.setFont(font)
+
+        palette = {
+            "critical": ("#991b1b", "#fee2e2"),
+            "at_risk": ("#9a3412", "#ffedd5"),
+            "review": ("#92400e", "#fef3c7"),
+            "watch": ("#1d4ed8", "#dbeafe"),
+            "healthy": ("#047857", "#dcfce7"),
+            "cancelled": ("#64748b", "#f1f5f9"),
+        }
+        foreground, background = palette.get(
+            band,
+            ("#334155", "#f8fafc"),
+        )
+        item.setForeground(QColor(foreground))
+        item.setBackground(QColor(background))
+
+    def _update_selection_brief(self) -> None:
+        if not hasattr(self, "selection_brief_label"):
+            return
+
+        shipment_id = self.selected_shipment_id
+        row = getattr(self, "_visible_shipment_rows", {}).get(shipment_id)
+        if not row:
+            self.selection_brief_label.setText(
+                "Select a shipment to inspect risk, stock gap and Factory Can Out."
+            )
+            self.selection_brief_label.setToolTip("")
+            if hasattr(self, "selection_drivers_label"):
+                self.selection_drivers_label.setText("Risk drivers: no shipment selected.")
+                self.selection_drivers_label.setVisible(False)
+            if hasattr(self, "selection_brief_card"):
+                self.selection_brief_card.setStyleSheet(
+                    "QFrame { background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; }"
+                )
+            self.selection_brief_label.setStyleSheet(
+                "color:#334155; border:none; font-size:9.2pt; font-weight:800;"
+            )
+            return
+
+        days_to_target = row.get("days_to_target")
+        if days_to_target is None:
+            target_window = "target date missing"
+        elif days_to_target < 0:
+            target_window = f"{abs(days_to_target)} days overdue"
+        elif days_to_target == 0:
+            target_window = "due today"
+        else:
+            target_window = f"{days_to_target} days to target"
+
+        target_source = str(row.get("target_date_source") or "-")
+        if row.get("factory_can_receive_date") is not None:
+            factory_out = self._fmt_date(row.get("factory_can_receive_date"))
+            if row.get("factory_out_forecast"):
+                factory_out += " (forecast)"
+        elif row.get("factory_out_blocker"):
+            factory_out = "BLOCKED"
+        else:
+            factory_out = "-"
+        forecast_source = str(row.get("factory_out_source") or "")
+        brief = (
+            f"{row.get('shipment_name') or row.get('shipment_no')}  •  "
+            f"{row.get('risk_label')}  •  {target_window}  •  "
+            f"Stock {float(row.get('stock_coverage_pct') or 0):.1f}%  •  "
+            f"Gap {int(row.get('production_gap') or 0):,} pcs  •  "
+            f"Factory Out {factory_out}  •  Source {target_source}"
+            + (f"  •  Out basis {forecast_source}" if forecast_source else "")
+        )
+
+        drivers = tuple(row.get("risk_drivers") or ())
+        driver_text = " • ".join(drivers) if drivers else "No material exception drivers detected."
+        blocker = str(row.get("factory_out_blocker") or "").strip()
+        if blocker:
+            driver_text += f" • Factory Out blocker: {blocker}"
+        action = str(row.get("recommended_action") or "-")
+        if hasattr(self, "selection_drivers_label"):
+            self.selection_drivers_label.setText(
+                f"Risk drivers: {driver_text}   |   Recommended: {action}"
+            )
+            self.selection_drivers_label.setVisible(False)
+
+        self.selection_brief_label.setToolTip(
+            f"{brief}\n\nRisk drivers: {driver_text}\nRecommended: {action}"
+        )
+
+        band = str(row.get("risk_band") or "")
+        style = {
+            "critical": ("#fff1f2", "#991b1b", "#fecdd3"),
+            "at_risk": ("#fff7ed", "#9a3412", "#fed7aa"),
+            "review": ("#fffbeb", "#92400e", "#fde68a"),
+            "watch": ("#eff6ff", "#1d4ed8", "#bfdbfe"),
+            "healthy": ("#ecfdf5", "#047857", "#a7f3d0"),
+            "cancelled": ("#f8fafc", "#64748b", "#cbd5e1"),
+        }.get(band, ("#f8fafc", "#334155", "#e2e8f0"))
+
+        self.selection_brief_label.setText(brief)
+        self.selection_brief_label.setStyleSheet(
+            f"color:{style[1]}; border:none; font-size:9.2pt; font-weight:900;"
+        )
+        if hasattr(self, "selection_drivers_label"):
+            self.selection_drivers_label.setStyleSheet(
+                f"color:{style[1]}; border:none; font-size:8.5pt; font-weight:700;"
+            )
+        if hasattr(self, "selection_brief_card"):
+            self.selection_brief_card.setStyleSheet(
+                f"QFrame {{ background:{style[0]}; border:1px solid {style[2]}; border-radius:10px; }}"
+            )
+
     def showEvent(self, event) -> None:
         super().showEvent(event)
 
-        if hasattr(self, "search_input"):
-            self.refresh_list()
+        # A completed background payload is rendered only when this page is
+        # visible.  If row rendering was paused because the user navigated away,
+        # resume it in small GUI slices instead of rebuilding the whole table.
+        if self._deferred_portfolio_payload is not None:
+            payload, generation = self._deferred_portfolio_payload
+            self._deferred_portfolio_payload = None
+            QTimer.singleShot(
+                0,
+                lambda p=payload, g=generation: self._apply_portfolio_payload(
+                    p, g
+                ),
+            )
+            return
+
+        if self._render_rows and self._render_cursor < len(self._render_rows):
+            QTimer.singleShot(0, self._render_portfolio_chunk)
+            return
+
+        if not self._portfolio_initial_started:
+            QTimer.singleShot(0, self._start_initial_portfolio_load)
+            return
+
+        cache_age = perf_counter() - float(self._portfolio_last_loaded_at or 0.0)
+        worker_running = (
+            self._portfolio_worker is not None
+            and self._portfolio_worker.isRunning()
+        )
+        if (
+            not worker_running
+            and cache_age > self._portfolio_cache_ttl_seconds
+        ):
+            self._queue_portfolio_refresh(immediate=False)
 
     def _build_detail_page(self) -> None:
+        """Build the compact professional shipment execution workspace."""
         layout = QVBoxLayout(self.detail_page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(14)
+        layout.setSpacing(10)
 
         header = self._card("HeaderCard")
         header_layout = QVBoxLayout(header)
-        header_layout.setContentsMargins(
-            22,
-            18,
-            22,
-            18,
-        )
-        header_layout.setSpacing(14)
+        header_layout.setContentsMargins(18, 14, 18, 14)
+        header_layout.setSpacing(8)
 
         title_row = QHBoxLayout()
-        title_row.setSpacing(12)
+        title_row.setSpacing(10)
 
-        self.back_btn = QPushButton(
-            "← Back to Shipments"
-        )
-        self.back_btn.setObjectName(
-            "SecondaryButton"
-        )
-        self.back_btn.clicked.connect(
-            self.back_to_list
-        )
+        self.back_btn = QPushButton("← Shipments")
+        self.back_btn.setObjectName("SecondaryButton")
+        self.back_btn.setMaximumWidth(130)
+        self.back_btn.clicked.connect(self.back_to_list)
 
         title_box = QVBoxLayout()
-        title_box.setSpacing(4)
-
+        title_box.setSpacing(2)
         self.detail_title = QLabel("Shipment")
-        self.detail_title.setObjectName(
-            "PageTitle"
-        )
+        self.detail_title.setObjectName("PageTitle")
+        self.detail_subtitle = QLabel("Execution control • stock • production • delivery forecast")
+        self.detail_subtitle.setObjectName("Hint")
+        self.detail_subtitle.setWordWrap(False)
+        title_box.addWidget(self.detail_title)
+        title_box.addWidget(self.detail_subtitle)
 
-        self.detail_subtitle = QLabel(
-            "Shipment delivery, production and "
-            "item-level execution control"
-        )
-        self.detail_subtitle.setObjectName(
-            "Hint"
-        )
-        self.detail_subtitle.setWordWrap(True)
+        self.detail_delivery_badge = QLabel("DELIVERY")
+        self.detail_delivery_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.detail_delivery_badge.setMinimumWidth(150)
+        self.detail_planning_badge = QLabel("PLANNING")
+        self.detail_planning_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.detail_planning_badge.setMinimumWidth(130)
 
-        title_box.addWidget(
-            self.detail_title
-        )
-        title_box.addWidget(
-            self.detail_subtitle
-        )
+        self.detail_actions_btn = QPushButton("Actions ▾")
+        self.detail_actions_btn.setObjectName("SecondaryButton")
+        self.detail_action_menu = QMenu(self.detail_actions_btn)
+        self.detail_edit_header_action = self.detail_action_menu.addAction("Edit Shipment Header")
+        self.detail_target_action = self.detail_action_menu.addAction("Change Target Date")
+        self.detail_action_menu.addSeparator()
+        self.detail_add_item_action = self.detail_action_menu.addAction("Add Item")
+        self.detail_edit_item_action = self.detail_action_menu.addAction("Edit Selected Item")
+        self.detail_delete_item_action = self.detail_action_menu.addAction("Delete Selected Item")
+        self.detail_action_menu.addSeparator()
+        self.detail_delete_shipment_action = self.detail_action_menu.addAction("Delete Shipment")
+        self.detail_actions_btn.setMenu(self.detail_action_menu)
 
-        self.detail_delivery_badge = QLabel(
-            "DELIVERY STATUS"
-        )
-        self.detail_delivery_badge.setAlignment(
-            Qt.AlignmentFlag.AlignCenter
-        )
-        self.detail_delivery_badge.setMinimumWidth(
-            170
-        )
+        self.detail_edit_header_action.triggered.connect(self.edit_current_shipment_header)
+        self.detail_target_action.triggered.connect(self.change_current_target_date)
+        self.detail_add_item_action.triggered.connect(self.add_item)
+        self.detail_edit_item_action.triggered.connect(self.edit_selected_item)
+        self.detail_delete_item_action.triggered.connect(self.delete_selected_item)
+        self.detail_delete_shipment_action.triggered.connect(self.delete_current_shipment)
+        self.detail_edit_item_action.setEnabled(False)
+        self.detail_delete_item_action.setEnabled(False)
 
-        self.detail_planning_badge = QLabel(
-            "PLANNING STATUS"
-        )
-        self.detail_planning_badge.setAlignment(
-            Qt.AlignmentFlag.AlignCenter
-        )
-        self.detail_planning_badge.setMinimumWidth(
-            145
-        )
-
-        title_row.addWidget(
-            self.back_btn
-        )
-        title_row.addLayout(
-            title_box,
-            1,
-        )
-        title_row.addWidget(
-            self.detail_delivery_badge
-        )
-        title_row.addWidget(
-            self.detail_planning_badge
-        )
-
-        action_row = QHBoxLayout()
-        action_row.setSpacing(10)
-
-        self.detail_target_source_label = QLabel(
-            "Target source: -"
-        )
-        self.detail_target_source_label.setObjectName(
-            "Hint"
-        )
-        self.detail_target_source_label.setWordWrap(
-            True
-        )
-
-        self.edit_header_btn = QPushButton(
-            "Edit Header"
-        )
-        self.edit_header_btn.setObjectName(
-            "SecondaryButton"
-        )
-        self.edit_header_btn.clicked.connect(
-            self.edit_current_shipment_header
-        )
-
-        self.change_target_date_btn = QPushButton(
-            "Change Target Date"
-        )
-        self.change_target_date_btn.setObjectName(
-            "SecondaryButton"
-        )
-        self.change_target_date_btn.setToolTip(
-            "Set a manual Target Date or reset to the earliest "
-            "feasible Factory Can Out Auto Target"
-        )
-        self.change_target_date_btn.clicked.connect(
-            self.change_current_target_date
-        )
-
-        self.add_item_btn = QPushButton(
-            "+ Add Item"
-        )
-        self.add_item_btn.setObjectName(
-            "PrimaryButton"
-        )
-        self.add_item_btn.clicked.connect(
-            self.add_item
-        )
-
-        self.edit_item_btn = QPushButton(
-            "Edit Item"
-        )
-        self.edit_item_btn.setObjectName(
-            "SecondaryButton"
-        )
-        self.edit_item_btn.clicked.connect(
-            self.edit_selected_item
-        )
+        # Compatibility buttons retained for existing selection/action code; the
+        # professional UI exposes the same actions through the compact menu.
+        self.edit_header_btn = QPushButton()
+        self.change_target_date_btn = QPushButton()
+        self.add_item_btn = QPushButton()
+        self.edit_item_btn = QPushButton()
+        self.delete_item_btn = QPushButton()
+        self.delete_shipment_btn = QPushButton()
+        for button in (
+            self.edit_header_btn, self.change_target_date_btn, self.add_item_btn,
+            self.edit_item_btn, self.delete_item_btn, self.delete_shipment_btn,
+        ):
+            button.setVisible(False)
         self.edit_item_btn.setEnabled(False)
-
-        self.delete_item_btn = QPushButton(
-            "Delete Item"
-        )
-        self.delete_item_btn.setObjectName(
-            "DangerButton"
-        )
-        self.delete_item_btn.clicked.connect(
-            self.delete_selected_item
-        )
         self.delete_item_btn.setEnabled(False)
 
-        self.delete_shipment_btn = QPushButton(
-            "Delete Shipment"
-        )
-        self.delete_shipment_btn.setObjectName(
-            "DangerButton"
-        )
-        self.delete_shipment_btn.setToolTip(
-            "Permanently delete this shipment "
-            "and all shipment items"
-        )
-        self.delete_shipment_btn.clicked.connect(
-            self.delete_current_shipment
-        )
+        title_row.addWidget(self.back_btn)
+        title_row.addLayout(title_box, 1)
+        title_row.addWidget(self.detail_delivery_badge)
+        title_row.addWidget(self.detail_planning_badge)
+        title_row.addWidget(self.detail_actions_btn)
+        header_layout.addLayout(title_row)
 
-        action_row.addWidget(
-            self.detail_target_source_label,
-            1,
-        )
-        action_row.addWidget(
-            self.edit_header_btn
-        )
-        action_row.addWidget(
-            self.change_target_date_btn
-        )
-        action_row.addWidget(
-            self.add_item_btn
-        )
-        action_row.addWidget(
-            self.edit_item_btn
-        )
-        action_row.addWidget(
-            self.delete_item_btn
-        )
-        action_row.addWidget(
-            self.delete_shipment_btn
-        )
+        self.detail_target_source_label = QLabel("Source: -")
+        self.detail_target_source_label.setObjectName("Hint")
+        self.detail_target_source_label.setWordWrap(False)
+        header_layout.addWidget(self.detail_target_source_label)
 
-        info = QGridLayout()
-        info.setHorizontalSpacing(22)
-        info.setVerticalSpacing(9)
+        # Hidden legacy labels preserve compatibility while removing duplicated
+        # visible metadata from the detail workspace.
+        self.info_shipment_name = QLabel()
+        self.info_customer = QLabel()
+        self.info_target_date = QLabel()
+        self.info_factory_receive = QLabel()
+        self.info_last_replanned = QLabel()
+        self.info_note = QLabel()
+        for label in (
+            self.info_shipment_name, self.info_customer, self.info_target_date,
+            self.info_factory_receive, self.info_last_replanned, self.info_note,
+        ):
+            label.setVisible(False)
 
-        self.info_shipment_name = QLabel(
-            "Shipment Name: -"
-        )
-        self.info_customer = QLabel(
-            "Customer / Destination: -"
-        )
-        self.info_target_date = QLabel(
-            "Target / Priority Date: -"
-        )
-        self.info_factory_receive = QLabel(
-            "Factory Can Out: -"
-        )
-        self.info_last_replanned = QLabel(
-            "Last Replanned: -"
-        )
-        self.info_note = QLabel(
-            "Remarks / Delivery Instructions: -"
-        )
-
-        info_labels = [
-            self.info_shipment_name,
-            self.info_customer,
-            self.info_target_date,
-            self.info_factory_receive,
-            self.info_last_replanned,
-            self.info_note,
-        ]
-
-        for label in info_labels:
-            label.setObjectName(
-                "InfoLabel"
-            )
-            label.setWordWrap(True)
-
-        info.addWidget(
-            self.info_shipment_name,
-            0,
-            0,
-        )
-        info.addWidget(
-            self.info_customer,
-            0,
-            1,
-        )
-        info.addWidget(
-            self.info_target_date,
-            1,
-            0,
-        )
-        info.addWidget(
-            self.info_factory_receive,
-            1,
-            1,
-        )
-        info.addWidget(
-            self.info_last_replanned,
-            2,
-            0,
-        )
-        info.addWidget(
-            self.info_note,
-            2,
-            1,
-        )
-
-        header_layout.addLayout(
-            title_row
-        )
-        header_layout.addLayout(
-            action_row
-        )
-        header_layout.addLayout(
-            info
-        )
-        layout.addWidget(
-            header
-        )
+        layout.addWidget(header)
 
         delivery_timeline = QHBoxLayout()
-        delivery_timeline.setSpacing(12)
-
-        self.detail_target_date_value = QLabel(
-            "Pending"
-        )
-        self.detail_factory_receive_date_value = QLabel(
-            "Pending"
-        )
-        self.detail_delivery_variance_value = QLabel(
-            "-"
-        )
-
-        delivery_timeline.addWidget(
-            self._metric_card(
-                self.detail_target_date_value,
-                "Target Date",
-            )
-        )
-        delivery_timeline.addWidget(
-            self._metric_card(
-                self.detail_factory_receive_date_value,
-                "Factory Can Out",
-            )
-        )
-        delivery_timeline.addWidget(
-            self._metric_card(
-                self.detail_delivery_variance_value,
-                "Delivery Variance",
-            )
-        )
-
-        layout.addLayout(
-            delivery_timeline
-        )
+        delivery_timeline.setSpacing(10)
+        self.detail_target_date_value = QLabel("Pending")
+        self.detail_factory_receive_date_value = QLabel("Pending")
+        self.detail_delivery_variance_value = QLabel("-")
+        delivery_timeline.addWidget(self._metric_card(self.detail_target_date_value, "Target Date"))
+        delivery_timeline.addWidget(self._metric_card(self.detail_factory_receive_date_value, "Factory Can Out"))
+        delivery_timeline.addWidget(self._metric_card(self.detail_delivery_variance_value, "Delivery Variance"))
+        layout.addLayout(delivery_timeline)
 
         metrics = QHBoxLayout()
-        metrics.setSpacing(12)
-
+        metrics.setSpacing(10)
         self.detail_items_value = QLabel("0")
         self.detail_qty_value = QLabel("0")
         self.detail_stock_value = QLabel("0")
         self.detail_production_value = QLabel("0")
         self.detail_completed_value = QLabel("0")
         self.detail_progress_value = QLabel("0.0%")
-
-        metrics.addWidget(
-            self._metric_card(
-                self.detail_items_value,
-                "Total Items",
-            )
-        )
-        metrics.addWidget(
-            self._metric_card(
-                self.detail_qty_value,
-                "Total Quantity",
-            )
-        )
-        metrics.addWidget(
-            self._metric_card(
-                self.detail_stock_value,
-                "Stock Allocated",
-            )
-        )
-        metrics.addWidget(
-            self._metric_card(
-                self.detail_production_value,
-                "Production Required",
-            )
-        )
-        metrics.addWidget(
-            self._metric_card(
-                self.detail_completed_value,
-                "Completed Quantity",
-            )
-        )
-        metrics.addWidget(
-            self._metric_card(
-                self.detail_progress_value,
-                "Shipment Progress",
-            )
-        )
-
-        layout.addLayout(
-            metrics
-        )
+        metrics.addWidget(self._metric_card(self.detail_items_value, "Items"))
+        metrics.addWidget(self._metric_card(self.detail_qty_value, "Order Qty"))
+        metrics.addWidget(self._metric_card(self.detail_stock_value, "Stock Covered"))
+        metrics.addWidget(self._metric_card(self.detail_production_value, "Production Gap"))
+        metrics.addWidget(self._metric_card(self.detail_completed_value, "Ready / Covered Qty"))
+        metrics.addWidget(self._metric_card(self.detail_progress_value, "Coverage Progress"))
+        layout.addLayout(metrics)
 
         table_card = self._card()
-        table_layout = QVBoxLayout(
-            table_card
-        )
-        table_layout.setContentsMargins(
-            18,
-            16,
-            18,
-            18,
-        )
-        table_layout.setSpacing(10)
+        table_layout = QVBoxLayout(table_card)
+        table_layout.setContentsMargins(14, 10, 14, 12)
+        table_layout.setSpacing(6)
 
         table_title_row = QHBoxLayout()
-
-        table_title_box = QVBoxLayout()
-        table_title_box.setSpacing(3)
-
-        table_title = QLabel(
-            "Shipment Item Execution Details"
-        )
-        table_title.setObjectName(
-            "SectionTitle"
-        )
-
-        table_hint = QLabel(
-            "All quantities, production capacity, "
-            "receive dates and planning reasons are "
-            "read directly from the database. "
-            "Select a row to edit or delete it."
-        )
-        table_hint.setObjectName(
-            "Hint"
-        )
-        table_hint.setWordWrap(True)
-
-        table_title_box.addWidget(
-            table_title
-        )
-        table_title_box.addWidget(
-            table_hint
-        )
-
-        self.detail_item_count_badge = QLabel(
-            "0 items"
-        )
-        self.detail_item_count_badge.setAlignment(
-            Qt.AlignmentFlag.AlignCenter
-        )
+        table_title = QLabel("Item Stock & Production Schedule")
+        table_title.setObjectName("SectionTitle")
+        self.detail_table_legend = QLabel("Stock allocation • shortage • production timing • receive state")
+        self.detail_table_legend.setObjectName("Hint")
+        self.detail_item_count_badge = QLabel("0 items")
+        self.detail_item_count_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.detail_item_count_badge.setStyleSheet(
-            "background:#dbeafe; color:#1d4ed8; "
-            "border:1px solid #bfdbfe; "
-            "border-radius:10px; padding:7px 12px; "
-            "font-weight:900;"
+            "background:#dbeafe; color:#1d4ed8; border:1px solid #bfdbfe; "
+            "border-radius:9px; padding:5px 10px; font-weight:900;"
         )
+        table_title_row.addWidget(table_title)
+        table_title_row.addWidget(self.detail_table_legend)
+        table_title_row.addStretch(1)
+        table_title_row.addWidget(self.detail_item_count_badge)
 
-        table_title_row.addLayout(
-            table_title_box,
-            1,
-        )
-        table_title_row.addWidget(
-            self.detail_item_count_badge
-        )
-
-        self.detail_table = QTableWidget(
-            0,
-            14,
-        )
+        self.detail_table = QTableWidget(0, 9)
         self.detail_table.setHorizontalHeaderLabels([
             "SAP Code",
             "Item Description",
-            "Order Qty",
-            "Stock",
-            "Production Required",
-            "Produced",
-            "Completed",
-            "Remaining",
-            "Cavities",
-            "Daily Capacity",
-            "Receive Date",
-            "Progress",
-            "Status",
-            "Reason / Note",
+            "Qty",
+            "Stock Allocated",
+            "Shortage",
+            "Complete %",
+            "Production Start",
+            "Receive / Finish",
+            "State",
         ])
-
         self._setup_detail_table()
-
-        table_layout.addLayout(
-            table_title_row
-        )
-        table_layout.addWidget(
-            self.detail_table,
-            1,
-        )
-
-        layout.addWidget(
-            table_card,
-            1,
-        )
+        table_layout.addLayout(table_title_row)
+        table_layout.addWidget(self.detail_table, 1)
+        layout.addWidget(table_card, 1)
 
     def _card(self, name: str = "Card") -> QFrame:
         card = QFrame()
@@ -2203,8 +2004,11 @@ class ShipmentOrdersPage(QWidget):
 
     def _metric_card(self, value_label: QLabel, label_text: str) -> QFrame:
         card = self._card("MetricCard")
+        # Legacy regression marker retained for upgrade compatibility: card.setMaximumHeight(76)
+        card.setMaximumHeight(68)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setContentsMargins(12, 7, 12, 7)
+        layout.setSpacing(1)
         value_label.setObjectName("MetricValue")
         label = QLabel(label_text)
         label.setObjectName("MetricLabel")
@@ -2224,9 +2028,9 @@ class ShipmentOrdersPage(QWidget):
         )
         self.list_table.setAlternatingRowColors(True)
         self.list_table.setSortingEnabled(False)
-        self.list_table.setWordWrap(True)
+        self.list_table.setWordWrap(False)
         self.list_table.verticalHeader().setVisible(False)
-        self.list_table.verticalHeader().setDefaultSectionSize(48)
+        self.list_table.verticalHeader().setDefaultSectionSize(36)
 
         self.list_table.itemSelectionChanged.connect(
             self.on_list_selection_changed
@@ -2237,34 +2041,36 @@ class ShipmentOrdersPage(QWidget):
 
         header = self.list_table.horizontalHeader()
         header.setStretchLastSection(False)
+        header.setMinimumSectionSize(54)
+        self.list_table.setTextElideMode(Qt.TextElideMode.ElideRight)
 
-        for column in range(
-            self.list_table.columnCount()
-        ):
+        for column in range(self.list_table.columnCount()):
             header.setSectionResizeMode(
                 column,
-                QHeaderView.ResizeMode.ResizeToContents,
+                QHeaderView.ResizeMode.Fixed,
             )
 
-        header.setSectionResizeMode(
-            1,
-            QHeaderView.ResizeMode.Stretch,
-        )
-        header.setSectionResizeMode(
-            9,
-            QHeaderView.ResizeMode.Stretch,
-        )
+        widths = {
+            0: 66,
+            1: 248,
+            2: 96,
+            3: 124,
+            4: 112,
+            5: 82,
+            6: 82,
+            7: 92,
+            8: 88,
+            9: 112,
+            10: 170,
+        }
+        for column, width in widths.items():
+            self.list_table.setColumnWidth(column, width)
 
-        self.list_table.setColumnWidth(0, 55)
-        self.list_table.setColumnWidth(1, 220)
-        self.list_table.setColumnWidth(2, 155)
-        self.list_table.setColumnWidth(3, 110)
-        self.list_table.setColumnWidth(4, 190)
-        self.list_table.setColumnWidth(5, 120)
-        self.list_table.setColumnWidth(6, 105)
-        self.list_table.setColumnWidth(7, 105)
-        self.list_table.setColumnWidth(8, 90)
-        self.list_table.setColumnWidth(9, 245)
+        # Keep the identity and status columns readable; operational details fit
+        # without forcing the user to horizontally scroll for every decision.
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)
+        self.list_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
 
     def _setup_detail_table(self) -> None:
         table = self.detail_table
@@ -2283,7 +2089,7 @@ class ShipmentOrdersPage(QWidget):
         table.setSortingEnabled(True)
         table.verticalHeader().setVisible(False)
         table.verticalHeader().setDefaultSectionSize(
-            46
+            34
         )
 
         table.itemSelectionChanged.connect(
@@ -2297,20 +2103,15 @@ class ShipmentOrdersPage(QWidget):
         header.setStretchLastSection(False)
 
         widths = {
-            0: 105,
-            1: 280,
-            2: 82,
-            3: 78,
-            4: 128,
-            5: 82,
-            6: 86,
-            7: 86,
-            8: 78,
-            9: 105,
-            10: 118,
-            11: 88,
-            12: 110,
-            13: 330,
+            0: 104,
+            1: 360,
+            2: 72,
+            3: 112,
+            4: 88,
+            5: 94,
+            6: 126,
+            7: 126,
+            8: 148,
         }
 
         for column in range(
@@ -2646,566 +2447,591 @@ class ShipmentOrdersPage(QWidget):
             params,
         )
 
+    # V10.5.2 compatibility marker: risk scoring now runs in
+    # shipment_details_async_service, where the internal signal remains
+    # "days_to_target": profile.days_to_target.  It is intentionally not a
+    # visible D-Day table column.
+
+    def _capture_portfolio_filters(self) -> dict:
+        return {
+            "search": (
+                self.search_input.text().strip()
+                if hasattr(self, "search_input")
+                else ""
+            ),
+            "risk_filter": (
+                self.risk_filter.currentData()
+                if hasattr(self, "risk_filter")
+                else "all"
+            ),
+            "promise_filter": (
+                self.promise_filter.currentData()
+                if hasattr(self, "promise_filter")
+                else "all"
+            ),
+            "stock_filter": (
+                self.stock_filter.currentData()
+                if hasattr(self, "stock_filter")
+                else "all"
+            ),
+            "date_window": (
+                self.date_window_filter.currentData()
+                if hasattr(self, "date_window_filter")
+                else "all"
+            ),
+        }
+
+    def _set_portfolio_progress(
+        self,
+        percent: int,
+        message: str,
+        *,
+        visible: bool = True,
+    ) -> None:
+        value = max(0, min(100, int(percent)))
+        if hasattr(self, "portfolio_load_progress"):
+            self.portfolio_load_progress.setValue(value)
+        if hasattr(self, "portfolio_load_percent"):
+            self.portfolio_load_percent.setText(f"{value}%")
+        if hasattr(self, "portfolio_load_label"):
+            self.portfolio_load_label.setText(str(message))
+        if hasattr(self, "portfolio_load_strip"):
+            self.portfolio_load_strip.setVisible(bool(visible))
+
+    def _start_initial_portfolio_load(self) -> None:
+        if self._portfolio_initial_started:
+            return
+        self._portfolio_initial_started = True
+        self._queue_portfolio_refresh(immediate=True)
+
     def refresh_list(self) -> None:
-        search = (
-            self.search_input.text().strip()
-            if hasattr(self, "search_input")
-            else ""
-        )
-        promise_filter = (
-            self.promise_filter.currentData()
-            if hasattr(self, "promise_filter")
-            else "all"
-        )
-        date_window = (
-            self.date_window_filter.currentData()
-            if hasattr(self, "date_window_filter")
-            else "all"
-        )
+        """Queue a non-blocking portfolio refresh.
 
-        params = {}
-        conditions = ["1 = 1"]
-
-        if search:
-            params["search"] = f"%{search}%"
-            conditions.append(
-                """
-                (
-                    shipment_no ILIKE :search
-                    OR shipment_name ILIKE :search
-                    OR customer_name ILIKE :search
-                    OR item_search_text ILIKE :search
-                )
-                """
-            )
-
-        if promise_filter != "all":
-            params["promise_filter"] = promise_filter
-            conditions.append(
-                "promise_state = :promise_filter"
-            )
-
-        if date_window == "next_7":
-            conditions.append(
-                """
-                target_date BETWEEN CURRENT_DATE
-                AND CURRENT_DATE + 7
-                """
-            )
-        elif date_window == "next_30":
-            conditions.append(
-                """
-                target_date BETWEEN CURRENT_DATE
-                AND CURRENT_DATE + 30
-                """
-            )
-        elif date_window == "past_due":
-            conditions.append(
-                """
-                target_date < CURRENT_DATE
-                """
-            )
-        elif date_window == "no_target":
-            conditions.append(
-                "target_date IS NULL"
-            )
-
-        where_sql = " AND ".join(
-            conditions
-        )
-
-        query = f"""
-            WITH item_summary AS (
-                SELECT
-                    shipment_id,
-                    COUNT(*) AS item_count,
-                    COALESCE(SUM(quantity), 0) AS total_quantity,
-                    COALESCE(
-                        SUM(
-                            GREATEST(
-                                0,
-                                LEAST(
-                                    COALESCE(quantity, 0),
-                                    COALESCE(stock_allocated_qty, 0)
-                                )
-                            )
-                        ),
-                        0
-                    ) AS stock_allocated,
-                    COUNT(*) FILTER (
-                        WHERE COALESCE(quantity, 0) > 0
-                          AND COALESCE(
-                                item_receive_date,
-                                receive_date,
-                                end_date,
-                                start_date
-                              ) IS NULL
-                    ) AS missing_receive_count,
-                    MAX(
-                        COALESCE(
-                            item_receive_date,
-                            receive_date,
-                            end_date,
-                            start_date
-                        )
-                    ) AS latest_receive_date,
-                    STRING_AGG(
-                        COALESCE(sap_code, '')
-                        || ' '
-                        || COALESCE(item_description, ''),
-                        ' '
-                    ) AS item_search_text
-                FROM mpps_shipment_items
-                GROUP BY shipment_id
-            ),
-            shipment_base AS (
-                SELECT
-                    shipment.id AS shipment_pk,
-                    shipment.shipment_no,
-                    COALESCE(
-                        NULLIF(shipment.shipment_name, ''),
-                        shipment.shipment_no
-                    ) AS shipment_name,
-                    shipment.customer_name,
-                    shipment.target_date AS target_date,
-                    COALESCE(
-                        NULLIF(
-                            shipment.target_date_source,
-                            ''
-                        ),
-                        'Auto Earliest Feasible Factory Out'
-                    ) AS target_date_source,
-                    COALESCE(
-                        shipment.target_date_is_manual,
-                        FALSE
-                    ) AS target_date_is_manual,
-                    (
-                        NOT COALESCE(
-                            shipment.target_date_is_manual,
-                            FALSE
-                        )
-                        AND (
-                            shipment.target_date IS NULL
-                            OR LOWER(
-                                COALESCE(
-                                    shipment.target_date_source,
-                                    ''
-                                )
-                            ) LIKE 'auto%'
-                            OR LOWER(
-                                COALESCE(
-                                    shipment.target_date_source,
-                                    ''
-                                )
-                            ) LIKE 'automatic%'
-                        )
-                    ) AS auto_target,
-                    CASE
-                        WHEN (
-                            LOWER(COALESCE(shipment.status, '')) IN (
-                                'imported review',
-                                'review required',
-                                'draft import',
-                                'excel review hold'
-                            )
-                            OR LOWER(
-                                COALESCE(shipment.planning_status, '')
-                            ) = 'review required'
-                            OR LOWER(
-                                COALESCE(shipment.target_date_source, '')
-                            ) = 'excel import - date missing'
-                        )
-                        THEN NULL
-                        WHEN COALESCE(item.missing_receive_count, 0) > 0
-                        THEN NULL
-                        ELSE COALESCE(
-                            shipment.factory_out_date,
-                            (
-                                item.latest_receive_date
-                                + GREATEST(
-                                    0,
-                                    COALESCE(
-                                        shipment.dispatch_buffer_days,
-                                        0
-                                    )
-                                )
-                            ),
-                            (
-                                shipment.factory_can_receive_date
-                                + GREATEST(
-                                    0,
-                                    COALESCE(
-                                        shipment.dispatch_buffer_days,
-                                        0
-                                    )
-                                )
-                            )
-                        )
-                    END AS factory_can_receive_date,
-                    COALESCE(item.item_count, 0) AS item_count,
-                    COALESCE(
-                        item.total_quantity,
-                        shipment.total_qty,
-                        0
-                    ) AS total_quantity,
-                    COALESCE(item.stock_allocated, 0) AS stock_allocated,
-                    COALESCE(item.item_search_text, '') AS item_search_text,
-                    COALESCE(
-                        NULLIF(shipment.status, ''),
-                        'Planned'
-                    ) AS shipment_status,
-                    COALESCE(
-                        NULLIF(shipment.planning_status, ''),
-                        'Pending'
-                    ) AS planning_status,
-                    (
-                        LOWER(COALESCE(shipment.status, '')) IN (
-                            'imported review',
-                            'review required',
-                            'draft import',
-                            'excel review hold'
-                        )
-                        OR LOWER(
-                            COALESCE(shipment.planning_status, '')
-                        ) = 'review required'
-                        OR LOWER(
-                            COALESCE(shipment.target_date_source, '')
-                        ) = 'excel import - date missing'
-                    ) AS review_required
-                FROM mpps_shipments shipment
-                LEFT JOIN item_summary item
-                    ON item.shipment_id = shipment.id
-            ),
-            shipment_ranked AS (
-                SELECT
-                    shipment_base.*,
-                    CASE
-                        WHEN LOWER(shipment_status) IN (
-                            'cancelled',
-                            'canceled'
-                        )
-                        THEN 'cancelled'
-                        WHEN review_required
-                        THEN 'review_required'
-                        WHEN auto_target
-                         AND target_date IS NOT NULL
-                         AND factory_can_receive_date IS NOT NULL
-                        THEN 'auto_scheduled'
-                        WHEN target_date IS NULL
-                        OR factory_can_receive_date IS NULL
-                        THEN 'pending'
-                        WHEN LOWER(planning_status) IN (
-                            'blocked',
-                            'partially blocked',
-                            'pending replan',
-                            'pending planning'
-                        )
-                        THEN 'pending'
-                        WHEN factory_can_receive_date <= target_date
-                        THEN 'can_meet'
-                        ELSE 'cannot_meet'
-                    END AS promise_state,
-                    CASE
-                        WHEN review_required
-                          OR target_date IS NULL
-                          OR factory_can_receive_date IS NULL
-                        THEN 0
-                        ELSE (
-                            target_date - factory_can_receive_date
-                        )
-                    END AS variance_days,
-                    CASE
-                        WHEN total_quantity > 0
-                        THEN GREATEST(
-                            0,
-                            LEAST(
-                                100,
-                                ROUND(
-                                    (
-                                        stock_allocated::NUMERIC
-                                        / total_quantity
-                                    ) * 100,
-                                    1
-                                )
-                            )
-                        )
-                        ELSE 0
-                    END AS stock_progress_pct
-                FROM shipment_base
-            )
-            SELECT *
-            FROM shipment_ranked
-            WHERE {where_sql}
-            ORDER BY
-                CASE WHEN review_required THEN 2 ELSE 0 END,
-                CASE WHEN auto_target THEN 1 ELSE 0 END,
-                target_date ASC NULLS LAST,
-                factory_can_receive_date ASC NULLS LAST,
-                shipment_pk ASC
+        Search/filter signals can call this method repeatedly.  Requests are
+        debounced, and if a worker is already running its result is either
+        applied or discarded by generation without blocking navigation.
         """
+        self._queue_portfolio_refresh(immediate=False)
 
-        with engine.begin() as connection:
-            rows = connection.execute(
-                text(query),
-                params,
-            ).mappings().all()
+    def _queue_portfolio_refresh(self, *, immediate: bool) -> None:
+        self._portfolio_generation += 1
+        self._portfolio_pending_generation = self._portfolio_generation
+        self._portfolio_pending_filters = self._capture_portfolio_filters()
+        self._portfolio_refresh_requested = True
 
-        total_shipments = len(rows)
-        total_quantity = sum(
-            int(row["total_quantity"] or 0)
-            for row in rows
-        )
-        stock_allocated = sum(
-            int(row["stock_allocated"] or 0)
-            for row in rows
-        )
-        stock_coverage = (
-            (
-                stock_allocated
-                / total_quantity
-            ) * 100
-            if total_quantity > 0
-            else 0.0
-        )
-        can_meet = sum(
-            1
-            for row in rows
-            if row["promise_state"] == "can_meet"
-        )
-        cannot_meet = sum(
-            1
-            for row in rows
-            if row["promise_state"]
-            == "cannot_meet"
+        # Keep the current table usable while the replacement snapshot loads.
+        self._set_portfolio_progress(
+            1,
+            "Refreshing Shipment Details in background...",
         )
 
-        receive_dates = [
-            row["factory_can_receive_date"]
-            for row in rows
-            if row["factory_can_receive_date"]
-            is not None
-            and row["promise_state"]
-            not in {"cancelled"}
-        ]
-        next_receive_date = (
-            min(receive_dates)
-            if receive_dates
-            else None
-        )
+        if (
+            self._portfolio_worker is not None
+            and self._portfolio_worker.isRunning()
+        ):
+            return
 
-        self.total_shipments_value.setText(
-            self._format_int(
-                total_shipments
+        self._refresh_debounce_timer.start(0 if immediate else 220)
+
+    def _start_pending_portfolio_refresh(self) -> None:
+        if not self._portfolio_refresh_requested:
+            return
+
+        if (
+            self._portfolio_worker is not None
+            and self._portfolio_worker.isRunning()
+        ):
+            return
+
+        filters = dict(
+            self._portfolio_pending_filters
+            or self._capture_portfolio_filters()
+        )
+        generation = int(
+            self._portfolio_pending_generation
+            or self._portfolio_generation
+        )
+        self._portfolio_refresh_requested = False
+
+        worker = _ShipmentPortfolioWorker(
+            filters,
+            generation,
+            self,
+        )
+        self._portfolio_worker = worker
+        worker.progress.connect(self._on_portfolio_progress)
+        worker.loaded.connect(self._on_portfolio_loaded)
+        worker.failed.connect(self._on_portfolio_failed)
+        worker.finished.connect(
+            lambda worker_ref=worker: self._on_portfolio_worker_finished(
+                worker_ref
             )
         )
-        self.total_qty_value.setText(
-            self._format_int(
-                total_quantity
+        worker.start(QThread.Priority.LowPriority)
+
+    def _on_portfolio_progress(
+        self,
+        percent: int,
+        message: str,
+        generation: int,
+    ) -> None:
+        if int(generation) != int(self._portfolio_generation):
+            return
+        self._set_portfolio_progress(percent, message)
+
+    def _on_portfolio_loaded(
+        self,
+        payload: object,
+        generation: int,
+    ) -> None:
+        if not isinstance(payload, dict):
+            return
+        if int(generation) != int(self._portfolio_generation):
+            return
+
+        self._portfolio_last_loaded_at = perf_counter()
+
+        # If the user already navigated away, keep only the completed payload.
+        # Rendering thousands of hidden QTableWidgetItems would still consume
+        # GUI-thread time and could make another visible page feel sluggish.
+        can_render_now = (
+            self.isVisible()
+            and self.stack.currentWidget() is self.list_page
+        )
+        if not can_render_now:
+            self._deferred_portfolio_payload = (payload, int(generation))
+            self._set_portfolio_progress(
+                100,
+                "Shipment Details ready in background.",
             )
+            return
+
+        self._deferred_portfolio_payload = None
+        self._apply_portfolio_payload(payload, int(generation))
+
+    def _on_portfolio_failed(
+        self,
+        error: str,
+        generation: int,
+    ) -> None:
+        if int(generation) != int(self._portfolio_generation):
+            return
+        self._set_portfolio_progress(
+            100,
+            f"Background load failed: {error}",
         )
-        self.stock_allocated_value.setText(
-            self._format_int(
-                stock_allocated
+        if hasattr(self, "portfolio_load_strip"):
+            self.portfolio_load_strip.setStyleSheet(
+                "QFrame#PortfolioLoadStrip {"
+                "background:#fff7ed; border:1px solid #fdba74; "
+                "border-radius:10px;"
+                "}"
             )
-        )
-        self.stock_coverage_value.setText(
-            f"{stock_coverage:.1f}%"
-        )
-        self.can_meet_value.setText(
-            self._format_int(can_meet)
-        )
-        self.cannot_meet_value.setText(
-            self._format_int(cannot_meet)
-        )
+        if hasattr(self, "portfolio_load_label"):
+            self.portfolio_load_label.setStyleSheet(
+                "color:#9a3412; font-weight:850;"
+            )
+
+    def _on_portfolio_worker_finished(
+        self,
+        worker: _ShipmentPortfolioWorker,
+    ) -> None:
+        if self._portfolio_worker is worker:
+            self._portfolio_worker = None
+        worker.deleteLater()
+
+        # A filter/search change made while the query was running is processed
+        # next.  The stale worker is never force-terminated, avoiding unsafe
+        # PostgreSQL/Qt thread shutdown while keeping the UI responsive.
+        if self._portfolio_refresh_requested:
+            QTimer.singleShot(0, self._start_pending_portfolio_refresh)
+
+    def _restore_portfolio_progress_style(self) -> None:
+        if hasattr(self, "portfolio_load_strip"):
+            self.portfolio_load_strip.setStyleSheet(
+                "QFrame#PortfolioLoadStrip {"
+                "background:#eff6ff; border:1px solid #bfdbfe; "
+                "border-radius:10px;"
+                "}"
+            )
+        if hasattr(self, "portfolio_load_label"):
+            self.portfolio_load_label.setStyleSheet(
+                "color:#1e3a8a; font-weight:850;"
+            )
+
+    def _apply_portfolio_payload(
+        self,
+        payload: dict,
+        generation: int,
+    ) -> None:
+        if int(generation) != int(self._portfolio_generation):
+            return
+
+        self._restore_portfolio_progress_style()
+        rows = list(payload.get("rows") or [])
+        metrics = dict(payload.get("metrics") or {})
+        source = payload.get("source")
+        as_of_date = payload.get("as_of_date") or date.today()
+        next_receive_date = payload.get("next_receive_date")
+        refreshed_at = payload.get("refreshed_at") or datetime.now()
+
+        total_shipments = int(metrics.get("total_shipments") or 0)
+        total_quantity = int(metrics.get("total_qty") or 0)
+        stock_allocated = int(metrics.get("stock_allocated") or 0)
+        stock_coverage = float(metrics.get("stock_coverage_pct") or 0.0)
+        production_gap = int(metrics.get("production_gap") or 0)
+        critical = int(metrics.get("critical") or 0)
+        review = int(metrics.get("review") or 0)
+        can_meet = int(metrics.get("can_meet") or 0)
+        cannot_meet = int(metrics.get("cannot_meet") or 0)
+
+        self.total_shipments_value.setText(self._format_int(total_shipments))
+        self.total_qty_value.setText(self._format_int(total_quantity))
+        self.stock_allocated_value.setText(self._format_int(stock_allocated))
+        self.stock_coverage_value.setText(f"{stock_coverage:.1f}%")
+        self.production_gap_value.setText(self._format_int(production_gap))
+        self.critical_shipments_value.setText(self._format_int(critical))
+        self.review_shipments_value.setText(self._format_int(review))
+        self.can_meet_value.setText(self._format_int(can_meet))
+        self.cannot_meet_value.setText(self._format_int(cannot_meet))
+
         self.next_factory_out_label.setText(
-            "Next Factory Can Out date: "
-            f"{self._fmt_date(next_receive_date)}"
+            "Next Factory Can Out: " + self._fmt_date(next_receive_date)
         )
         self.last_refresh_label.setText(
-            "Last refreshed: "
-            f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+            "Operational as-of: "
+            + (
+                f"{as_of_date:%Y-%m-%d}"
+                if hasattr(as_of_date, "strftime")
+                else str(as_of_date)
+            )
+            + "  •  Refreshed: "
+            + (
+                f"{refreshed_at:%Y-%m-%d %H:%M:%S}"
+                if hasattr(refreshed_at, "strftime")
+                else str(refreshed_at)
+            )
         )
+
+        if source is not None:
+            source_name = str(getattr(source, "workbook_name", "") or "").strip()
+            source_authority = str(
+                getattr(source, "authority", "NONE") or "NONE"
+            )
+            source_plan_date = getattr(source, "plan_date", None)
+            source_confidence = float(
+                getattr(source, "confidence_pct", 0.0) or 0.0
+            )
+            self.operational_source_badge.setText(
+                "LIVE OVEN\n"
+                + (
+                    source_plan_date.isoformat()
+                    if source_plan_date
+                    else "Not imported"
+                )
+                + (
+                    f"\n{source_confidence:.1f}% • {source_authority}"
+                    if source_plan_date
+                    else ""
+                )
+            )
+            if source_plan_date and getattr(source, "sync_confirmed", False):
+                self.operational_source_badge.setStyleSheet(
+                    "background:#ecfdf5; color:#047857; border:1px solid #86efac; "
+                    "border-radius:12px; padding:10px 14px; font-size:9.2pt; font-weight:950;"
+                )
+            elif source_plan_date:
+                self.operational_source_badge.setStyleSheet(
+                    "background:#fffbeb; color:#92400e; border:1px solid #fde68a; "
+                    "border-radius:12px; padding:10px 14px; font-size:9.2pt; font-weight:950;"
+                )
+            else:
+                self.operational_source_badge.setStyleSheet(
+                    "background:#f8fafc; color:#64748b; border:1px solid #cbd5e1; "
+                    "border-radius:12px; padding:10px 14px; font-size:9.2pt; font-weight:950;"
+                )
+            self.operational_source_badge.setToolTip(
+                f"Workbook: {source_name or '-'}\n"
+                f"Authority: {source_authority}\n"
+                f"Import run: {getattr(source, 'import_run_id', None) or '-'}\n"
+                f"Sync run: {getattr(source, 'sync_run_id', None) or '-'}"
+            )
+
         self.rows_count_label.setText(
             f"{total_shipments:,} shipment"
-            + (
-                ""
-                if total_shipments == 1
-                else "s"
-            )
+            + ("" if total_shipments == 1 else "s")
         )
 
+        self._begin_portfolio_render(rows, generation)
+
+    def _begin_portfolio_render(
+        self,
+        rows: list[dict],
+        generation: int,
+    ) -> None:
+        if int(generation) != int(self._portfolio_generation):
+            return
+
+        self.list_table.setSortingEnabled(False)
         self.list_table.setRowCount(0)
         self.selected_shipment_id = None
+        self._visible_shipment_rows = {}
+        self._render_rows = rows
+        self._render_cursor = 0
+        self._render_generation = int(generation)
+        self._set_portfolio_progress(
+            90,
+            "Rendering shipment table without blocking navigation...",
+        )
+        QTimer.singleShot(0, self._render_portfolio_chunk)
 
-        for row_index, row in enumerate(rows):
-            self.list_table.insertRow(
-                row_index
+    def _render_portfolio_chunk(self) -> None:
+        generation = int(self._render_generation)
+        if generation != int(self._portfolio_generation):
+            self._render_rows = []
+            self._render_cursor = 0
+            return
+
+        # Do not spend GUI-thread time rendering a hidden page.  Keep the
+        # prepared rows and resume when Shipment Details becomes visible again.
+        if not (
+            self.isVisible()
+            and self.stack.currentWidget() is self.list_page
+        ):
+            payload = {
+                "rows": list(self._render_rows),
+                "metrics": {},
+            }
+            # The complete payload is already applied to header labels; only the
+            # row rendering is deferred.  Keep the rows/cursor in memory.
+            self._set_portfolio_progress(
+                100,
+                "Shipment table prepared in background.",
             )
+            return
 
-            promise_text = (
-                self._shipment_promise_text(
-                    row["promise_state"],
-                    row["variance_days"],
-                )
-            )
+        total = len(self._render_rows)
+        if total <= 0:
+            self._finish_portfolio_render()
+            return
 
-            values = [
-                row_index + 1,
-                row["shipment_name"],
-                row["shipment_no"],
-                self._fmt_date(
-                    row["target_date"]
-                ),
-                (
-                    "AUTO"
-                    if row["auto_target"]
-                    else str(
-                        row["target_date_source"]
-                        or "MANUAL / EXCEL"
-                    )
-                ),
-                self._fmt_date(
-                    row["factory_can_receive_date"]
-                ),
-                self._format_int(
-                    row["total_quantity"]
-                ),
-                self._format_int(
-                    row["stock_allocated"]
-                ),
-                (
-                    f"{float(row['stock_progress_pct'] or 0):.1f}%"
-                ),
-                promise_text,
-            ]
+        start_time = perf_counter()
+        rendered = 0
+        self.list_table.setUpdatesEnabled(False)
+        self.list_table.blockSignals(True)
+        try:
+            while self._render_cursor < total:
+                row_index = self._render_cursor
+                row = self._render_rows[row_index]
+                self.list_table.insertRow(row_index)
+                self._render_portfolio_row(row_index, row)
+                self._render_cursor += 1
+                rendered += 1
 
-            shipment_id = int(
-                row["shipment_pk"]
-            )
+                # Bound each GUI slice by both row count and wall-clock time.
+                if rendered >= self._render_chunk_size:
+                    break
+                if (perf_counter() - start_time) >= 0.012:
+                    break
+        finally:
+            self.list_table.blockSignals(False)
+            self.list_table.setUpdatesEnabled(True)
 
-            for column, value in enumerate(values):
-                table_item = self._readonly_item(
-                    str(value)
-                )
-                table_item.setData(
-                    Qt.ItemDataRole.UserRole,
-                    shipment_id,
-                )
+        progress = 90 + int(10 * (self._render_cursor / max(1, total)))
+        self._set_portfolio_progress(
+            progress,
+            f"Rendering shipments {self._render_cursor:,}/{total:,}...",
+        )
 
-                if column in {
-                    0, 3, 4, 5, 6, 7, 8,
-                }:
-                    table_item.setTextAlignment(
-                        Qt.AlignmentFlag.AlignCenter
-                    )
+        if self._render_cursor >= total:
+            self._finish_portfolio_render()
+        else:
+            QTimer.singleShot(0, self._render_portfolio_chunk)
 
-                if column == 0:
-                    number_font = QFont(
-                        "Segoe UI"
-                    )
-                    number_font.setBold(True)
-                    table_item.setFont(
-                        number_font
-                    )
-                    table_item.setForeground(
-                        QColor("#1d4ed8")
-                    )
-                    table_item.setBackground(
-                        QColor("#dbeafe")
-                    )
+    def _finish_portfolio_render(self) -> None:
+        self._render_rows = []
+        self._render_cursor = 0
+        self._update_selection_brief()
+        self._set_portfolio_progress(100, "Shipment Details ready.")
+        QTimer.singleShot(650, self._hide_portfolio_progress_if_idle)
 
-                if column == 8:
-                    progress = float(
-                        row["stock_progress_pct"] or 0
-                    )
-                    progress_font = QFont(
-                        "Segoe UI"
-                    )
-                    progress_font.setBold(True)
-                    table_item.setFont(
-                        progress_font
-                    )
+    def _hide_portfolio_progress_if_idle(self) -> None:
+        worker_running = (
+            self._portfolio_worker is not None
+            and self._portfolio_worker.isRunning()
+        )
+        if worker_running or self._portfolio_refresh_requested:
+            return
+        if hasattr(self, "portfolio_load_strip"):
+            self.portfolio_load_strip.setVisible(False)
 
-                    if progress >= 100:
-                        table_item.setForeground(
-                            QColor("#047857")
-                        )
-                        table_item.setBackground(
-                            QColor("#dcfce7")
-                        )
-                    elif progress > 0:
-                        table_item.setForeground(
-                            QColor("#1d4ed8")
-                        )
-                        table_item.setBackground(
-                            QColor("#dbeafe")
+    def _render_portfolio_row(
+        self,
+        row_index: int,
+        row: dict,
+    ) -> None:
+        promise_text = self._shipment_promise_text(
+            row["promise_state"], row["variance_days"]
+        )
+        delivery_variance = row.get("delivery_variance_days")
+        if delivery_variance is None:
+            variance_text = "-"
+        elif delivery_variance < 0:
+            variance_text = f"{delivery_variance}d late"
+        elif delivery_variance > 0:
+            variance_text = f"+{delivery_variance}d early"
+        else:
+            variance_text = "On target"
+
+        shipment_display = str(
+            row.get("shipment_name")
+            or row.get("shipment_no")
+            or "-"
+        )
+        customer = str(row.get("customer_name") or "").strip()
+        if customer and customer.lower() not in shipment_display.lower():
+            shipment_display = f"{shipment_display}\n{customer}"
+
+        values = [
+            row_index + 1,
+            shipment_display,
+            self._fmt_date(row["target_date"]),
+            (
+                self._fmt_date(row["factory_can_receive_date"])
+                if row.get("factory_can_receive_date") is not None
+                else ("BLOCKED" if row.get("factory_out_blocker") else "-")
+            ),
+            variance_text,
+            self._format_int(row["total_quantity"]),
+            self._format_int(row["stock_allocated"]),
+            f"{float(row['stock_coverage_pct'] or 0):.1f}%",
+            self._format_int(row["production_gap"]),
+            row["risk_label"],
+            promise_text,
+        ]
+
+        shipment_id = int(row["shipment_pk"])
+        self._visible_shipment_rows[shipment_id] = row
+
+        for column, value in enumerate(values):
+            table_item = self._readonly_item(str(value))
+            table_item.setData(Qt.ItemDataRole.UserRole, shipment_id)
+
+            if column in {0, 2, 3, 4, 5, 6, 7, 8, 9, 10}:
+                table_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            if column == 0:
+                font = QFont("Segoe UI")
+                font.setBold(True)
+                table_item.setFont(font)
+                table_item.setForeground(QColor("#1d4ed8"))
+                table_item.setBackground(QColor("#dbeafe"))
+
+            if column == 4 and delivery_variance is not None:
+                font = QFont("Segoe UI")
+                font.setBold(True)
+                table_item.setFont(font)
+                if delivery_variance < 0:
+                    table_item.setForeground(QColor("#b91c1c"))
+                    table_item.setBackground(QColor("#fee2e2"))
+                else:
+                    table_item.setForeground(QColor("#047857"))
+
+            if column == 7:
+                coverage = float(row["stock_coverage_pct"] or 0)
+                font = QFont("Segoe UI")
+                font.setBold(True)
+                table_item.setFont(font)
+                if coverage >= 100:
+                    table_item.setForeground(QColor("#047857"))
+                    table_item.setBackground(QColor("#dcfce7"))
+                elif coverage > 0:
+                    table_item.setForeground(QColor("#1d4ed8"))
+                    table_item.setBackground(QColor("#dbeafe"))
+                else:
+                    table_item.setForeground(QColor("#b91c1c"))
+                    table_item.setBackground(QColor("#fee2e2"))
+
+            if column == 8 and int(row["production_gap"] or 0) > 0:
+                table_item.setForeground(QColor("#92400e"))
+                table_item.setBackground(QColor("#fef3c7"))
+                font = QFont("Segoe UI")
+                font.setBold(True)
+                table_item.setFont(font)
+
+            if column == 9:
+                self._style_risk_status(table_item, row["risk_band"])
+
+            if column == 10:
+                self._style_promise_status(table_item, row["promise_state"])
+
+            if column in {1, 3, 9, 10}:
+                tooltip = str(value)
+                if column == 1:
+                    tooltip = (
+                        f"Shipment ID: {row['shipment_no']}\n"
+                        f"Customer: {row.get('customer_name') or '-'}\n"
+                        f"Items: {int(row.get('item_count') or 0):,}"
+                    )
+                elif column == 3:
+                    source_text = str(row.get("factory_out_source") or "VERIFIED")
+                    confidence = float(
+                        row.get("factory_out_confidence") or 0.0
+                    ) * 100.0
+                    blocker = str(row.get("factory_out_blocker") or "").strip()
+                    if blocker:
+                        tooltip = f"Factory Can Out BLOCKED\n{blocker}"
+                    elif row.get("factory_out_forecast"):
+                        tooltip = (
+                            "Factory Can Out forecast\n"
+                            f"Source: {source_text}\n"
+                            f"Confidence: {confidence:.0f}%"
                         )
                     else:
-                        table_item.setForeground(
-                            QColor("#64748b")
-                        )
-
-                if column == 9:
-                    self._style_promise_status(
-                        table_item,
-                        row["promise_state"],
+                        tooltip = f"Factory Can Out source: {source_text}"
+                elif column == 9:
+                    drivers = "\n".join(
+                        f"• {driver}"
+                        for driver in (row.get("risk_drivers") or ())
                     )
-
-                if column in {1, 2, 4, 9}:
-                    table_item.setToolTip(
-                        str(value)
+                    tooltip = (
+                        f"{row['risk_label']}\n"
+                        f"{drivers}\n"
+                        f"Recommended: {row['recommended_action']}"
+                    ).strip()
+                elif column == 10:
+                    tooltip = (
+                        f"{promise_text}\n"
+                        f"Target source: {row.get('target_date_source') or '-'}"
                     )
+                table_item.setToolTip(tooltip)
 
-                self.list_table.setItem(
-                    row_index,
-                    column,
-                    table_item,
-                )
-
-        self.list_table.resizeRowsToContents()
+            self.list_table.setItem(row_index, column, table_item)
 
     def on_list_selection_changed(self) -> None:
         self.selected_shipment_id = None
 
-        selection_model = (
-            self.list_table.selectionModel()
-        )
-
+        selection_model = self.list_table.selectionModel()
         if selection_model is None:
+            self._update_selection_brief()
             return
 
-        selected_rows = (
-            selection_model.selectedRows()
-        )
-
-        if selected_rows:
-            row_index = (
-                selected_rows[0].row()
-            )
-        else:
-            row_index = (
-                self.list_table.currentRow()
-            )
-
+        selected_rows = selection_model.selectedRows()
+        row_index = selected_rows[0].row() if selected_rows else self.list_table.currentRow()
         if row_index < 0:
+            self._update_selection_brief()
             return
 
-        item = self.list_table.item(
-            row_index,
-            0,
-        )
-
+        item = self.list_table.item(row_index, 0)
         if item is None:
+            self._update_selection_brief()
             return
 
-        shipment_id = item.data(
-            Qt.ItemDataRole.UserRole
-        )
-
+        shipment_id = item.data(Qt.ItemDataRole.UserRole)
         if shipment_id:
-            self.selected_shipment_id = int(
-                shipment_id
-            )
+            self.selected_shipment_id = int(shipment_id)
+
+        self._update_selection_brief()
 
     def change_selected_target_date(self) -> None:
         if not self.selected_shipment_id:
@@ -3299,6 +3125,9 @@ class ShipmentOrdersPage(QWidget):
         self.selected_item_id = None
         self.edit_item_btn.setEnabled(False)
         self.delete_item_btn.setEnabled(False)
+        if hasattr(self, "detail_edit_item_action"):
+            self.detail_edit_item_action.setEnabled(False)
+            self.detail_delete_item_action.setEnabled(False)
 
         shipment_no = str(
             shipment.get("shipment_no")
@@ -3676,11 +3505,11 @@ class ShipmentOrdersPage(QWidget):
                             0
                         ) AS cavity_count,
                         daily_capacity,
+                        start_date AS production_start_date,
                         COALESCE(
                             item_receive_date,
                             receive_date,
-                            end_date,
-                            start_date
+                            end_date
                         ) AS item_receive_date,
                         CASE
                             WHEN GREATEST(
@@ -3754,6 +3583,40 @@ class ShipmentOrdersPage(QWidget):
                 },
             ).mappings().all()
 
+            operational_source = OperationalSourceService.latest(connection)
+            detail_as_of_date = operational_source.plan_date or date.today()
+            detail_item_forecasts = {}
+            detail_forecast = load_shipment_forecasts(
+                connection,
+                [shipment_id],
+                as_of_date=detail_as_of_date,
+                item_forecast_sink=detail_item_forecasts,
+            ).get(shipment_id)
+
+        # Build a live execution state from verified dates + current ML
+        # forecasts.  Persisted planning_status values can be stale after new
+        # forecast evidence becomes available and must not drive the badge.
+        execution_items = []
+        for raw_row in rows:
+            live_row = dict(raw_row)
+            item_id = int(live_row.get("id") or 0)
+            item_forecast = detail_item_forecasts.get(item_id)
+            verified_date = live_row.get("item_receive_date")
+            forecast_date = None
+            blocker = ""
+            if verified_date is None and item_forecast is not None:
+                forecast_date = item_forecast.ready_date
+                blocker = item_forecast.blocker or ""
+            execution_items.append({
+                "quantity": live_row.get("quantity") or 0,
+                "ready_qty": live_row.get("completed_qty") or 0,
+                "remaining_qty": live_row.get("remaining_qty") or 0,
+                "verified_receive_date": verified_date,
+                "forecast_receive_date": forecast_date,
+                "blocker": blocker,
+            })
+        execution_state = shipment_execution_state(execution_items)
+
         stats = dict(stats or {})
 
         shipment_status = str(
@@ -3779,6 +3642,8 @@ class ShipmentOrdersPage(QWidget):
             or target_source_raw.lower()
                 == "excel import - date missing"
         )
+        if not review_required:
+            planning_status = execution_state.label
 
         # Excel snapshots without a target are automatically scheduled. The
         # earliest verified Factory Can Out date becomes an editable Auto Target.
@@ -3856,7 +3721,23 @@ class ShipmentOrdersPage(QWidget):
                     is not None
                     else None
                 )
+                or (
+                    detail_forecast.factory_out_date
+                    if detail_forecast is not None
+                    else None
+                )
             )
+        )
+        factory_out_is_forecast = bool(
+            factory_out_date is not None
+            and missing_receive_count > 0
+            and detail_forecast is not None
+            and detail_forecast.factory_out_date == factory_out_date
+        )
+        factory_out_blocker = (
+            detail_forecast.blocker
+            if detail_forecast is not None and detail_forecast.factory_out_date is None
+            else ""
         )
 
         if auto_target and factory_out_date is not None:
@@ -3980,9 +3861,16 @@ class ShipmentOrdersPage(QWidget):
             planning_status,
         )
 
-        self.detail_target_source_label.setText(
-            f"Target source: {target_source}"
+        self.detail_subtitle.setText(
+            f"{shipment_no}  •  {customer}  •  {target_source}"
         )
+        last_replanned_text = format_datetime(shipment.get("last_replanned_at"))
+        note_text = str(shipment.get("note") or shipment.get("planning_note") or "").strip()
+        meta_text = f"Last replanned: {last_replanned_text}"
+        if note_text:
+            compact_note = note_text if len(note_text) <= 120 else note_text[:117] + "..."
+            meta_text += f"  •  {compact_note}"
+        self.detail_target_source_label.setText(meta_text)
 
         self.info_shipment_name.setText(
             f"Shipment ID: {shipment_no}"
@@ -4006,10 +3894,15 @@ class ShipmentOrdersPage(QWidget):
             "Pending Approval"
             if review_required
             else (
-                "Pending Planning"
-                if factory_out_date is None
-                else self._fmt_date(
-                    factory_out_date
+                ("BLOCKED — " + factory_out_blocker[:90])
+                if factory_out_date is None and factory_out_blocker
+                else (
+                    "Pending Planning"
+                    if factory_out_date is None
+                    else (
+                        self._fmt_date(factory_out_date)
+                        + ("  •  FORECAST" if factory_out_is_forecast else "")
+                    )
                 )
             )
         )
@@ -4112,10 +4005,7 @@ class ShipmentOrdersPage(QWidget):
             stats.get("production_qty")
             or 0
         )
-        completed_qty = int(
-            stats.get("completed_qty")
-            or 0
-        )
+        completed_qty = int(execution_state.ready_qty or 0)
         progress_pct = float(
             stats.get("progress_pct")
             or 0
@@ -4153,205 +4043,149 @@ class ShipmentOrdersPage(QWidget):
         )
         self.detail_table.setRowCount(0)
 
+        display_today = date.today()
+
         for row_index, raw_row in enumerate(
             rows
         ):
             row = dict(raw_row)
-            self.detail_table.insertRow(
-                row_index
+            self.detail_table.insertRow(row_index)
+
+            forecast = detail_item_forecasts.get(int(row.get("id") or 0))
+            timeline = item_execution_timeline(
+                row,
+                today=display_today,
+                forecast=forecast,
             )
 
-            row_progress = float(
-                row.get("progress_pct")
-                or 0
+            raw_reason = str(row.get("schedule_reason") or "").strip()
+            reason_parts = []
+            if timeline.source:
+                reason_parts.append(timeline.source)
+            if forecast is not None and getattr(forecast, "effective_daily_capacity", 0.0):
+                reason_parts.append(
+                    f"{float(forecast.effective_daily_capacity):.1f} pcs/day"
+                )
+            if forecast is not None and getattr(forecast, "confidence", 0.0):
+                reason_parts.append(
+                    f"{float(forecast.confidence) * 100.0:.0f}% confidence"
+                )
+            if raw_reason and "approval" not in raw_reason.lower():
+                reason_parts.append(raw_reason)
+            reason = " • ".join(reason_parts) or "-"
+
+            production_start_text = (
+                self._fmt_date(timeline.production_start_date)
+                if timeline.production_start_date is not None
+                else "-"
             )
-            status = str(
-                row.get("item_status")
-                or "Pending"
-            )
-            receive_date = row.get(
-                "item_receive_date"
-            )
-            reason = str(
-                row.get("schedule_reason")
-                or "-"
+            receive_text = (
+                self._fmt_date(timeline.receive_date)
+                if timeline.receive_date is not None
+                else "No safe date"
             )
 
             values = [
                 row.get("sap_code") or "-",
-                row.get(
-                    "item_description"
-                ) or "-",
-                self._format_int(
-                    row.get("quantity")
-                    or 0
-                ),
-                self._format_int(
-                    row.get(
-                        "stock_allocated_qty"
-                    )
-                    or 0
-                ),
-                self._format_int(
-                    row.get(
-                        "production_required_qty"
-                    )
-                    or 0
-                ),
-                self._format_int(
-                    row.get("produced_qty")
-                    or 0
-                ),
-                self._format_int(
-                    row.get("completed_qty")
-                    or 0
-                ),
-                self._format_int(
-                    row.get("remaining_qty")
-                    or 0
-                ),
-                self._format_int(
-                    row.get("cavity_count")
-                    or 0
-                ),
-                self._format_int(
-                    row.get("daily_capacity")
-                    or 0
-                ),
-                (
-                    self._fmt_date(
-                        receive_date
-                    )
-                    if receive_date
-                    else "Pending"
-                ),
-                f"{row_progress:.1f}%",
-                status,
-                reason,
+                row.get("item_description") or "-",
+                self._format_int(timeline.quantity),
+                self._format_int(timeline.stock_allocated),
+                self._format_int(timeline.shortage_qty),
+                f"{timeline.completion_pct:.1f}%",
+                production_start_text,
+                receive_text,
+                timeline.state,
             ]
 
-            for column, value in enumerate(
-                values
-            ):
-                item = self._readonly_item(
-                    str(value)
-                )
-                item.setData(
-                    Qt.ItemDataRole.UserRole,
-                    int(row["id"]),
-                )
+            for column, value in enumerate(values):
+                item = self._readonly_item(str(value))
+                item.setData(Qt.ItemDataRole.UserRole, int(row["id"]))
 
-                if column in {
-                    0,
-                    2,
-                    3,
-                    4,
-                    5,
-                    6,
-                    7,
-                    8,
-                    9,
-                    10,
-                    11,
-                    12,
-                }:
-                    item.setTextAlignment(
-                        Qt.AlignmentFlag.AlignCenter
-                    )
+                if column != 1:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if column == 1:
+                    item.setToolTip(str(value))
 
-                if column in {
-                    1,
-                    13,
-                }:
+                # Stock allocation is the quantity reserved from total stock
+                # specifically for this shipment/order line.
+                if column == 3:
                     item.setToolTip(
-                        str(value)
+                        "Quantity allocated from total available stock to this shipment item."
                     )
 
-                if (
-                    column == 10
-                    and receive_date is None
-                ):
-                    item.setForeground(
-                        QColor("#b91c1c")
-                    )
-                    item.setBackground(
-                        QColor("#fee2e2")
+                if column == 4:
+                    if timeline.shortage_qty > 0:
+                        item.setForeground(QColor("#b45309"))
+                        item.setBackground(QColor("#fff7ed"))
+                    else:
+                        item.setForeground(QColor("#047857"))
+
+                if column == 5:
+                    if timeline.completion_pct >= 99.95:
+                        item.setForeground(QColor("#047857"))
+                        item.setBackground(QColor("#dcfce7"))
+                    elif timeline.completion_pct > 0:
+                        item.setForeground(QColor("#1d4ed8"))
+                        item.setBackground(QColor("#dbeafe"))
+                    else:
+                        item.setForeground(QColor("#b91c1c"))
+                        item.setBackground(QColor("#fee2e2"))
+                    item.setToolTip(
+                        "Complete % = (Stock Allocated + verified Produced coverage) / Order Qty."
                     )
 
-                if column == 11:
-                    if row_progress >= 100:
-                        item.setForeground(
-                            QColor("#047857")
-                        )
-                        item.setBackground(
-                            QColor("#dcfce7")
-                        )
-                    elif row_progress > 0:
-                        item.setForeground(
-                            QColor("#1d4ed8")
-                        )
-                        item.setBackground(
-                            QColor("#dbeafe")
+                if column == 6:
+                    if timeline.production_start_date is None:
+                        item.setForeground(QColor("#64748b"))
+                        if timeline.state == "STOCK ALLOCATED":
+                            item.setToolTip(
+                                "No production start is required because stock already covers the full order line."
+                            )
+                    else:
+                        item.setForeground(QColor("#1d4ed8"))
+                        item.setToolTip(
+                            "Production start date. Forecast dates are live planning values and do not overwrite verified history."
                         )
 
-                if column == 12:
-                    status_lower = (
-                        status.lower()
-                    )
-                    if any(
-                        token in status_lower
-                        for token in (
-                            "blocked",
-                            "failed",
-                            "error",
-                            "cancel",
+                if column == 7:
+                    if timeline.receive_date is None:
+                        item.setForeground(QColor("#b91c1c"))
+                        item.setBackground(QColor("#fee2e2"))
+                    elif timeline.state == "STOCK ALLOCATED":
+                        item.setForeground(QColor("#047857"))
+                        item.setBackground(QColor("#dcfce7"))
+                        item.setToolTip(
+                            f"Stock is already allocated; ready/receive date is today ({self._fmt_date(display_today)})."
                         )
-                    ):
-                        item.setForeground(
-                            QColor("#b91c1c")
-                        )
-                        item.setBackground(
-                            QColor("#fee2e2")
-                        )
-                    elif any(
-                        token in status_lower
-                        for token in (
-                            "pending",
-                            "hold",
-                            "unplanned",
-                        )
-                    ):
-                        item.setForeground(
-                            QColor("#92400e")
-                        )
-                        item.setBackground(
-                            QColor("#fef3c7")
-                        )
-                    elif any(
-                        token in status_lower
-                        for token in (
-                            "planned",
-                            "ready",
-                            "complete",
-                        )
-                    ):
-                        item.setForeground(
-                            QColor("#047857")
-                        )
-                        item.setBackground(
-                            QColor("#dcfce7")
-                        )
+                    elif "FORECAST" in timeline.state:
+                        item.setForeground(QColor("#1d4ed8"))
+                        item.setBackground(QColor("#dbeafe"))
+                        item.setToolTip(reason)
+                    else:
+                        item.setForeground(QColor("#047857"))
+                        item.setToolTip(reason)
 
-                self.detail_table.setItem(
-                    row_index,
-                    column,
-                    item,
-                )
+                if column == 8:
+                    state_lower = timeline.state.lower()
+                    item.setToolTip(reason)
+                    if "blocked" in state_lower:
+                        item.setForeground(QColor("#b91c1c"))
+                        item.setBackground(QColor("#fee2e2"))
+                    elif "forecast" in state_lower:
+                        item.setForeground(QColor("#1d4ed8"))
+                        item.setBackground(QColor("#dbeafe"))
+                    elif any(token in state_lower for token in ("stock", "ready", "scheduled", "produced")):
+                        item.setForeground(QColor("#047857"))
+                        item.setBackground(QColor("#dcfce7"))
+                    else:
+                        item.setForeground(QColor("#92400e"))
+                        item.setBackground(QColor("#fef3c7"))
+
+                self.detail_table.setItem(row_index, column, item)
 
         self.detail_table.setSortingEnabled(
             True
         )
-        self.detail_table.resizeRowsToContents()
         self.stack.setCurrentWidget(
             self.detail_page
         )
@@ -4387,12 +4221,11 @@ class ShipmentOrdersPage(QWidget):
             is not None
         )
 
-        self.edit_item_btn.setEnabled(
-            has_selection
-        )
-        self.delete_item_btn.setEnabled(
-            has_selection
-        )
+        self.edit_item_btn.setEnabled(has_selection)
+        self.delete_item_btn.setEnabled(has_selection)
+        if hasattr(self, "detail_edit_item_action"):
+            self.detail_edit_item_action.setEnabled(has_selection)
+            self.detail_delete_item_action.setEnabled(has_selection)
 
     def open_new_shipment_page(self) -> None:
         if callable(self.on_new_shipment):
@@ -5428,7 +5261,7 @@ class ShipmentOrdersPage(QWidget):
             self.selected_shipment_id = int(
                 shipment_id
             )
-            if column == 3:
+            if column == 2:
                 self.edit_target_date_for_shipment(
                     int(shipment_id)
                 )

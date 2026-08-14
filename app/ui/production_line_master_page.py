@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from uuid import uuid4
 
@@ -104,11 +104,22 @@ class ProductionLineRepository:
             )
 
     def delete(self, item_id: str) -> None:
+        """Non-destructive V11 lifecycle action: retire instead of delete."""
         self.ensure_table()
-
         with engine.begin() as conn:
             conn.execute(
-                text("DELETE FROM production_lines WHERE id = :id"),
+                text(
+                    """
+                    UPDATE production_lines
+                    SET status='Retired',
+                        remarks=CASE
+                            WHEN TRIM(COALESCE(remarks,''))=''
+                            THEN 'Retired from technical register; historical ML evidence retained.'
+                            ELSE remarks END,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=:id
+                    """
+                ),
                 {"id": item_id},
             )
 
@@ -530,7 +541,7 @@ class ProductionLineMasterPage(QWidget):
             edit_button.setObjectName("EditButton")
             edit_button.clicked.connect(lambda checked=False, item_id=row["id"]: self._edit_line(item_id))
 
-            delete_button = QPushButton("Delete")
+            delete_button = QPushButton("Retire")
             delete_button.setObjectName("DeleteButton")
             delete_button.clicked.connect(lambda checked=False, item_id=row["id"]: self._delete_line(item_id))
 
@@ -604,8 +615,8 @@ class ProductionLineMasterPage(QWidget):
 
         answer = QMessageBox.question(
             self,
-            "Delete Production Line",
-            f"Delete production line '{row.get('line_name', '')}'?",
+            "Retire Production Line",
+            f"Retire production line '{row.get('line_name', '')}'? Historical evidence will be retained.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
 
@@ -617,7 +628,7 @@ class ProductionLineMasterPage(QWidget):
         except Exception as exc:
             QMessageBox.critical(
                 self,
-                "Delete Failed",
+                "Retire Failed",
                 f"Could not delete production line.\n\n{exc}",
             )
             return

@@ -70,7 +70,7 @@ class TireStockPage(QWidget):
         title.setObjectName("SectionTitle")
         hint = QLabel(
             "MPPS Stock Planning is the current stock source of truth. Available "
-            "stock is FG + QC - scrap - blocked."
+            "usable stock is FG + QC; scrap and blocked are separate status buckets."
         )
         hint.setObjectName("SectionHint")
         hint.setWordWrap(True)
@@ -127,7 +127,7 @@ class TireStockPage(QWidget):
                                 scrap_stock,
                                 blocked_stock,
                                 (
-                                    fg_stock + qc_stock - scrap_stock - blocked_stock
+                                    GREATEST(fg_stock, 0) + GREATEST(qc_stock, 0)
                                 )::INTEGER AS available_stock
                             FROM mpps_stock_items
                             WHERE is_active = TRUE

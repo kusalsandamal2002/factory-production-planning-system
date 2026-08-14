@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
@@ -280,11 +280,22 @@ class CavityRepository:
             )
 
     def delete_cavity(self, cavity_id: int) -> None:
+        """Retire a cavity while preserving its historical production evidence."""
         self.ensure_tables()
-
         with engine.begin() as conn:
             conn.execute(
-                text("DELETE FROM production_line_cavities WHERE id = :id"),
+                text(
+                    """
+                    UPDATE production_line_cavities
+                    SET status='Retired',
+                        remarks=CASE
+                            WHEN TRIM(COALESCE(remarks,''))=''
+                            THEN 'Retired from technical register; historical ML evidence retained.'
+                            ELSE remarks END,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=:id
+                    """
+                ),
                 {"id": cavity_id},
             )
 
@@ -1321,7 +1332,7 @@ class CavitiesMasterPage(QWidget):
         box.setIcon(QMessageBox.Icon.Question)
 
         edit_button = box.addButton("Edit", QMessageBox.ButtonRole.AcceptRole)
-        delete_button = box.addButton("Delete", QMessageBox.ButtonRole.DestructiveRole)
+        delete_button = box.addButton("Retire", QMessageBox.ButtonRole.DestructiveRole)
         cancel_button = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
 
         box.exec()
@@ -1407,8 +1418,8 @@ class CavitiesMasterPage(QWidget):
 
         confirm = QMessageBox.question(
             self,
-            "Delete Cavity",
-            f"Delete {cavity_code} from {self.selected_line_name}?",
+            "Retire Cavity",
+            f"Retire {cavity_code} from {self.selected_line_name}? Historical evidence will be retained.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1419,7 +1430,7 @@ class CavitiesMasterPage(QWidget):
         try:
             self.repo.delete_cavity(cavity_id)
         except Exception as exc:
-            QMessageBox.critical(self, "Delete Failed", f"Could not delete cavity.\n\n{exc}")
+            QMessageBox.critical(self, "Retire Failed", f"Could not delete cavity.\n\n{exc}")
             return
 
         self._load_detail(self.selected_line_name)

@@ -248,12 +248,8 @@ def calculate_excel_oven_plan(
             else 10**9
         )
 
-        if approval.lower() != "approved":
-            status = "NOT APPROVED"
-            risk_parts.append(
-                "Planning manager approval is not Approved"
-            )
-        elif not smds:
+        # Approval status is audit metadata, not a planning constraint.
+        if not smds:
             status = "MISSING SMDS"
             risk_parts.append("SMDS mapping was not found")
         elif total_capacity_raw <= 0:

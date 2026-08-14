@@ -95,16 +95,16 @@ def load_production_requirements(
             si.qc_stock,
             si.scrap_stock,
             si.blocked_stock,
-            (si.fg_stock + si.qc_stock - si.scrap_stock - si.blocked_stock)::INTEGER
+            (GREATEST(si.fg_stock, 0) + GREATEST(si.qc_stock, 0))::INTEGER
                 AS opening_available_stock,
             0::INTEGER AS confirmed_production_qty,
             0::INTEGER AS completed_shipment_qty,
-            (si.fg_stock + si.qc_stock - si.scrap_stock - si.blocked_stock)::INTEGER
+            (GREATEST(si.fg_stock, 0) + GREATEST(si.qc_stock, 0))::INTEGER
                 AS available_stock_at_date,
             COALESCE(cd.demand_qty, 0)::INTEGER AS eligible_shipment_demand,
             GREATEST(
                 COALESCE(cd.demand_qty, 0)
-                - GREATEST(si.fg_stock + si.qc_stock - si.scrap_stock - si.blocked_stock, 0),
+                - (GREATEST(si.fg_stock, 0) + GREATEST(si.qc_stock, 0)),
                 0
             )::INTEGER AS shortage_qty,
             COALESCE(si.average_weight, 0) AS unit_weight_kg,
@@ -116,7 +116,7 @@ def load_production_requirements(
         ORDER BY
             GREATEST(
                 COALESCE(cd.demand_qty, 0)
-                - GREATEST(si.fg_stock + si.qc_stock - si.scrap_stock - si.blocked_stock, 0),
+                - (GREATEST(si.fg_stock, 0) + GREATEST(si.qc_stock, 0)),
                 0
             ) DESC,
             cd.earliest_due_date NULLS LAST,

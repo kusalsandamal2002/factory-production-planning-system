@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
+import json
 from typing import Any
 
 from PySide6.QtCore import Qt, QThread, Signal
@@ -18,43 +20,68 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from sqlalchemy import text
 
 from app.database import get_session
-from app.services.production_learning_service import (
-    ProductionLearningService,
-)
+from app.services.ai_planning_service import AIPlanningService
+from app.services.operational_source_service import OperationalSourceService
+from app.services.factory_intelligence_service import FactoryIntelligenceService
 
 
-# INTELLIGENT CONTINUOUS EXCEL SYNC + LEARNING FOUNDATION V7.0
-
-
-class _LearningWorker(QThread):
+class _AIWorker(QThread):
     completed = Signal(object)
     failed = Signal(str)
 
+    def __init__(self, action: str):
+        super().__init__()
+        self.action = action
+
     def run(self) -> None:
         try:
-            result = ProductionLearningService().rebuild_all()
+            service = AIPlanningService()
+            with get_session() as session:
+                service.ensure_schema(session)
+                result: dict[str, Any] = {}
+                result.update(service.reconcile_plan_vs_actual(session))
+                result.update(service.train_models(session))
+                factory = FactoryIntelligenceService()
+                factory.ensure_schema(session)
+                result.update(factory.train_capacity_models(session))
+                result.update(factory.train_planner_policy(session))
+                result.update(factory.refresh_state(session))
+                result.update(service.evaluate_ai_runs(session))
+                if self.action == "GENERATE":
+                    source = OperationalSourceService.latest(session)
+                    target_date = source.next_planning_date
+                    result.update(
+                        service.generate_candidate_plan(
+                            session,
+                            plan_date=target_date,
+                            source_import_run_id=source.import_run_id,
+                        )
+                    )
+                    result.update(service.evaluate_ai_runs(session))
+                result["readiness"] = service.get_readiness(session).__dict__
             self.completed.emit(result)
         except Exception as exc:
             self.failed.emit(str(exc))
 
 
 class WorkbookLearningCenterPage(QWidget):
-    """Explainable local learning dashboard.
+    """AI-assisted production planning control center.
 
-    Models remain advisory. Workbook plan signals are never treated as verified
-    actual production unless the source semantics explicitly say so.
+    Excel/Oven uploads remain the final production-plan authority. The AI runs in
+    shadow mode, learns from verified PROD actuals, shows candidate plans, and
+    exposes measurable readiness before any future supervised-auto promotion.
     """
 
     def __init__(self, current_user=None, *args, **kwargs):
         super().__init__()
         self.current_user = current_user
-        self.service = ProductionLearningService()
-        self.worker: _LearningWorker | None = None
-        self.metric_values: dict[str, QLabel] = {}
+        self.service = AIPlanningService()
+        self.worker: _AIWorker | None = None
+        self.metrics: dict[str, QLabel] = {}
         self._build_ui()
-        self.refresh()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -63,141 +90,172 @@ class WorkbookLearningCenterPage(QWidget):
 
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("AI / ML Learning Center")
-        title.setStyleSheet(
-            "font-size:27px;font-weight:950;color:#0f172a;"
-        )
+        title = QLabel("AI Production Planning Control Center")
+        title.setStyleSheet("font-size:26px;font-weight:950;color:#0f172a;")
         subtitle = QLabel(
-            "Local learning mode for recurring OVEN workbooks: demand signals, "
-            "production signals, confidence-scored advisory models, Excel-vs-app "
-            "reconciliation and feedback history. No model changes the live "
-            "production schedule automatically."
+            "Daily Excel/Oven plan = FINAL execution authority. MPPS AI learns from "
+            "PROD day/night actuals, compares plan vs actual, forecasts execution "
+            "reliability and prepares the next-day candidate plan in SHADOW mode."
         )
         subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("color:#52627a;font-size:12px;")
+        subtitle.setStyleSheet("color:#64748b;font-size:12px;")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         header.addLayout(title_box, 1)
 
-        self.status_badge = QLabel("ADVISORY LEARNING MODE")
-        self.status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_badge.setMinimumWidth(205)
-        self.status_badge.setStyleSheet(
-            "background:#e0f2fe;color:#075985;border:1px solid #7dd3fc;"
-            "border-radius:16px;padding:9px 14px;font-weight:900;"
+        self.mode_badge = QLabel("SHADOW MODE")
+        self.source_badge = QLabel("Live OVEN: -")
+        self.source_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.source_badge.setMinimumWidth(180)
+        self.source_badge.setStyleSheet(
+            "background:#ecfdf5;color:#166534;border:1px solid #bbf7d0;"
+            "border-radius:16px;padding:9px 14px;font-weight:950;"
         )
-        header.addWidget(self.status_badge)
+        self.mode_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.mode_badge.setMinimumWidth(180)
+        self.mode_badge.setStyleSheet(
+            "background:#e0f2fe;color:#075985;border:1px solid #7dd3fc;"
+            "border-radius:16px;padding:9px 14px;font-weight:950;"
+        )
+        header.addWidget(self.source_badge)
+        header.addWidget(self.mode_badge)
         root.addLayout(header)
 
-        metrics = QGridLayout()
-        metrics.setSpacing(10)
+        metric_grid = QGridLayout()
+        metric_grid.setSpacing(10)
         specs = [
-            ("observations", "Learning Observations"),
-            ("workbook_runs", "Workbook Runs"),
-            ("models", "Advisory Models"),
-            ("high_confidence", "High Confidence"),
-            ("feedback_rows", "Feedback Records"),
-            ("reconciliation_reviews", "Reconciliation Review"),
+            ("validation_days", "Validated Production Days"),
+            ("accuracy", "Model Validation Accuracy"),
+            ("coverage", "Plan / Actual Data Coverage"),
+            ("high", "High-Confidence SAP Models"),
+            ("models", "SAP Learning Models"),
+            ("candidate_items", "Latest AI Candidate Items"),
         ]
         for index, (key, caption) in enumerate(specs):
-            metrics.addWidget(
-                self._metric_card(key, caption),
-                index // 6,
-                index % 6,
-            )
-        root.addLayout(metrics)
+            metric_grid.addWidget(self._metric_card(key, caption), index // 3, index % 3)
+        root.addLayout(metric_grid)
 
-        notice = QLabel(
-            "Reliability rule: three monthly workbooks are enough for importer and "
-            "model-pipeline validation, but not for autonomous forecasting. Demand "
-            "forecast confidence becomes meaningful after roughly 12 comparable "
-            "months. Production-rate models need actual line/oven/shift output, "
-            "downtime, scrap and changeover data."
-        )
-        notice.setWordWrap(True)
-        notice.setStyleSheet(
+        self.readiness_notice = QLabel("")
+        self.readiness_notice.setWordWrap(True)
+        self.readiness_notice.setStyleSheet(
             "background:#fff7ed;color:#9a3412;border:1px solid #fed7aa;"
-            "border-radius:9px;padding:10px;font-weight:750;"
+            "border-radius:10px;padding:10px 12px;font-weight:800;"
         )
-        root.addWidget(notice)
+        root.addWidget(self.readiness_notice)
 
         actions = QHBoxLayout()
-        self.refresh_btn = QPushButton("Refresh Learning Dashboard")
+        self.refresh_btn = QPushButton("Refresh AI Dashboard")
         self.refresh_btn.setMinimumHeight(40)
         self.refresh_btn.clicked.connect(self.refresh)
         actions.addWidget(self.refresh_btn)
 
-        self.rebuild_btn = QPushButton("Rebuild Advisory Models")
-        self.rebuild_btn.setMinimumHeight(40)
-        self.rebuild_btn.setStyleSheet(
-            "background:#1d4ed8;color:white;font-weight:900;padding:0 18px;"
+        self.train_btn = QPushButton("Reconcile + Train Models")
+        self.train_btn.setMinimumHeight(40)
+        self.train_btn.clicked.connect(lambda: self._start_worker("TRAIN"))
+        actions.addWidget(self.train_btn)
+
+        self.generate_btn = QPushButton("Generate Next-Day AI Candidate")
+        self.generate_btn.setMinimumHeight(40)
+        self.generate_btn.setStyleSheet(
+            "background:#2563eb;color:white;border:none;border-radius:8px;"
+            "font-weight:950;padding:0 18px;"
         )
-        self.rebuild_btn.clicked.connect(self.rebuild_models)
-        actions.addWidget(self.rebuild_btn)
+        self.generate_btn.clicked.connect(lambda: self._start_worker("GENERATE"))
+        actions.addWidget(self.generate_btn)
         actions.addStretch()
         root.addLayout(actions)
 
         tabs = QTabWidget()
-        self.models_table = self._table(
+        self.candidate_table = self._table(
             [
-                "Model Type",
-                "Entity",
-                "Samples",
-                "Prediction",
-                "Lower",
-                "Upper",
+                "Priority",
+                "SAP",
+                "Description",
+                "Shipment Demand",
+                "Planning Stock",
+                "Net Requirement",
+                "Learned Completion",
+                "AI Day",
+                "AI Night",
+                "AI Total",
+                "Expected Actual",
+                "Blended Capacity",
+                "Learned Safe Capacity",
+                "Planner Policy",
                 "Confidence",
                 "Band",
-                "Advisory",
-                "Last Trained",
-                "Explanation",
-            ]
-        )
-        self.reconciliation_table = self._table(
-            [
-                "Import Run",
-                "Plan Date",
-                "SAP",
-                "Excel Demand",
-                "App Demand",
-                "Demand Var",
-                "Excel Required",
-                "App Required",
-                "Required Var",
-                "Excel Plan",
-                "App Capacity",
-                "Plan Var",
                 "Status",
                 "Explanation",
             ]
         )
-        tabs.addTab(self.models_table, "Advisory Models")
-        tabs.addTab(
-            self.reconciliation_table,
-            "Excel vs App Reconciliation",
+        self.actual_table = self._table(
+            [
+                "Date",
+                "SAP",
+                "Description",
+                "Plan Day",
+                "Plan Night",
+                "Plan Total",
+                "Actual Day",
+                "Actual Night",
+                "Actual Total",
+                "Variance",
+                "Achievement %",
+                "Status",
+            ]
         )
+        self.evaluation_table = self._table(
+            [
+                "Plan Date",
+                "AI Run",
+                "SAP",
+                "AI Plan",
+                "AI Expected Actual",
+                "Final Excel Plan",
+                "Actual",
+                "AI vs Final Error %",
+                "AI Expected vs Actual Error %",
+                "Status",
+            ]
+        )
+        self.model_table = self._table(
+            [
+                "SAP",
+                "Samples",
+                "Champion Model",
+                "Completion Ratio",
+                "Conservative",
+                "Day Share",
+                "WAPE %",
+                "Recent WAPE %",
+                "Validation Accuracy %",
+                "Drift",
+                "Confidence",
+                "Band",
+                "Last Trained",
+            ]
+        )
+        tabs.addTab(self.candidate_table, "Next-Day AI Candidate")
+        tabs.addTab(self.actual_table, "Final Plan vs Actual")
+        tabs.addTab(self.evaluation_table, "AI vs Final / Actual")
+        tabs.addTab(self.model_table, "Model Health")
         root.addWidget(tabs, 1)
 
     def _metric_card(self, key: str, caption: str) -> QFrame:
         card = QFrame()
         card.setStyleSheet(
-            "QFrame{background:white;border:1px solid #dbe4ef;"
-            "border-radius:10px;}"
+            "QFrame{background:white;border:1px solid #dbe4ef;border-radius:10px;}"
         )
         layout = QVBoxLayout(card)
         layout.setContentsMargins(12, 9, 12, 9)
         value = QLabel("0")
-        value.setStyleSheet(
-            "font-size:21px;font-weight:950;color:#0f172a;"
-        )
+        value.setStyleSheet("font-size:20px;font-weight:950;color:#0f172a;")
         label = QLabel(caption)
         label.setWordWrap(True)
-        label.setStyleSheet(
-            "font-size:10px;font-weight:800;color:#64748b;"
-        )
+        label.setStyleSheet("font-size:10px;font-weight:800;color:#64748b;")
         layout.addWidget(value)
         layout.addWidget(label)
-        self.metric_values[key] = value
+        self.metrics[key] = value
         return card
 
     @staticmethod
@@ -205,152 +263,211 @@ class WorkbookLearningCenterPage(QWidget):
         table = QTableWidget(0, len(headers))
         table.setHorizontalHeaderLabels(headers)
         table.setAlternatingRowColors(True)
-        table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
-        )
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         table.horizontalHeader().setStretchLastSection(True)
-        table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents
-        )
         table.setStyleSheet(
-            "QTableWidget{border:1px solid #dbe4ef;background:white;"
-            "gridline-color:#e2e8f0;}"
-            "QHeaderView::section{background:#f8fafc;color:#334155;"
-            "font-weight:900;border:0;border-bottom:1px solid #cbd5e1;"
-            "padding:7px;}"
+            "QTableWidget{border:1px solid #dbe4ef;background:white;gridline-color:#e2e8f0;}"
+            "QHeaderView::section{background:#f8fafc;color:#334155;font-weight:900;"
+            "border:0;border-bottom:1px solid #cbd5e1;padding:7px;}"
         )
         return table
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.refresh()
 
     def refresh(self) -> None:
         try:
             with get_session() as session:
-                dashboard = self.service.get_dashboard(session)
+                dashboard = self.service.dashboard(session)
         except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "Learning Dashboard Error",
-                str(exc),
-            )
+            QMessageBox.critical(self, "AI Planning Dashboard", str(exc))
             return
 
-        metrics = dashboard.get("metrics", {})
-        for key, label in self.metric_values.items():
-            label.setText(
-                f"{int(metrics.get(key, 0) or 0):,}"
+        readiness = dashboard.get("readiness", {})
+        try:
+            with get_session() as session:
+                source = OperationalSourceService.latest(session)
+            if source.plan_date:
+                self.source_badge.setText(f"Live OVEN: {source.plan_date.isoformat()}")
+                self.source_badge.setToolTip(source.workbook_name or source.label)
+            else:
+                self.source_badge.setText("Live OVEN: not imported")
+        except Exception:
+            self.source_badge.setText("Live OVEN: unknown")
+        mode = str(readiness.get("mode") or "SHADOW")
+        eligible = bool(readiness.get("eligible_for_supervised_auto"))
+        self.mode_badge.setText(
+            f"{mode} / {'AUTO-ELIGIBLE' if eligible else 'LEARNING'}"
+        )
+        self.metrics["validation_days"].setText(f"{int(readiness.get('validation_days', 0) or 0):,}")
+        self.metrics["accuracy"].setText(f"{float(readiness.get('accuracy_pct', 0) or 0):.1f}%")
+        self.metrics["coverage"].setText(f"{float(readiness.get('coverage_pct', 0) or 0):.1f}%")
+        self.metrics["high"].setText(f"{int(readiness.get('high_confidence_items', 0) or 0):,}")
+        self.metrics["models"].setText(f"{int(readiness.get('total_models', 0) or 0):,}")
+        latest_run = dashboard.get("latest_run") or {}
+        self.metrics["candidate_items"].setText(f"{int(latest_run.get('item_count', 0) or 0):,}")
+        self.readiness_notice.setText(
+            str(readiness.get("explanation") or "")
+            + f" Accuracy basis: {readiness.get('accuracy_basis', 'MODEL_BACKTEST_ONLY')}."
+        )
+
+        self._fill(
+            self.candidate_table,
+            [
+                [
+                    _num(r.get("priority_score"), 1),
+                    r.get("sap_code"),
+                    r.get("item_description"),
+                    r.get("shipment_demand_qty"),
+                    r.get("current_stock_qty"),
+                    r.get("net_requirement_qty"),
+                    _pct_ratio(r.get("learned_completion_ratio")),
+                    r.get("recommended_day_qty"),
+                    r.get("recommended_night_qty"),
+                    r.get("recommended_total_qty"),
+                    r.get("expected_actual_qty"),
+                    r.get("daily_capacity_qty"),
+                    r.get("learned_capacity_qty"),
+                    _num(r.get("planner_policy_ratio"), 3),
+                    _pct_ratio(r.get("confidence_score")),
+                    r.get("confidence_band"),
+                    r.get("status"),
+                    r.get("explanation"),
+                ]
+                for r in dashboard.get("plan_items", [])
+            ],
+        )
+        self._fill(
+            self.actual_table,
+            [
+                [
+                    r.get("production_date"),
+                    r.get("sap_code"),
+                    r.get("item_description"),
+                    r.get("plan_day_qty"),
+                    r.get("plan_night_qty"),
+                    r.get("plan_total_qty"),
+                    r.get("actual_day_qty"),
+                    r.get("actual_night_qty"),
+                    r.get("actual_total_qty"),
+                    r.get("variance_qty"),
+                    _num(r.get("achievement_pct"), 1),
+                    r.get("status"),
+                ]
+                for r in dashboard.get("reconciliation", [])
+            ],
+        )
+        self._fill(
+            self.evaluation_table,
+            [
+                [
+                    r.get("plan_date"),
+                    r.get("ai_run_id"),
+                    r.get("sap_code"),
+                    r.get("ai_recommended_total_qty"),
+                    r.get("ai_expected_actual_qty"),
+                    r.get("final_excel_total_qty"),
+                    r.get("actual_total_qty"),
+                    _num(r.get("ai_vs_final_error_pct"), 1) if r.get("ai_vs_final_error_pct") is not None else "",
+                    _num(r.get("ai_expected_vs_actual_error_pct"), 1) if r.get("ai_expected_vs_actual_error_pct") is not None else "",
+                    r.get("evaluation_status"),
+                ]
+                for r in dashboard.get("evaluations", [])
+            ],
+        )
+        model_rows = []
+        for r in dashboard.get("models", []):
+            payload = r.get("model_json") or {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+            model_rows.append(
+                [
+                    r.get("sap_code"),
+                    r.get("sample_days"),
+                    payload.get("champion_model", "LEGACY/FALLBACK"),
+                    _num(r.get("ewma_completion_ratio"), 3),
+                    _num(payload.get("conservative_completion_ratio"), 3),
+                    _pct_ratio(r.get("day_share")),
+                    _num(r.get("mape_pct"), 1),
+                    _num(payload.get("recent_wape_pct"), 1),
+                    _num(r.get("validation_accuracy_pct"), 1),
+                    _pct_ratio(payload.get("drift_score")),
+                    _pct_ratio(r.get("confidence_score")),
+                    r.get("confidence_band"),
+                    r.get("last_trained_at"),
+                ]
             )
+        self._fill(self.model_table, model_rows)
 
-        self._fill_table(
-            self.models_table,
-            [
-                [
-                    row.get("model_type"),
-                    row.get("entity_key"),
-                    row.get("sample_count"),
-                    _display_number(row.get("prediction")),
-                    _display_number(row.get("lower_bound")),
-                    _display_number(row.get("upper_bound")),
-                    _display_percent(row.get("confidence_score")),
-                    row.get("confidence_band"),
-                    "YES" if row.get("is_advisory_only") else "NO",
-                    row.get("last_trained_at"),
-                    row.get("explanation"),
-                ]
-                for row in dashboard.get("models", [])
-            ],
-        )
-        self._fill_table(
-            self.reconciliation_table,
-            [
-                [
-                    row.get("import_run_id"),
-                    row.get("plan_date"),
-                    row.get("sap_code"),
-                    row.get("excel_shipment_demand"),
-                    row.get("app_live_demand"),
-                    row.get("demand_variance"),
-                    row.get("excel_production_required"),
-                    row.get("app_production_required"),
-                    row.get("production_variance"),
-                    row.get("excel_planned_qty"),
-                    row.get("app_daily_capacity"),
-                    row.get("plan_variance"),
-                    row.get("reconciliation_status"),
-                    row.get("explanation"),
-                ]
-                for row in dashboard.get("reconciliation", [])
-            ],
-        )
-
-    def rebuild_models(self) -> None:
+    def _start_worker(self, action: str) -> None:
         if self.worker and self.worker.isRunning():
             return
-        self.rebuild_btn.setEnabled(False)
-        self.status_badge.setText("REBUILDING MODELS")
-        self.worker = _LearningWorker()
-        self.worker.completed.connect(self._rebuild_complete)
-        self.worker.failed.connect(self._rebuild_failed)
+        self.train_btn.setEnabled(False)
+        self.generate_btn.setEnabled(False)
+        self.mode_badge.setText("AI MODEL RUNNING")
+        self.worker = _AIWorker(action)
+        self.worker.setParent(self)
+        self.worker.completed.connect(self._worker_complete)
+        self.worker.failed.connect(self._worker_failed)
+        self.worker.finished.connect(self._worker_finished)
+        self.worker.finished.connect(self.worker.deleteLater)
         self.worker.start()
 
-    def _rebuild_complete(self, result: dict[str, Any]) -> None:
-        self.rebuild_btn.setEnabled(True)
-        self.status_badge.setText("ADVISORY LEARNING MODE")
-        self.refresh()
-        QMessageBox.information(
-            self,
-            "Learning Models Rebuilt",
-            (
-                f"Advisory models rebuilt: "
-                f"{int(result.get('models_total', 0) or 0):,}. "
-                "No live production schedule was changed."
-            ),
-        )
+    def _worker_finished(self) -> None:
+        self.worker = None
+        self.train_btn.setEnabled(True)
+        self.generate_btn.setEnabled(True)
 
-    def _rebuild_failed(self, reason: str) -> None:
-        self.rebuild_btn.setEnabled(True)
-        self.status_badge.setText("MODEL REBUILD FAILED")
-        QMessageBox.critical(
-            self,
-            "Learning Model Error",
-            reason,
+    def _worker_complete(self, result: dict[str, Any]) -> None:
+        self.train_btn.setEnabled(True)
+        self.generate_btn.setEnabled(True)
+        self.refresh()
+        message = (
+            f"Models trained: {int(result.get('ai_models_trained', 0) or 0):,}. "
+            f"Reconciled rows: {int(result.get('plan_actual_reconciled_rows', 0) or 0):,}."
         )
+        if result.get("ai_plan_run_id"):
+            message += (
+                f" AI candidate #{result['ai_plan_run_id']} generated for "
+                f"{result.get('ai_plan_date')} with {int(result.get('ai_plan_items', 0) or 0):,} items."
+            )
+        message += " Excel plan remains the final execution plan."
+        QMessageBox.information(self, "AI Planning Cycle Complete", message)
+
+    def _worker_failed(self, reason: str) -> None:
+        self.train_btn.setEnabled(True)
+        self.generate_btn.setEnabled(True)
+        self.mode_badge.setText("AI RUN FAILED")
+        QMessageBox.critical(self, "AI Planning Error", reason)
 
     @staticmethod
-    def _fill_table(
-        table: QTableWidget,
-        rows: list[list[Any]],
-    ) -> None:
+    def _fill(table: QTableWidget, rows: list[list[Any]]) -> None:
         table.setSortingEnabled(False)
         table.setRowCount(0)
         for values in rows:
             row = table.rowCount()
             table.insertRow(row)
-            for column, value in enumerate(values):
-                table.setItem(
-                    row,
-                    column,
-                    QTableWidgetItem(
-                        "" if value is None else str(value)
-                    ),
-                )
+            for col, value in enumerate(values):
+                table.setItem(row, col, QTableWidgetItem("" if value is None else str(value)))
         table.setSortingEnabled(True)
 
 
-def _display_number(value: Any) -> str:
+def _num(value: Any, digits: int = 0) -> str:
     try:
-        number = float(value or 0)
-        if number.is_integer():
-            return f"{int(number):,}"
-        return f"{number:,.2f}"
+        return f"{float(value or 0):,.{digits}f}"
     except Exception:
         return str(value or "")
 
 
-def _display_percent(value: Any) -> str:
+def _pct_ratio(value: Any) -> str:
     try:
-        return f"{float(value or 0) * 100:.1f}%"
+        return f"{float(value or 0) * 100.0:.1f}%"
     except Exception:
         return ""

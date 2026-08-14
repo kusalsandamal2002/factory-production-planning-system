@@ -1224,11 +1224,7 @@ class ExistingShipmentAddItemsDialog(QDialog):
                                 ''
                             ) AS tyre_description
                         FROM smds
-                        WHERE COALESCE(
-                            planning_manager_approval_status,
-                            'Pending'
-                        ) = 'Approved'
-                          AND sap_code IS NOT NULL
+                        WHERE sap_code IS NOT NULL
                           AND TRIM(sap_code) <> ''
                         ORDER BY sap_code ASC
                         """

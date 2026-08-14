@@ -182,7 +182,7 @@ class DailyStockEditDialog(QDialog):
         title = QLabel("Daily Production / Stock Entry")
         title.setObjectName("Title")
 
-        hint = QLabel("Edit the selected daily stock line. Available daily qty is calculated from FG + QC - Scrap - Blocked.")
+        hint = QLabel("Edit the selected daily stock line. Usable daily qty is FG + QC. Scrap and Blocked remain separate non-usable buckets.")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
 
@@ -466,7 +466,7 @@ class DailyStockPage(QWidget):
         title = QLabel("Daily Production List")
         title.setObjectName("PageTitle")
 
-        hint = QLabel("Double-click a row to edit. Available = FG + QC - Scrap - Blocked.")
+        hint = QLabel("Double-click a row to edit. Usable = FG + QC. Scrap and Blocked are tracked separately.")
         hint.setObjectName("PageHint")
         hint.setWordWrap(True)
 
@@ -609,7 +609,7 @@ class DailyStockPage(QWidget):
                 qc_qty,
                 scrap_qty,
                 blocked_qty,
-                (fg_qty + qc_qty - scrap_qty - blocked_qty) AS available_qty
+                (GREATEST(fg_qty, 0) + GREATEST(qc_qty, 0)) AS available_qty
             FROM mpps_daily_stock_entries
             {where}
             ORDER BY available_qty DESC, sap_code ASC;
@@ -826,7 +826,7 @@ class DailyStockPage(QWidget):
                         qc_qty,
                         scrap_qty,
                         blocked_qty,
-                        (fg_qty + qc_qty - scrap_qty - blocked_qty) AS available_qty,
+                        (GREATEST(fg_qty, 0) + GREATEST(qc_qty, 0)) AS available_qty,
                         note
                     FROM mpps_daily_stock_entries
                     WHERE stock_date = :stock_date

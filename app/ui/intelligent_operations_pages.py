@@ -4,23 +4,39 @@ from datetime import date
 from typing import Any
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QPageLayout, QPageSize, QTextDocument
+from PySide6.QtPrintSupport import QPrintDialog, QPrintPreviewDialog, QPrinter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QDialog,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 from sqlalchemy import text
+
+from app.services.shift_daily_report_service import (
+    LOSS_COLUMNS,
+    LOSS_REASONS,
+    TYRE_LINE_ORDER,
+    ShiftDailyReportService,
+    build_shift_report_html,
+)
+from app.services.ai_planning_service import AIPlanningService
 
 
 
@@ -244,8 +260,8 @@ class DeliveryDateControlPage(_OperationsPage):
 class DailyProductionPlanPage(_OperationsPage):
     title_text = "Daily Production Plan"
     subtitle_text = (
-        "Saved cavity-level production plan combined with imported Excel oven plans. "
-        "The latest saved planner run remains the live execution source."
+        "Compare live cavity planning, the imported Excel/Oven FINAL plan and the "
+        "AI next-day candidate. AI stays advisory while its plan-vs-actual accuracy learns."
     )
 
     def __init__(self, current_user=None, *args, **kwargs):
@@ -289,12 +305,33 @@ class DailyProductionPlanPage(_OperationsPage):
                 "Source",
             ]
         )
+        self.ai_table = self._table(
+            [
+                "Date",
+                "Priority",
+                "SAP",
+                "Description",
+                "Shipment Demand",
+                "Planning Stock",
+                "Net Requirement",
+                "AI Day",
+                "AI Night",
+                "AI Total",
+                "Expected Actual",
+                "Confidence",
+                "Status",
+                "Reason",
+            ]
+        )
         self.tabs.addTab(self.cavity_table, "Live Cavity Plan")
-        self.tabs.addTab(self.imported_table, "Imported Oven Plan")
+        self.tabs.addTab(self.imported_table, "Imported Oven Plan - FINAL")
+        self.tabs.addTab(self.ai_table, "AI Candidate - SHADOW")
         self.root.addWidget(self.tabs, 1)
 
     def refresh(self) -> None:
         try:
+            with _get_session() as session:
+                AIPlanningService().ensure_schema(session)
             dates = self._query(
                 """
                 SELECT DISTINCT plan_date
@@ -302,6 +339,8 @@ class DailyProductionPlanPage(_OperationsPage):
                     SELECT plan_date FROM mpps_cavity_plan_rows
                     UNION
                     SELECT plan_date FROM mpps_oven_plan
+                    UNION
+                    SELECT plan_date FROM mpps_ai_plan_runs
                 ) dates
                 WHERE plan_date IS NOT NULL
                 ORDER BY plan_date DESC
@@ -326,6 +365,7 @@ class DailyProductionPlanPage(_OperationsPage):
         if not selected:
             self.cavity_table.setRowCount(0)
             self.imported_table.setRowCount(0)
+            self.ai_table.setRowCount(0)
             return
         try:
             cavity_rows = self._query(
@@ -406,19 +446,608 @@ class DailyProductionPlanPage(_OperationsPage):
                     for r in imported
                 ],
             )
+            ai_rows = self._query(
+                """
+                SELECT i.*
+                FROM mpps_ai_plan_items i
+                JOIN (
+                    SELECT MAX(id) AS run_id
+                    FROM mpps_ai_plan_runs
+                    WHERE plan_date = CAST(:plan_date AS DATE)
+                ) latest ON latest.run_id = i.run_id
+                ORDER BY i.priority_score DESC, i.sap_code
+                """,
+                {"plan_date": selected},
+            )
+            self._fill(
+                self.ai_table,
+                [
+                    [
+                        r["plan_date"],
+                        round(float(r["priority_score"] or 0), 1),
+                        r["sap_code"],
+                        r["item_description"],
+                        r["shipment_demand_qty"],
+                        r["current_stock_qty"],
+                        r["net_requirement_qty"],
+                        r["recommended_day_qty"],
+                        r["recommended_night_qty"],
+                        r["recommended_total_qty"],
+                        r["expected_actual_qty"],
+                        f"{float(r['confidence_score'] or 0) * 100:.1f}%",
+                        r["status"],
+                        r["explanation"],
+                    ]
+                    for r in ai_rows
+                ],
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Daily Plan Data", str(exc))
+
+
+class _ShiftReportEditor(QWidget):
+    def __init__(self, shift_name: str, current_user=None, parent=None):
+        super().__init__(parent)
+        self.shift_name = shift_name.upper()
+        self.current_user = current_user
+        self.report_date = ""
+        self.target_summary: dict[str, Any] = {"lines": {}, "unmapped": []}
+        self._loading = False
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+
+        toolbar = QHBoxLayout()
+        title = QLabel(f"{self.shift_name} — Daily Production Summary Report")
+        title.setStyleSheet("font-size:16px;font-weight:950;color:#0f172a;")
+        toolbar.addWidget(title)
+        toolbar.addStretch()
+
+        self.save_button = QPushButton("Save Report")
+        self.save_button.setMinimumHeight(34)
+        self.save_button.setStyleSheet(
+            "QPushButton{background:#2563eb;color:white;border:0;border-radius:7px;padding:7px 13px;font-weight:900;}"
+            "QPushButton:hover{background:#1d4ed8;}"
+        )
+        self.save_button.clicked.connect(self.save_report)
+        toolbar.addWidget(self.save_button)
+
+        preview_button = QPushButton("Print / Preview")
+        preview_button.setMinimumHeight(34)
+        preview_button.setStyleSheet("font-weight:900;padding:7px 13px;")
+        preview_button.clicked.connect(self.print_preview)
+        toolbar.addWidget(preview_button)
+
+        pdf_button = QPushButton("Save PDF")
+        pdf_button.setMinimumHeight(34)
+        pdf_button.setStyleSheet("font-weight:900;padding:7px 13px;")
+        pdf_button.clicked.connect(self.save_pdf)
+        toolbar.addWidget(pdf_button)
+        outer.addLayout(toolbar)
+
+        self.reconciliation_label = QLabel("")
+        self.reconciliation_label.setWordWrap(True)
+        self.reconciliation_label.setStyleSheet(
+            "QLabel{background:#eff6ff;border:1px solid #bfdbfe;border-radius:7px;padding:7px;color:#1e3a8a;font-weight:800;}"
+        )
+        outer.addWidget(self.reconciliation_label)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea{background:#f8fafc;border:0;}")
+        body = QWidget()
+        body.setStyleSheet("QWidget{background:#ffffff;}")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(12, 12, 12, 12)
+        body_layout.setSpacing(10)
+
+        header = QFrame()
+        header.setStyleSheet("QFrame{border:1px solid #0f172a;background:white;}")
+        header_layout = QGridLayout(header)
+        company = QLabel("LAUGFS Corporation (Rubber) Ltd.")
+        company.setStyleSheet("font-size:14px;font-weight:950;border:0;")
+        report_title = QLabel("Daily Production Summary Report")
+        report_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        report_title.setStyleSheet("font-size:15px;font-weight:950;border:0;")
+        self.date_label = QLabel("Date: -")
+        self.date_label.setStyleSheet("font-weight:900;border:0;")
+        shift_label = QLabel(f"Shift: {self.shift_name}")
+        shift_label.setStyleSheet("font-weight:900;border:0;")
+        header_layout.addWidget(company, 0, 0)
+        header_layout.addWidget(report_title, 0, 1, 1, 2)
+        header_layout.addWidget(self.date_label, 1, 0)
+        header_layout.addWidget(shift_label, 1, 2)
+        body_layout.addWidget(header)
+
+        top = QGridLayout()
+        top.setHorizontalSpacing(10)
+        top.setVerticalSpacing(10)
+
+        left = QVBoxLayout()
+        left.setSpacing(8)
+        left.addWidget(self._section_label("Production performance"))
+        details_label = QLabel("Details For SAP")
+        details_label.setStyleSheet("font-weight:900;")
+        left.addWidget(details_label)
+        self.production_notes = QTextEdit()
+        self.production_notes.setPlaceholderText("Production performance / SAP details...")
+        self.production_notes.setMaximumHeight(78)
+        self.production_notes.setStyleSheet("QTextEdit{border:1px solid #94a3b8;padding:5px;}")
+        left.addWidget(self.production_notes)
+
+        left.addWidget(self._section_label("2nd Stage Compound Production"))
+        self.compound_table = self._editable_table(
+            ["Compound Type", "Target", "Actual", "Achievement (%)"], 7
+        )
+        self.compound_table.setMinimumHeight(214)
+        left.addWidget(self.compound_table)
+
+        left.addWidget(self._section_label("Quality Performance — Scrap Tyres"))
+        self.scrap_tyre_table = self._editable_table(
+            ["Tyre Size", "PCS", "Defect", "Responsible Operator"], 3
+        )
+        self.scrap_tyre_table.setMinimumHeight(126)
+        left.addWidget(self.scrap_tyre_table)
+
+        left.addWidget(self._section_label("Scrap Compound"))
+        self.scrap_compound_table = self._editable_table(
+            ["Compound Type", "Weights", "Defect", "Responsible Operator"], 3
+        )
+        self.scrap_compound_table.setMinimumHeight(126)
+        left.addWidget(self.scrap_compound_table)
+
+        metrics = QGridLayout()
+        metrics.addWidget(QLabel("Used man hours"), 0, 0)
+        self.used_man_hours = QLineEdit()
+        self.used_man_hours.setPlaceholderText("0.00")
+        self.used_man_hours.textChanged.connect(self._refresh_calculated_fields)
+        metrics.addWidget(self.used_man_hours, 0, 1)
+        metrics.addWidget(QLabel("Production (Kg)"), 1, 0)
+        self.production_kg_label = QLabel("0.00")
+        self.production_kg_label.setStyleSheet("font-weight:900;")
+        metrics.addWidget(self.production_kg_label, 1, 1)
+        metrics.addWidget(QLabel("Man hours (Kg)"), 2, 0)
+        self.kg_per_hour_label = QLabel("0.00")
+        self.kg_per_hour_label.setStyleSheet("font-weight:900;")
+        metrics.addWidget(self.kg_per_hour_label, 2, 1)
+        left.addLayout(metrics)
+
+        right = QVBoxLayout()
+        right.setSpacing(8)
+        right.addWidget(self._section_label("Supervisor Name"))
+        self.supervisor_name = QLineEdit()
+        self.supervisor_name.setPlaceholderText("Supervisor name")
+        right.addWidget(self.supervisor_name)
+        right.addWidget(self._section_label("Tyre production"))
+        self.tyre_table = self._editable_table(
+            ["Line No", "Target (Kg)", "Actual (Kg)", "Target (pcs)", "Actual (Pcs)"],
+            len(TYRE_LINE_ORDER) + 1,
+        )
+        self.tyre_table.setMinimumHeight(246)
+        self.tyre_table.itemChanged.connect(self._on_tyre_item_changed)
+        right.addWidget(self.tyre_table)
+        right.addStretch()
+        signature = QLabel("Supervisor:- ............................................................")
+        signature.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        signature.setStyleSheet("font-weight:900;padding:18px 4px;")
+        right.addWidget(signature)
+
+        left_frame = QFrame()
+        left_frame.setStyleSheet("QFrame{border:1px solid #cbd5e1;border-radius:6px;background:white;}")
+        left_frame.setLayout(left)
+        right_frame = QFrame()
+        right_frame.setStyleSheet("QFrame{border:1px solid #cbd5e1;border-radius:6px;background:white;}")
+        right_frame.setLayout(right)
+        top.addWidget(left_frame, 0, 0)
+        top.addWidget(right_frame, 0, 1)
+        top.setColumnStretch(0, 1)
+        top.setColumnStretch(1, 1)
+        body_layout.addLayout(top)
+
+        body_layout.addWidget(self._section_label("Loss Reasons"))
+        self.loss_table = self._editable_table(
+            [
+                "Loss Reasons",
+                "200 KG", "200 PCS",
+                "600/400/Super KG", "600/400/Super PCS",
+                "400 KG", "400 PCS",
+                "800 KG", "800 PCS",
+            ],
+            len(LOSS_REASONS),
+        )
+        self.loss_table.setMinimumHeight(650)
+        body_layout.addWidget(self.loss_table)
+
+        footer = QLabel(
+            "Doc #: LR-ST-PP-014     |     Issue #: 09     |     "
+            "Issue Date: 02.09.2025     |     Print format: A4 Portrait / 2 pages"
+        )
+        footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        footer.setStyleSheet("color:#475569;font-size:10px;font-weight:800;padding:6px;")
+        body_layout.addWidget(footer)
+
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+
+    @staticmethod
+    def _section_label(text_value: str) -> QLabel:
+        label = QLabel(text_value)
+        label.setStyleSheet(
+            "QLabel{background:#e2e8f0;border:1px solid #94a3b8;padding:5px;font-weight:950;color:#0f172a;}"
+        )
+        return label
+
+    @staticmethod
+    def _editable_table(headers: list[str], rows: int) -> QTableWidget:
+        table = QTableWidget(rows, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setStyleSheet(
+            "QTableWidget{border:1px solid #94a3b8;background:white;gridline-color:#cbd5e1;}"
+            "QHeaderView::section{background:#f1f5f9;color:#0f172a;font-weight:900;border:0;border-bottom:1px solid #94a3b8;padding:5px;}"
+        )
+        return table
+
+    @staticmethod
+    def _set_item(table: QTableWidget, row: int, column: int, value: Any, editable: bool = True) -> None:
+        item = table.item(row, column)
+        if item is None:
+            item = QTableWidgetItem()
+            table.setItem(row, column, item)
+        item.setText("" if value is None else str(value))
+        flags = item.flags()
+        if editable:
+            flags |= Qt.ItemFlag.ItemIsEditable
+        else:
+            flags &= ~Qt.ItemFlag.ItemIsEditable
+        item.setFlags(flags)
+        if column > 0:
+            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+    @staticmethod
+    def _num(value: Any) -> float:
+        try:
+            return float(str(value or "").replace(",", "").strip())
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _table_text(table: QTableWidget, row: int, column: int) -> str:
+        item = table.item(row, column)
+        return item.text().strip() if item else ""
+
+    def load(self, report_date: str) -> None:
+        self.report_date = report_date
+        self.date_label.setText(f"Date: {report_date or '-'}")
+        if not report_date:
+            return
+        self._loading = True
+        try:
+            self.target_summary = ShiftDailyReportService.load_targets(report_date, self.shift_name)
+            payload = ShiftDailyReportService.load_report(report_date, self.shift_name)
+            self._load_payload(payload)
+            self._load_targets()
+            self._load_loss_reason_labels()
+            self._update_reconciliation()
+            self._refresh_calculated_fields()
+        finally:
+            self._loading = False
+
+    def _load_targets(self) -> None:
+        lines = self.target_summary.get("lines", {})
+        actuals = self._current_payload_actuals_from_table()
+        for row, line in enumerate(TYRE_LINE_ORDER):
+            target = lines.get(line, {})
+            self._set_item(self.tyre_table, row, 0, line, False)
+            self._set_item(self.tyre_table, row, 1, f"{self._num(target.get('target_kg')):.2f}", False)
+            self._set_item(self.tyre_table, row, 2, actuals.get(line, {}).get("kg", ""), True)
+            self._set_item(self.tyre_table, row, 3, str(int(round(self._num(target.get('target_pcs'))))), False)
+            self._set_item(self.tyre_table, row, 4, actuals.get(line, {}).get("pcs", ""), True)
+        self._set_item(self.tyre_table, len(TYRE_LINE_ORDER), 0, "Total", False)
+        for column in range(1, 5):
+            self._set_item(self.tyre_table, len(TYRE_LINE_ORDER), column, "", False)
+        self._refresh_tyre_totals()
+
+    def _current_payload_actuals_from_table(self) -> dict[str, dict[str, str]]:
+        result = {line: {"kg": "", "pcs": ""} for line in TYRE_LINE_ORDER}
+        for row, line in enumerate(TYRE_LINE_ORDER):
+            result[line] = {
+                "kg": self._table_text(self.tyre_table, row, 2),
+                "pcs": self._table_text(self.tyre_table, row, 4),
+            }
+        return result
+
+    def _load_payload(self, payload: dict[str, Any]) -> None:
+        self.supervisor_name.setText(str(payload.get("supervisor_name") or ""))
+        self.production_notes.setPlainText(str(payload.get("production_notes") or ""))
+        self.used_man_hours.setText(str(payload.get("used_man_hours") or ""))
+
+        actuals = payload.get("tyre_actuals") or {}
+        for row, line in enumerate(TYRE_LINE_ORDER):
+            values = actuals.get(line) or {}
+            self._set_item(self.tyre_table, row, 2, values.get("kg", ""), True)
+            self._set_item(self.tyre_table, row, 4, values.get("pcs", ""), True)
+
+        compound_rows = payload.get("compound_rows") or []
+        for row in range(6):
+            values = compound_rows[row] if row < len(compound_rows) else {}
+            self._set_item(self.compound_table, row, 0, values.get("compound_type", ""), True)
+            self._set_item(self.compound_table, row, 1, values.get("target", ""), True)
+            self._set_item(self.compound_table, row, 2, values.get("actual", ""), True)
+            self._set_item(self.compound_table, row, 3, "", False)
+        self._set_item(self.compound_table, 6, 0, "Total", False)
+        for column in range(1, 4):
+            self._set_item(self.compound_table, 6, column, "", False)
+
+        scrap_rows = payload.get("scrap_tyre_rows") or []
+        scrap_keys = ("tyre_size", "pcs", "defect", "operator")
+        for row in range(3):
+            values = scrap_rows[row] if row < len(scrap_rows) else {}
+            for column, key in enumerate(scrap_keys):
+                self._set_item(self.scrap_tyre_table, row, column, values.get(key, ""), True)
+
+        compound_scrap = payload.get("scrap_compound_rows") or []
+        compound_scrap_keys = ("compound_type", "weight", "defect", "operator")
+        for row in range(3):
+            values = compound_scrap[row] if row < len(compound_scrap) else {}
+            for column, key in enumerate(compound_scrap_keys):
+                self._set_item(self.scrap_compound_table, row, column, values.get(key, ""), True)
+
+        loss = payload.get("loss_reasons") or {}
+        for row, reason in enumerate(LOSS_REASONS):
+            values = loss.get(reason) or {}
+            self._set_item(self.loss_table, row, 0, reason, False)
+            for column, key in enumerate(LOSS_COLUMNS, start=1):
+                self._set_item(self.loss_table, row, column, values.get(key, ""), True)
+
+        self._refresh_compound_totals()
+
+    def _load_loss_reason_labels(self) -> None:
+        for row, reason in enumerate(LOSS_REASONS):
+            self._set_item(self.loss_table, row, 0, reason, False)
+
+    def _on_tyre_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._loading:
+            return
+        if item.column() in (2, 4):
+            self._refresh_tyre_totals()
+            self._refresh_calculated_fields()
+
+    def _refresh_tyre_totals(self) -> None:
+        target_kg = target_pcs = actual_kg = actual_pcs = 0.0
+        for row in range(len(TYRE_LINE_ORDER)):
+            target_kg += self._num(self._table_text(self.tyre_table, row, 1))
+            actual_kg += self._num(self._table_text(self.tyre_table, row, 2))
+            target_pcs += self._num(self._table_text(self.tyre_table, row, 3))
+            actual_pcs += self._num(self._table_text(self.tyre_table, row, 4))
+        total_row = len(TYRE_LINE_ORDER)
+        previous = self.tyre_table.blockSignals(True)
+        try:
+            self._set_item(self.tyre_table, total_row, 1, f"{target_kg:.2f}", False)
+            self._set_item(self.tyre_table, total_row, 2, f"{actual_kg:.2f}" if actual_kg else "", False)
+            self._set_item(self.tyre_table, total_row, 3, str(int(round(target_pcs))), False)
+            self._set_item(self.tyre_table, total_row, 4, str(int(round(actual_pcs))) if actual_pcs else "", False)
+        finally:
+            self.tyre_table.blockSignals(previous)
+
+    def _refresh_compound_totals(self) -> None:
+        target_total = actual_total = 0.0
+        for row in range(6):
+            target = self._num(self._table_text(self.compound_table, row, 1))
+            actual = self._num(self._table_text(self.compound_table, row, 2))
+            target_total += target
+            actual_total += actual
+            achievement = (actual / target * 100) if target else 0.0
+            self._set_item(
+                self.compound_table,
+                row,
+                3,
+                f"{achievement:.1f}%" if target else "",
+                False,
+            )
+        self._set_item(self.compound_table, 6, 1, f"{target_total:.2f}" if target_total else "", False)
+        self._set_item(self.compound_table, 6, 2, f"{actual_total:.2f}" if actual_total else "", False)
+        achievement = actual_total / target_total * 100 if target_total else 0.0
+        self._set_item(self.compound_table, 6, 3, f"{achievement:.1f}%" if target_total else "", False)
+
+    def _refresh_calculated_fields(self) -> None:
+        actual_kg = sum(
+            self._num(self._table_text(self.tyre_table, row, 2))
+            for row in range(len(TYRE_LINE_ORDER))
+        )
+        man_hours = self._num(self.used_man_hours.text())
+        self.production_kg_label.setText(f"{actual_kg:,.2f}" if actual_kg else "0.00")
+        self.kg_per_hour_label.setText(
+            f"{actual_kg / man_hours:,.2f}" if actual_kg and man_hours else "0.00"
+        )
+        if not self._loading:
+            self._refresh_compound_totals()
+
+    def _update_reconciliation(self) -> None:
+        raw_pcs = int(self.target_summary.get("raw_total_pcs") or 0)
+        mapped_pcs = int(self.target_summary.get("mapped_total_pcs") or 0)
+        raw_kg = float(self.target_summary.get("raw_total_kg") or 0)
+        mapped_kg = float(self.target_summary.get("mapped_total_kg") or 0)
+        unmapped = self.target_summary.get("unmapped") or []
+        if unmapped:
+            names = ", ".join(str(row.get("line_name") or "") for row in unmapped[:6])
+            self.reconciliation_label.setText(
+                f"LIVE TARGET CHECK: {mapped_pcs:,}/{raw_pcs:,} pcs mapped | "
+                f"{mapped_kg:,.2f}/{raw_kg:,.2f} kg mapped | UNMAPPED: {names}"
+            )
+            self.reconciliation_label.setStyleSheet(
+                "QLabel{background:#fff7ed;border:1px solid #fdba74;border-radius:7px;padding:7px;color:#9a3412;font-weight:900;}"
+            )
+        else:
+            self.reconciliation_label.setText(
+                f"LIVE TARGET CHECK: {raw_pcs:,} pcs | {raw_kg:,.2f} kg | All imported OVEN lines reconciled to the Excel DAY/NIGHT report format."
+            )
+            self.reconciliation_label.setStyleSheet(
+                "QLabel{background:#ecfdf5;border:1px solid #a7f3d0;border-radius:7px;padding:7px;color:#065f46;font-weight:900;}"
+            )
+
+    def collect_payload(self) -> dict[str, Any]:
+        self._refresh_compound_totals()
+        compound_rows = []
+        for row in range(6):
+            compound_rows.append(
+                {
+                    "compound_type": self._table_text(self.compound_table, row, 0),
+                    "target": self._table_text(self.compound_table, row, 1),
+                    "actual": self._table_text(self.compound_table, row, 2),
+                }
+            )
+        scrap_tyre_rows = []
+        for row in range(3):
+            scrap_tyre_rows.append(
+                {
+                    "tyre_size": self._table_text(self.scrap_tyre_table, row, 0),
+                    "pcs": self._table_text(self.scrap_tyre_table, row, 1),
+                    "defect": self._table_text(self.scrap_tyre_table, row, 2),
+                    "operator": self._table_text(self.scrap_tyre_table, row, 3),
+                }
+            )
+        scrap_compound_rows = []
+        for row in range(3):
+            scrap_compound_rows.append(
+                {
+                    "compound_type": self._table_text(self.scrap_compound_table, row, 0),
+                    "weight": self._table_text(self.scrap_compound_table, row, 1),
+                    "defect": self._table_text(self.scrap_compound_table, row, 2),
+                    "operator": self._table_text(self.scrap_compound_table, row, 3),
+                }
+            )
+        loss = {}
+        for row, reason in enumerate(LOSS_REASONS):
+            loss[reason] = {
+                key: self._table_text(self.loss_table, row, column)
+                for column, key in enumerate(LOSS_COLUMNS, start=1)
+            }
+        return {
+            "supervisor_name": self.supervisor_name.text().strip(),
+            "production_notes": self.production_notes.toPlainText().strip(),
+            "tyre_actuals": self._current_payload_actuals_from_table(),
+            "compound_rows": compound_rows,
+            "scrap_tyre_rows": scrap_tyre_rows,
+            "scrap_compound_rows": scrap_compound_rows,
+            "used_man_hours": self.used_man_hours.text().strip(),
+            "loss_reasons": loss,
+        }
+
+    def _user_label(self) -> str:
+        user = self.current_user
+        if isinstance(user, dict):
+            for key in ("username", "full_name", "name", "email"):
+                if user.get(key):
+                    return str(user[key])
+        for key in ("username", "full_name", "name", "email"):
+            value = getattr(user, key, None)
+            if value:
+                return str(value)
+        return ""
+
+    def save_report(self) -> None:
+        if not self.report_date:
+            QMessageBox.warning(self, "Shift Report", "Select a plan date first.")
+            return
+        try:
+            ShiftDailyReportService.save_report(
+                self.report_date,
+                self.shift_name,
+                self.collect_payload(),
+                self._user_label(),
+            )
+            QMessageBox.information(
+                self,
+                "Shift Report Saved",
+                f"{self.shift_name} report for {self.report_date} was saved.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Shift Report Save", str(exc))
+
+    def _document(self) -> QTextDocument:
+        html = build_shift_report_html(
+            self.report_date,
+            self.shift_name,
+            self.target_summary,
+            self.collect_payload(),
+        )
+        document = QTextDocument(self)
+        document.setHtml(html)
+        return document
+
+    @staticmethod
+    def _configure_printer(printer: QPrinter) -> None:
+        printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+        printer.setPageOrientation(QPageLayout.Orientation.Portrait)
+
+    def print_preview(self) -> None:
+        if not self.report_date:
+            QMessageBox.warning(self, "Shift Report", "Select a plan date first.")
+            return
+        document = self._document()
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        self._configure_printer(printer)
+        preview = QPrintPreviewDialog(printer, self)
+        preview.setWindowTitle(
+            f"{self.shift_name} Daily Production Summary — {self.report_date}"
+        )
+        preview.paintRequested.connect(document.print_)
+        preview.exec()
+
+    def print_direct(self) -> None:
+        if not self.report_date:
+            return
+        document = self._document()
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        self._configure_printer(printer)
+        dialog = QPrintDialog(printer, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            document.print_(printer)
+
+    def save_pdf(self) -> None:
+        if not self.report_date:
+            QMessageBox.warning(self, "Shift Report", "Select a plan date first.")
+            return
+        default_name = (
+            f"Daily_Production_Summary_{self.report_date}_{self.shift_name.replace(' ', '_')}.pdf"
+        )
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Shift Report PDF",
+            default_name,
+            "PDF Files (*.pdf)",
+        )
+        if not filename:
+            return
+        if not filename.lower().endswith(".pdf"):
+            filename += ".pdf"
+        try:
+            document = self._document()
+            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+            self._configure_printer(printer)
+            printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+            printer.setOutputFileName(filename)
+            document.print_(printer)
+            QMessageBox.information(self, "PDF Saved", f"Saved:\n{filename}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Save PDF", str(exc))
 
 
 class ShiftPlanPage(_OperationsPage):
     title_text = "Day / Night Shift Control"
     subtitle_text = (
-        "Shift totals, oven/cavity allocations, planned weight and source traceability "
-        "for the selected production date."
+        "Live OVEN allocations plus Excel-format DAY/NIGHT production summary reports. "
+        "Targets are calculated from the imported oven plan; actuals, quality and loss data are saved by date and shift."
     )
 
     def __init__(self, current_user=None, *args, **kwargs):
         super().__init__(current_user, *args, **kwargs)
+        ShiftDailyReportService.ensure_schema()
+
         filter_row = QHBoxLayout()
         filter_row.addWidget(QLabel("Plan Date"))
         self.date_filter = QComboBox()
@@ -426,8 +1055,13 @@ class ShiftPlanPage(_OperationsPage):
         filter_row.addWidget(self.date_filter)
         filter_row.addStretch()
         self.root.addLayout(filter_row)
+
+        self.tabs = QTabWidget()
+        live_tab = QWidget()
+        live_layout = QVBoxLayout(live_tab)
+        live_layout.setContentsMargins(0, 0, 0, 0)
         self.metrics = QGridLayout()
-        self.root.addLayout(self.metrics)
+        live_layout.addLayout(self.metrics)
         self.table = self._table(
             [
                 "Shift",
@@ -439,7 +1073,14 @@ class ShiftPlanPage(_OperationsPage):
                 "Source",
             ]
         )
-        self.root.addWidget(self.table, 1)
+        live_layout.addWidget(self.table, 1)
+
+        self.day_report = _ShiftReportEditor("DAY", current_user, self)
+        self.night_report = _ShiftReportEditor("NIGHT", current_user, self)
+        self.tabs.addTab(live_tab, "Live Oven Allocations")
+        self.tabs.addTab(self.day_report, "DAY Report / Print")
+        self.tabs.addTab(self.night_report, "NIGHT Report / Print")
+        self.root.addWidget(self.tabs, 1)
 
     def refresh(self) -> None:
         try:
@@ -468,6 +1109,7 @@ class ShiftPlanPage(_OperationsPage):
     def _load_selected(self) -> None:
         selected = self.date_filter.currentText()
         if not selected:
+            self.table.setRowCount(0)
             return
         try:
             summary = self._query(
@@ -529,6 +1171,8 @@ class ShiftPlanPage(_OperationsPage):
                     for r in rows
                 ],
             )
+            self.day_report.load(selected)
+            self.night_report.load(selected)
         except Exception as exc:
             QMessageBox.critical(self, "Shift Plan Data", str(exc))
 
@@ -635,7 +1279,7 @@ class OperationsReportsPage(_OperationsPage):
                     s.qc_stock,
                     s.scrap_stock,
                     s.blocked_stock,
-                    GREATEST(0, s.fg_stock + s.qc_stock - s.scrap_stock - s.blocked_stock) AS net_available,
+                    GREATEST(s.fg_stock, 0) + GREATEST(s.qc_stock, 0) AS net_available,
                     p.average_weight
                 FROM mpps_sap_stock_items s
                 LEFT JOIN mpps_stock_items p ON p.material_code = s.sap_code

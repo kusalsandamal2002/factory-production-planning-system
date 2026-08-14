@@ -373,6 +373,25 @@ class WorkbookContinuousSyncService:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS excel_authoritative_shipment_archive (
+                id BIGSERIAL PRIMARY KEY,
+                import_run_id BIGINT,
+                archived_plan_date DATE,
+                archived_workbook TEXT NOT NULL DEFAULT '',
+                previous_shipment_id BIGINT,
+                previous_shipment_no TEXT NOT NULL DEFAULT '',
+                previous_source_family TEXT NOT NULL DEFAULT '',
+                shipment_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                items_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                reason TEXT NOT NULL DEFAULT '',
+                archived_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_excel_authoritative_shipment_archive_run
+            ON excel_authoritative_shipment_archive(import_run_id, archived_at DESC)
+            """,
+            """
             CREATE TABLE IF NOT EXISTS excel_shipment_item_revisions (
                 id BIGSERIAL PRIMARY KEY,
                 sync_run_id BIGINT NOT NULL
@@ -506,6 +525,16 @@ class WorkbookContinuousSyncService:
                 (
                     f"Workbook plan date {plan_date.isoformat()} is older than "
                     f"the latest live revision {latest.isoformat()}."
+                ),
+                latest,
+            )
+        if options.get("authoritative_latest_shipments", False):
+            return (
+                "LIVE",
+                (
+                    "Workbook is the newest eligible revision. Its shipment "
+                    "snapshot is FINAL/authoritative: previous Excel-managed "
+                    "live shipments will be archived and replaced by this workbook."
                 ),
                 latest,
             )
@@ -687,6 +716,50 @@ class WorkbookContinuousSyncService:
                         )
                         generation += 1
                     group.identity_key = candidate
+
+    @classmethod
+    def _find_legacy_canonical_shipment(
+        cls,
+        session,
+        identity_key: str,
+    ) -> dict[str, Any] | None:
+        """Adopt a shipment created by an older sync generation.
+
+        V7 builds could already have written ``source_family`` /
+        ``source_identity_key`` or the deterministic ``shipment_no`` before
+        the V8 ``excel_shipment_identities`` registry existed.  Without this
+        bridge V8 can attempt a second INSERT and PostgreSQL correctly raises
+        a unique-integrity error.  Prefer an exact source identity, then fall
+        back to the deterministic shipment number.
+        """
+        key = _text(identity_key)
+        if not key:
+            return None
+        stable_no = _shipment_no(key)
+        return session.execute(
+            text(
+                """
+                SELECT *
+                FROM mpps_shipments
+                WHERE (source_family = :source_family
+                       AND source_identity_key = :identity_key)
+                   OR shipment_no = :shipment_no
+                ORDER BY
+                    CASE
+                        WHEN source_family = :source_family
+                         AND source_identity_key = :identity_key THEN 0
+                        ELSE 1
+                    END,
+                    id
+                LIMIT 1
+                """
+            ),
+            {
+                "source_family": cls.SOURCE_FAMILY,
+                "identity_key": key,
+                "shipment_no": stable_no,
+            },
+        ).mappings().first()
 
     @staticmethod
     def _load_shipment(session, shipment_id: int | None) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]]]:
@@ -1113,6 +1186,551 @@ class WorkbookContinuousSyncService:
             manual_preserved,
         )
 
+    def _identity_row(self, session, identity_key: str):
+        """Return a shipment identity without assuming the registry is complete."""
+        return session.execute(
+            text(
+                """
+                SELECT * FROM excel_shipment_identities
+                WHERE source_family = :source_family
+                  AND identity_key = :identity_key
+                LIMIT 1
+                """
+            ),
+            {
+                "source_family": self.SOURCE_FAMILY,
+                "identity_key": identity_key,
+            },
+        ).mappings().first()
+
+    def _ensure_identity_row(
+        self,
+        session,
+        *,
+        ledger,
+        import_run_id: int,
+        group: ShipmentGroup,
+        analysis,
+        plan_date: date,
+    ):
+        """Create/repair the stable identity row atomically and return it.
+
+        Older V7 databases can contain a shipment with no V8 identity registry
+        row, while a failed import can also leave preview state stale.  This
+        method makes the registry idempotent instead of relying on `.one()`.
+        """
+        identity = self._identity_row(session, group.identity_key)
+        if identity is not None:
+            return identity
+
+        values = {
+            "source_family": self.SOURCE_FAMILY,
+            "identity_key": group.identity_key,
+            "base_key": group.base_key,
+            "display_name": group.shipment_name,
+            "canonical_shipment_id": None,
+            "first_seen_plan_date": plan_date,
+            "last_seen_plan_date": plan_date,
+            "latest_run_id": import_run_id,
+            "latest_workbook_hash": analysis.workbook_hash,
+            "latest_workbook_name": analysis.workbook_name,
+            "latest_column": group.shipment_column,
+            "latest_status": group.source_status,
+            "latest_item_fingerprint": self._item_fingerprint(group),
+            "latest_total_qty": group.total_qty,
+            "latest_item_count": group.item_count,
+            "is_active": True,
+            "missing_since_plan_date": None,
+            "updated_at": datetime.now(),
+        }
+        ledger._upsert_with_change(
+            session,
+            import_run_id,
+            "excel_shipment_identities",
+            {
+                "source_family": self.SOURCE_FAMILY,
+                "identity_key": group.identity_key,
+            },
+            values,
+        )
+        identity = self._identity_row(session, group.identity_key)
+        if identity is None:
+            raise RuntimeError(
+                "Shipment identity registry could not be created/recovered for "
+                f"{group.identity_key}. No live shipment was changed."
+            )
+        return identity
+
+    @staticmethod
+    def _authoritative_shipment_no(plan_date: date, group: ShipmentGroup) -> str:
+        """Deterministic live number for the exact latest-workbook shipment."""
+        seed = (
+            f"{plan_date.isoformat()}|{group.shipment_column}|"
+            f"{group.shipment_name}|{group.base_key}"
+        )
+        digest = sha1(seed.encode("utf-8")).hexdigest()[:12].upper()
+        return f"XLS-FINAL-{plan_date.strftime('%Y%m%d')}-{digest}"
+
+    def _archive_and_remove_previous_excel_live_shipments(
+        self,
+        session,
+        *,
+        import_run_id: int,
+        analysis,
+        plan_date: date,
+        ledger,
+        counters: Counter,
+    ) -> int:
+        """Move the previous Excel-controlled live queue out of operational tables.
+
+        Historical Excel snapshots, actual production, stock history and AI learning
+        remain untouched.  Only live shipments created/managed by OVEN Excel sync are
+        removed from the operational queue, after a full JSON archive is written.
+        """
+        previous = session.execute(
+            text(
+                """
+                SELECT *
+                FROM mpps_shipments
+                WHERE COALESCE(source_family, '') = :source_family
+                   OR COALESCE(shipment_no, '') LIKE 'XLS-SYNC-%'
+                   OR COALESCE(shipment_no, '') LIKE 'XLS-FINAL-%'
+                ORDER BY id
+                """
+            ),
+            {"source_family": self.SOURCE_FAMILY},
+        ).mappings().all()
+
+        for shipment in previous:
+            shipment = dict(shipment)
+            shipment_id = int(shipment["id"])
+            items = [
+                dict(row)
+                for row in session.execute(
+                    text(
+                        """
+                        SELECT * FROM mpps_shipment_items
+                        WHERE shipment_id = :shipment_id
+                        ORDER BY id
+                        """
+                    ),
+                    {"shipment_id": shipment_id},
+                ).mappings().all()
+            ]
+            session.execute(
+                text(
+                    """
+                    INSERT INTO excel_authoritative_shipment_archive (
+                        import_run_id,
+                        archived_plan_date,
+                        archived_workbook,
+                        previous_shipment_id,
+                        previous_shipment_no,
+                        previous_source_family,
+                        shipment_json,
+                        items_json,
+                        reason
+                    ) VALUES (
+                        :import_run_id,
+                        :plan_date,
+                        :workbook,
+                        :shipment_id,
+                        :shipment_no,
+                        :source_family,
+                        CAST(:shipment_json AS JSONB),
+                        CAST(:items_json AS JSONB),
+                        :reason
+                    )
+                    """
+                ),
+                {
+                    "import_run_id": import_run_id,
+                    "plan_date": plan_date,
+                    "workbook": analysis.workbook_name,
+                    "shipment_id": shipment_id,
+                    "shipment_no": _text(shipment.get("shipment_no")),
+                    "source_family": _text(shipment.get("source_family")),
+                    "shipment_json": json.dumps(_json_safe(shipment), default=str),
+                    "items_json": json.dumps(_json_safe(items), default=str),
+                    "reason": (
+                        "Archived because a newer/equal-date OVEN workbook is the "
+                        "authoritative live shipment snapshot."
+                    ),
+                },
+            )
+
+            # Record DELETEs so the built-in import rollback can restore the
+            # previous operational queue if the user rolls this import back.
+            for item in items:
+                ledger._record_change(
+                    session,
+                    import_run_id,
+                    "mpps_shipment_items",
+                    "DELETE",
+                    {"id": int(item["id"])},
+                    item,
+                    {},
+                )
+            ledger._record_change(
+                session,
+                import_run_id,
+                "mpps_shipments",
+                "DELETE",
+                {"id": shipment_id},
+                shipment,
+                {},
+            )
+            counters["authoritative_shipments_archived"] += 1
+            counters["authoritative_items_archived"] += len(items)
+
+        if previous:
+            session.execute(
+                text(
+                    """
+                    DELETE FROM mpps_shipments
+                    WHERE COALESCE(source_family, '') = :source_family
+                       OR COALESCE(shipment_no, '') LIKE 'XLS-SYNC-%'
+                       OR COALESCE(shipment_no, '') LIKE 'XLS-FINAL-%'
+                    """
+                ),
+                {"source_family": self.SOURCE_FAMILY},
+            )
+
+        # The registry is historical metadata; clear only live pointers.  Old
+        # identity rows remain useful for audit but cannot point at deleted live rows.
+        session.execute(
+            text(
+                """
+                UPDATE excel_shipment_identities
+                SET canonical_shipment_id = NULL,
+                    is_active = FALSE,
+                    missing_since_plan_date = :plan_date,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE source_family = :source_family
+                """
+            ),
+            {"plan_date": plan_date, "source_family": self.SOURCE_FAMILY},
+        )
+        return len(previous)
+
+    def _sync_authoritative_latest(
+        self,
+        session,
+        *,
+        import_run_id: int,
+        analysis,
+        options: dict[str, Any],
+        counters: Counter,
+        ledger,
+        preview: SyncPreview,
+    ) -> dict[str, Any]:
+        """Replace the Excel-controlled live shipment queue from the latest file.
+
+        Business rule: the newest OVEN workbook by plan date is the live shipment
+        truth.  Older workbooks are historical only.  Previous Excel live shipments
+        are archived, removed from operational planning, and the latest workbook is
+        rebuilt exactly from its non-zero shipment rows.
+        """
+        plan_date = date.fromisoformat(preview.plan_date)
+        sync_run_id = session.execute(
+            text(
+                """
+                INSERT INTO excel_shipment_sync_runs (
+                    import_run_id, workbook_hash, workbook_name, plan_date,
+                    sync_mode, status, reason
+                ) VALUES (
+                    :import_run_id, :workbook_hash, :workbook_name, :plan_date,
+                    'LIVE', 'RUNNING', :reason
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "import_run_id": import_run_id,
+                "workbook_hash": analysis.workbook_hash,
+                "workbook_name": analysis.workbook_name,
+                "plan_date": plan_date,
+                "reason": preview.reason,
+            },
+        ).scalar_one()
+
+        archived = self._archive_and_remove_previous_excel_live_shipments(
+            session,
+            import_run_id=import_run_id,
+            analysis=analysis,
+            plan_date=plan_date,
+            ledger=ledger,
+            counters=counters,
+        )
+
+        groups = [
+            group
+            for group in self._group_analysis(analysis)
+            if group.item_count > 0 and group.total_qty > 0
+        ]
+        created_shipments = 0
+        created_items = 0
+
+        for group in groups:
+            # All non-zero shipment columns in the newest workbook are treated as
+            # real demand, including columns previously labelled deferred.
+            if not group.shipment_name:
+                group.shipment_name = f"SHIPMENT {group.shipment_column}"
+                group.base_key = _source_base_key(group.shipment_name)
+            group.identity_key = _identity_key(
+                group.base_key,
+                f"AUTHORITATIVE-{group.shipment_column}",
+            )
+            stable_no = self._authoritative_shipment_no(plan_date, group)
+            target_date = group.source_target_date
+
+            shipment_values = {
+                "shipment_no": stable_no,
+                "shipment_id": stable_no,
+                "shipment_name": group.shipment_name,
+                "customer_name": group.shipment_name,
+                "shipment_date": plan_date,
+                "target_date": target_date,
+                "target_date_is_manual": False,
+                "target_date_source": "LATEST OVEN EXCEL",
+                "plan_date": plan_date,
+                "factory_can_receive_date": None,
+                "factory_out_date": None,
+                "dispatch_buffer_days": 0,
+                "delivery_status": "Pending Planning",
+                "delay_days": 0,
+                "early_days": 0,
+                "total_qty": group.total_qty,
+                "completed_qty": 0,
+                "progress_pct": 0,
+                "planning_status": "Pending Replan",
+                "planning_note": (
+                    "Authoritative latest OVEN workbook shipment; Excel quantity "
+                    "is the live planning truth until a newer workbook is committed."
+                ),
+                "last_replanned_at": None,
+                "status": "Planned",
+                "note": (
+                    f"FINAL shipment snapshot from {analysis.workbook_name}; "
+                    f"source column {group.shipment_column}."
+                ),
+                "source_family": self.SOURCE_FAMILY,
+                "source_identity_key": group.identity_key,
+                "source_latest_run_id": import_run_id,
+                "source_latest_plan_date": plan_date,
+                "source_latest_workbook": analysis.workbook_name,
+                "source_latest_column": group.shipment_column,
+                "source_latest_status": group.source_status,
+                "source_missing_from_latest": False,
+                "source_revision_no": 1,
+                "source_sync_status": "AUTHORITATIVE_LATEST",
+                "source_sync_note": "Live shipment rebuilt from the latest workbook.",
+                "updated_at": datetime.now(),
+            }
+            inserted_shipment = ledger._insert_with_change(
+                session,
+                import_run_id,
+                "mpps_shipments",
+                shipment_values,
+                key_fields={"shipment_no": stable_no},
+            )
+            if not inserted_shipment or inserted_shipment.get("id") is None:
+                raise RuntimeError(
+                    f"Authoritative shipment insert returned no id for {stable_no}."
+                )
+            shipment_id = int(inserted_shipment["id"])
+            created_shipments += 1
+
+            for code, source_item in group.items.items():
+                qty = _safe_int(source_item.get("quantity"))
+                if qty <= 0:
+                    continue
+                item_values = {
+                    "shipment_id": shipment_id,
+                    "sap_code": code,
+                    "item_description": _text(source_item.get("description")),
+                    "quantity": qty,
+                    "stock_allocated_qty": 0,
+                    "produced_qty": 0,
+                    "completed_qty": 0,
+                    "production_required_qty": qty,
+                    "remaining_qty": qty,
+                    "progress_pct": 0,
+                    "item_status": "Pending",
+                    "planning_note": "Latest Excel demand; waiting for global replan.",
+                    "schedule_reason": "Waiting for cumulative stock/resource planning.",
+                    "factory_out_reason": "Waiting for cumulative stock/resource planning.",
+                    "note": f"Authoritative Excel import run #{import_run_id}",
+                    "source_item_key": f"{group.identity_key}|{code}",
+                    "source_latest_run_id": import_run_id,
+                    "source_latest_plan_date": plan_date,
+                    "source_latest_qty": qty,
+                    "source_removed_from_latest": False,
+                    "source_revision_no": 1,
+                    "source_sync_status": "AUTHORITATIVE_LATEST",
+                    "source_sync_note": "Created from latest workbook demand.",
+                    "updated_at": datetime.now(),
+                }
+                inserted_item = ledger._insert_with_change(
+                    session,
+                    import_run_id,
+                    "mpps_shipment_items",
+                    item_values,
+                    key_fields={"shipment_id": shipment_id, "sap_code": code},
+                )
+                if not inserted_item or inserted_item.get("id") is None:
+                    raise RuntimeError(
+                        "Authoritative shipment item INSERT returned no row: "
+                        f"shipment_id={shipment_id}, sap_code={code}."
+                    )
+                created_items += 1
+                self._record_item_revision(
+                    session,
+                    sync_run_id=sync_run_id,
+                    import_run_id=import_run_id,
+                    identity_key=group.identity_key,
+                    shipment_id=shipment_id,
+                    shipment_item_id=int(inserted_item["id"]),
+                    sap_code=_text(inserted_item.get("sap_code") or code),
+                    action="AUTHORITATIVE_NEW",
+                    old_qty=0,
+                    new_qty=qty,
+                    produced_qty=0,
+                    completed_qty=0,
+                    protected_actual=False,
+                    conflict=False,
+                    reason="Created from the latest authoritative workbook.",
+                )
+
+            # Rebuild one current identity pointer for traceability.  The natural
+            # key UPSERT is race-safe and old identities remain inactive history.
+            identity = self._ensure_identity_row(
+                session,
+                ledger=ledger,
+                import_run_id=import_run_id,
+                group=group,
+                analysis=analysis,
+                plan_date=plan_date,
+            )
+            ledger._update_existing_by_id(
+                session,
+                import_run_id,
+                "excel_shipment_identities",
+                int(identity["id"]),
+                {
+                    "display_name": group.shipment_name,
+                    "canonical_shipment_id": shipment_id,
+                    "first_seen_plan_date": identity.get("first_seen_plan_date") or plan_date,
+                    "last_seen_plan_date": plan_date,
+                    "latest_run_id": import_run_id,
+                    "latest_workbook_hash": analysis.workbook_hash,
+                    "latest_workbook_name": analysis.workbook_name,
+                    "latest_column": group.shipment_column,
+                    "latest_status": group.source_status,
+                    "latest_item_fingerprint": self._item_fingerprint(group),
+                    "latest_total_qty": group.total_qty,
+                    "latest_item_count": group.item_count,
+                    "is_active": True,
+                    "missing_since_plan_date": None,
+                    "updated_at": datetime.now(),
+                },
+            )
+            session.execute(
+                text(
+                    """
+                    UPDATE excel_import_shipment_snapshots
+                    SET live_shipment_id = :shipment_id,
+                        source_identity_key = :identity_key
+                    WHERE run_id = :run_id
+                      AND shipment_column = :shipment_column
+                    """
+                ),
+                {
+                    "shipment_id": shipment_id,
+                    "identity_key": group.identity_key,
+                    "run_id": import_run_id,
+                    "shipment_column": group.shipment_column,
+                },
+            )
+
+            sync_row = SyncPreviewRow(
+                action="AUTHORITATIVE_LATEST",
+                identity_key=group.identity_key,
+                shipment_column=group.shipment_column,
+                shipment_name=group.shipment_name,
+                existing_shipment_id=None,
+                existing_shipment_no="",
+                source_status=group.source_status,
+                source_target_date=(target_date.isoformat() if target_date else ""),
+                source_date_class=group.source_date_class,
+                old_item_count=0,
+                new_item_count=group.item_count,
+                old_total_qty=0,
+                new_total_qty=group.total_qty,
+                changed_items=0,
+                new_items=group.item_count,
+                removed_items=0,
+                conflicts=0,
+                manual_fields_preserved=0,
+                reason="Latest workbook is the FINAL live shipment truth.",
+            )
+            self._insert_sync_row(session, sync_run_id, import_run_id, sync_row)
+
+        counters["shipments_created"] += created_shipments
+        counters["shipment_items_created"] += created_items
+        counters["authoritative_live_shipments"] += created_shipments
+        counters["authoritative_live_items"] += created_items
+
+        details = {
+            "sync_mode": "LIVE",
+            "authority_mode": "LATEST_WORKBOOK_FINAL",
+            "sync_reason": preview.reason,
+            "archived_previous_shipments": archived,
+            "new_shipments": created_shipments,
+            "new_items": created_items,
+            "updated_shipments": 0,
+            "unchanged_shipments": 0,
+            "deferred_shipments": 0,
+            "missing_shipments": archived,
+            "review_shipments": 0,
+            "changed_items": 0,
+            "removed_items": int(counters.get("authoritative_items_archived", 0)),
+            "conflict_items": 0,
+            "manual_fields_preserved": 0,
+            "live_change_count": archived + created_shipments + created_items,
+        }
+        session.execute(
+            text(
+                """
+                UPDATE excel_shipment_sync_runs
+                SET status = 'COMMITTED',
+                    new_shipments = :new_shipments,
+                    updated_shipments = 0,
+                    unchanged_shipments = 0,
+                    deferred_shipments = 0,
+                    missing_shipments = :missing_shipments,
+                    review_shipments = 0,
+                    new_items = :new_items,
+                    changed_items = 0,
+                    removed_items = :removed_items,
+                    conflict_items = 0,
+                    manual_fields_preserved = 0,
+                    details_json = CAST(:details_json AS JSONB),
+                    completed_at = CURRENT_TIMESTAMP
+                WHERE id = :sync_run_id
+                """
+            ),
+            {
+                "sync_run_id": sync_run_id,
+                "new_shipments": created_shipments,
+                "missing_shipments": archived,
+                "new_items": created_items,
+                "removed_items": int(counters.get("authoritative_items_archived", 0)),
+                "details_json": json.dumps(details, default=str),
+            },
+        )
+        return {"sync_run_id": sync_run_id, **details}
+
     def sync(
         self,
         session,
@@ -1126,6 +1744,20 @@ class WorkbookContinuousSyncService:
         self.ensure_schema(session)
         preview = self.preview_with_session(session, analysis, options)
         plan_date = date.fromisoformat(preview.plan_date)
+
+        if (
+            preview.mode == "LIVE"
+            and options.get("authoritative_latest_shipments", False)
+        ):
+            return self._sync_authoritative_latest(
+                session,
+                import_run_id=import_run_id,
+                analysis=analysis,
+                options=options,
+                counters=counters,
+                ledger=ledger,
+                preview=preview,
+            )
 
         sync_run_id = session.execute(
             text(
@@ -1253,67 +1885,45 @@ class WorkbookContinuousSyncService:
             if not group:
                 continue
 
-            identity = session.execute(
-                text(
-                    """
-                    SELECT * FROM excel_shipment_identities
-                    WHERE source_family = :source_family
-                      AND identity_key = :identity_key
-                    LIMIT 1
-                    """
-                ),
-                {
-                    "source_family": self.SOURCE_FAMILY,
-                    "identity_key": group.identity_key,
-                },
-            ).mappings().first()
-
-            if not identity:
-                ledger._insert_with_change(
-                    session,
-                    import_run_id,
-                    "excel_shipment_identities",
-                    {
-                        "source_family": self.SOURCE_FAMILY,
-                        "identity_key": group.identity_key,
-                        "base_key": group.base_key,
-                        "display_name": group.shipment_name,
-                        "canonical_shipment_id": None,
-                        "first_seen_plan_date": plan_date,
-                        "last_seen_plan_date": plan_date,
-                        "latest_run_id": import_run_id,
-                        "latest_workbook_hash": analysis.workbook_hash,
-                        "latest_workbook_name": analysis.workbook_name,
-                        "latest_column": group.shipment_column,
-                        "latest_status": group.source_status,
-                        "latest_item_fingerprint": self._item_fingerprint(group),
-                        "latest_total_qty": group.total_qty,
-                        "latest_item_count": group.item_count,
-                        "is_active": True,
-                        "missing_since_plan_date": None,
-                        "updated_at": datetime.now(),
-                    },
-                    key_fields={
-                        "source_family": self.SOURCE_FAMILY,
-                        "identity_key": group.identity_key,
-                    },
-                )
-                identity = session.execute(
-                    text(
-                        """
-                        SELECT * FROM excel_shipment_identities
-                        WHERE source_family = :source_family
-                          AND identity_key = :identity_key
-                        LIMIT 1
-                        """
-                    ),
-                    {
-                        "source_family": self.SOURCE_FAMILY,
-                        "identity_key": group.identity_key,
-                    },
-                ).mappings().one()
+            identity = self._ensure_identity_row(
+                session,
+                ledger=ledger,
+                import_run_id=import_run_id,
+                group=group,
+                analysis=analysis,
+                plan_date=plan_date,
+            )
 
             shipment_id = identity.get("canonical_shipment_id")
+
+            # Migration bridge: an older continuous-sync build may already
+            # have created the live shipment while the V8 identity registry
+            # is empty/unlinked.  Adopt that row instead of attempting a
+            # duplicate INSERT that violates shipment_no/source-identity
+            # uniqueness.
+            if not shipment_id:
+                legacy_shipment = self._find_legacy_canonical_shipment(
+                    session,
+                    group.identity_key,
+                )
+                if legacy_shipment:
+                    shipment_id = int(legacy_shipment["id"])
+                    ledger._update_existing_by_id(
+                        session,
+                        import_run_id,
+                        "excel_shipment_identities",
+                        int(identity["id"]),
+                        {
+                            "canonical_shipment_id": shipment_id,
+                            "updated_at": datetime.now(),
+                        },
+                    )
+                    identity = {
+                        **dict(identity),
+                        "canonical_shipment_id": shipment_id,
+                    }
+                    counters["legacy_shipments_adopted"] += 1
+
             shipment, existing_items = self._load_shipment(
                 session,
                 int(shipment_id) if shipment_id else None,
@@ -1368,7 +1978,16 @@ class WorkbookContinuousSyncService:
                 shipment = session.execute(
                     text("SELECT * FROM mpps_shipments WHERE shipment_no = :shipment_no"),
                     {"shipment_no": stable_no},
-                ).mappings().one()
+                ).mappings().first()
+                if shipment is None:
+                    shipment = self._find_legacy_canonical_shipment(
+                        session, group.identity_key
+                    )
+                if shipment is None:
+                    raise RuntimeError(
+                        "Shipment row could not be recovered after creation for "
+                        f"identity {group.identity_key}. No partial import was committed."
+                    )
                 shipment_id = int(shipment["id"])
                 ledger._update_existing_by_id(
                     session,
@@ -1489,7 +2108,12 @@ class WorkbookContinuousSyncService:
                             """
                         ),
                         {"shipment_id": shipment_id, "sap_code": code},
-                    ).mappings().one()
+                    ).mappings().first()
+                    if inserted_item is None:
+                        raise RuntimeError(
+                            "Shipment item could not be recovered after insert: "
+                            f"shipment_id={shipment_id}, sap_code={code}."
+                        )
                     self._record_item_revision(
                         session,
                         sync_run_id=sync_run_id,
@@ -1679,20 +2303,14 @@ class WorkbookContinuousSyncService:
                     reason=reason,
                 )
 
-            identity = session.execute(
-                text(
-                    """
-                    SELECT * FROM excel_shipment_identities
-                    WHERE source_family = :source_family
-                      AND identity_key = :identity_key
-                    LIMIT 1
-                    """
-                ),
-                {
-                    "source_family": self.SOURCE_FAMILY,
-                    "identity_key": group.identity_key,
-                },
-            ).mappings().one()
+            identity = self._ensure_identity_row(
+                session,
+                ledger=ledger,
+                import_run_id=import_run_id,
+                group=group,
+                analysis=analysis,
+                plan_date=plan_date,
+            )
             ledger._update_existing_by_id(
                 session,
                 import_run_id,
