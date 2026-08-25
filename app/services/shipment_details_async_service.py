@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import date, datetime
 from typing import Any, Callable, Mapping
@@ -6,7 +6,6 @@ from typing import Any, Callable, Mapping
 from sqlalchemy import text
 
 from app.database import engine
-from app.services.factory_out_forecast_service import load_shipment_forecasts
 from app.services.operational_source_service import OperationalSourceService
 from app.services.shipment_command_service import portfolio_metrics, shipment_risk_profile
 
@@ -190,6 +189,10 @@ def load_shipment_portfolio(
                 COALESCE(item.item_search_text, '') AS item_search_text,
                 COALESCE(NULLIF(shipment.status, ''), 'Planned') AS shipment_status,
                 COALESCE(NULLIF(shipment.planning_status, ''), 'Pending') AS planning_status,
+                COALESCE(NULLIF(shipment.lifecycle_status, ''), 'ACTIVE') AS lifecycle_status,
+                COALESCE(shipment.source_missing_from_latest, FALSE) AS source_missing_from_latest,
+                shipment.actual_factory_out_date,
+                COALESCE(shipment.closure_reason, '') AS closure_reason,
                 (
                     LOWER(COALESCE(shipment.status, '')) IN (
                         'imported review',
@@ -258,42 +261,23 @@ def load_shipment_portfolio(
     _emit(progress, 24, "Loading shipment portfolio from PostgreSQL...")
     with engine.begin() as connection:
         raw_rows = connection.execute(text(query), params).mappings().all()
-        _emit(progress, 48, "Loading Factory Can Out forecasts...")
-        forecast_map = load_shipment_forecasts(
-            connection,
-            [int(row["shipment_pk"]) for row in raw_rows],
-            as_of_date=as_of_date,
-        )
 
-    _emit(progress, 62, "Calculating shipment risk and delivery state...")
+    _emit(progress, 62, "Reading canonical Factory Can Out and delivery state...")
     rows: list[dict[str, Any]] = []
     total_raw = max(1, len(raw_rows))
 
     for row_index, raw in enumerate(raw_rows):
         row = dict(raw)
-        forecast = forecast_map.get(int(row.get("shipment_pk") or 0))
-        if (
-            not row.get("review_required")
-            and row.get("factory_can_receive_date") is None
-            and forecast is not None
-        ):
-            if forecast.factory_out_date is not None:
-                row["factory_can_receive_date"] = forecast.factory_out_date
-                row["factory_out_forecast"] = True
-                row["factory_out_source"] = forecast.source
-                row["factory_out_confidence"] = forecast.confidence
-            else:
-                row["factory_out_forecast"] = False
-                row["factory_out_source"] = "BLOCKED"
-                row["factory_out_blocker"] = forecast.blocker
+        row["factory_out_forecast"] = False
+        if row.get("factory_can_receive_date") is not None:
+            row["factory_out_source"] = "R6_CANONICAL"
+            row["factory_out_confidence"] = 1.0
+        elif row.get("review_required"):
+            row["factory_out_source"] = "CLOSURE_REVIEW"
+            row["factory_out_confidence"] = 0.0
         else:
-            row["factory_out_forecast"] = False
-            row["factory_out_source"] = (
-                "VERIFIED" if row.get("factory_can_receive_date") else ""
-            )
-            row["factory_out_confidence"] = (
-                1.0 if row.get("factory_can_receive_date") else 0.0
-            )
+            row["factory_out_source"] = "PENDING_CANONICAL_REPLAN"
+            row["factory_out_confidence"] = 0.0
 
         target = row.get("target_date")
         factory_out = row.get("factory_can_receive_date")

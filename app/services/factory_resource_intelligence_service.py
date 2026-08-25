@@ -703,6 +703,7 @@ class FactoryResourceIntelligenceService:
         }
         sap_group: dict[tuple[date, str], dict[str, Any]] = {}
         mold_shift_group: dict[tuple[date, str, str], dict[str, Any]] = {}
+        allocation_params: list[dict[str, Any]] = []
 
         for row in oven_rows:
             sap = _code(row.get("sap_code"))
@@ -727,67 +728,29 @@ class FactoryResourceIntelligenceService:
             if not casing_type and casing_evidence:
                 casing_type = casing_evidence
 
-            session.execute(
-                text(
-                    """
-                    INSERT INTO mpps_fi_plan_allocations (
-                        import_run_id, plan_date, source_workbook, source_sheet,
-                        source_row, allocation_slot, line_name, cavity_code,
-                        sap_code, item_description, shift_name, planned_qty,
-                        today_qty, total_to_produce_qty, next_day_qty,
-                        unit_weight_kg, mold_key, mold_code, casing_type, casing_evidence,
-                        evidence_confidence
-                    ) VALUES (
-                        :import_run_id, :plan_date, :source_workbook, :source_sheet,
-                        :source_row, :allocation_slot, :line_name, :cavity_code,
-                        :sap_code, :item_description, :shift_name, :planned_qty,
-                        :today_qty, :total_to_produce_qty, :next_day_qty,
-                        :unit_weight_kg, :mold_key, :mold_code, :casing_type, :casing_evidence,
-                        :evidence_confidence
-                    )
-                    ON CONFLICT (import_run_id, plan_date, source_row, shift_name)
-                    DO UPDATE SET
-                        line_name=EXCLUDED.line_name,
-                        cavity_code=EXCLUDED.cavity_code,
-                        sap_code=EXCLUDED.sap_code,
-                        item_description=EXCLUDED.item_description,
-                        planned_qty=EXCLUDED.planned_qty,
-                        today_qty=EXCLUDED.today_qty,
-                        total_to_produce_qty=EXCLUDED.total_to_produce_qty,
-                        next_day_qty=EXCLUDED.next_day_qty,
-                        unit_weight_kg=EXCLUDED.unit_weight_kg,
-                        mold_key=EXCLUDED.mold_key,
-                        mold_code=EXCLUDED.mold_code,
-                        casing_type=EXCLUDED.casing_type,
-                        casing_evidence=EXCLUDED.casing_evidence,
-                        allocation_slot=EXCLUDED.allocation_slot,
-                        evidence_confidence=EXCLUDED.evidence_confidence
-                    """
-                ),
-                {
-                    "import_run_id": int(import_run_id),
-                    "plan_date": row_date,
-                    "source_workbook": str(getattr(analysis, "workbook_name", "") or ""),
-                    "source_sheet": str(row.get("source_sheet") or "OVEN"),
-                    "source_row": source_row,
-                    "allocation_slot": slot,
-                    "line_name": line,
-                    "cavity_code": cavity,
-                    "sap_code": sap,
-                    "item_description": _text(row.get("description")),
-                    "shift_name": shift,
-                    "planned_qty": max(0, _i(row.get("planned_qty"))),
-                    "today_qty": max(0, _i(row.get("today_qty"))),
-                    "total_to_produce_qty": max(0, _i(row.get("total_to_produce_qty"))),
-                    "next_day_qty": max(0, _i(row.get("next_day_qty"))),
-                    "unit_weight_kg": max(0.0, _f(row.get("unit_weight_kg"))),
-                    "mold_key": mold_key,
-                    "mold_code": mold_code,
-                    "casing_type": casing_type,
-                    "casing_evidence": casing_evidence,
-                    "evidence_confidence": 1.0 if smds else 0.82,
-                },
-            )
+            allocation_params.append({
+                "import_run_id": int(import_run_id),
+                "plan_date": row_date,
+                "source_workbook": str(getattr(analysis, "workbook_name", "") or ""),
+                "source_sheet": str(row.get("source_sheet") or "OVEN"),
+                "source_row": source_row,
+                "allocation_slot": slot,
+                "line_name": line,
+                "cavity_code": cavity,
+                "sap_code": sap,
+                "item_description": _text(row.get("description")),
+                "shift_name": shift,
+                "planned_qty": max(0, _i(row.get("planned_qty"))),
+                "today_qty": max(0, _i(row.get("today_qty"))),
+                "total_to_produce_qty": max(0, _i(row.get("total_to_produce_qty"))),
+                "next_day_qty": max(0, _i(row.get("next_day_qty"))),
+                "unit_weight_kg": max(0.0, _f(row.get("unit_weight_kg"))),
+                "mold_key": mold_key,
+                "mold_code": mold_code,
+                "casing_type": casing_type,
+                "casing_evidence": casing_evidence,
+                "evidence_confidence": 1.0 if smds else 0.82,
+            })
             inserted += 1
             if line:
                 line_days.add(line)
@@ -834,75 +797,121 @@ class FactoryResourceIntelligenceService:
                 if not rec["casing_type"] and casing_type:
                     rec["casing_type"] = casing_type
 
+        if allocation_params:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO mpps_fi_plan_allocations (
+                        import_run_id, plan_date, source_workbook, source_sheet,
+                        source_row, allocation_slot, line_name, cavity_code,
+                        sap_code, item_description, shift_name, planned_qty,
+                        today_qty, total_to_produce_qty, next_day_qty,
+                        unit_weight_kg, mold_key, mold_code, casing_type, casing_evidence,
+                        evidence_confidence
+                    ) VALUES (
+                        :import_run_id, :plan_date, :source_workbook, :source_sheet,
+                        :source_row, :allocation_slot, :line_name, :cavity_code,
+                        :sap_code, :item_description, :shift_name, :planned_qty,
+                        :today_qty, :total_to_produce_qty, :next_day_qty,
+                        :unit_weight_kg, :mold_key, :mold_code, :casing_type, :casing_evidence,
+                        :evidence_confidence
+                    )
+                    ON CONFLICT (import_run_id, plan_date, source_row, shift_name)
+                    DO UPDATE SET
+                        line_name=EXCLUDED.line_name, cavity_code=EXCLUDED.cavity_code,
+                        sap_code=EXCLUDED.sap_code, item_description=EXCLUDED.item_description,
+                        planned_qty=EXCLUDED.planned_qty, today_qty=EXCLUDED.today_qty,
+                        total_to_produce_qty=EXCLUDED.total_to_produce_qty,
+                        next_day_qty=EXCLUDED.next_day_qty, unit_weight_kg=EXCLUDED.unit_weight_kg,
+                        mold_key=EXCLUDED.mold_key, mold_code=EXCLUDED.mold_code,
+                        casing_type=EXCLUDED.casing_type, casing_evidence=EXCLUDED.casing_evidence,
+                        allocation_slot=EXCLUDED.allocation_slot,
+                        evidence_confidence=EXCLUDED.evidence_confidence
+                    """
+                ),
+                allocation_params,
+            )
+
+        daily_params: list[dict[str, Any]] = []
         for (row_date, sap), rec in sap_group.items():
             primary_line = rec["lines"].most_common(1)[0][0] if rec["lines"] else ""
             lines = sorted(k for k in rec["lines"] if k)
             cavities = sorted(c for c in rec["cavities"] if c)
             day_qty = int(rec["day"])
             night_qty = int(rec["night"])
+            daily_params.append({
+                "import_run_id": int(import_run_id),
+                "plan_date": row_date,
+                "sap_code": sap,
+                "item_description": rec["description"],
+                "day_plan_qty": day_qty,
+                "night_plan_qty": night_qty,
+                "total_plan_qty": day_qty + night_qty,
+                "today_qty_evidence": sum(rec["today_rows"].values()),
+                "distinct_cavity_count": len(cavities),
+                "allocation_slot_count": len(rec["slots"]),
+                "distinct_line_count": len(lines),
+                "primary_line": primary_line,
+                "mold_key": rec["mold_key"],
+                "mold_code": (rec["mold_codes"].most_common(1)[0][0] if rec["mold_codes"] else ""),
+                "casing_type": rec["casing_type"],
+                "lines_json": json.dumps(lines),
+                "cavities_json": json.dumps(cavities),
+                "source_workbook": str(getattr(analysis, "workbook_name", "") or ""),
+            })
+
+        if daily_params:
             session.execute(
                 text(
                     """
                     INSERT INTO mpps_fi_daily_sap_resource_plan (
                         import_run_id, plan_date, sap_code, item_description,
                         day_plan_qty, night_plan_qty, total_plan_qty,
-                        today_qty_evidence, distinct_cavity_count,
-                        allocation_slot_count, distinct_line_count, primary_line,
-                        mold_key, mold_code, casing_type, lines_json, cavities_json,
-                        source_workbook, updated_at
+                        today_qty_evidence, distinct_cavity_count, allocation_slot_count,
+                        distinct_line_count, primary_line, mold_key, mold_code, casing_type,
+                        lines_json, cavities_json, source_workbook, updated_at
                     ) VALUES (
                         :import_run_id, :plan_date, :sap_code, :item_description,
                         :day_plan_qty, :night_plan_qty, :total_plan_qty,
-                        :today_qty_evidence, :distinct_cavity_count,
-                        :allocation_slot_count, :distinct_line_count, :primary_line,
-                        :mold_key, :mold_code, :casing_type, CAST(:lines_json AS JSONB),
-                        CAST(:cavities_json AS JSONB), :source_workbook, CURRENT_TIMESTAMP
+                        :today_qty_evidence, :distinct_cavity_count, :allocation_slot_count,
+                        :distinct_line_count, :primary_line, :mold_key, :mold_code, :casing_type,
+                        CAST(:lines_json AS JSONB), CAST(:cavities_json AS JSONB),
+                        :source_workbook, CURRENT_TIMESTAMP
                     )
                     ON CONFLICT (import_run_id, plan_date, sap_code)
                     DO UPDATE SET
                         item_description=EXCLUDED.item_description,
-                        day_plan_qty=EXCLUDED.day_plan_qty,
-                        night_plan_qty=EXCLUDED.night_plan_qty,
+                        day_plan_qty=EXCLUDED.day_plan_qty, night_plan_qty=EXCLUDED.night_plan_qty,
                         total_plan_qty=EXCLUDED.total_plan_qty,
                         today_qty_evidence=EXCLUDED.today_qty_evidence,
                         distinct_cavity_count=EXCLUDED.distinct_cavity_count,
                         allocation_slot_count=EXCLUDED.allocation_slot_count,
-                        distinct_line_count=EXCLUDED.distinct_line_count,
-                        primary_line=EXCLUDED.primary_line,
-                        mold_key=EXCLUDED.mold_key,
-                        mold_code=EXCLUDED.mold_code,
-                        casing_type=EXCLUDED.casing_type,
-                        lines_json=EXCLUDED.lines_json,
-                        cavities_json=EXCLUDED.cavities_json,
-                        source_workbook=EXCLUDED.source_workbook,
+                        distinct_line_count=EXCLUDED.distinct_line_count, primary_line=EXCLUDED.primary_line,
+                        mold_key=EXCLUDED.mold_key, mold_code=EXCLUDED.mold_code,
+                        casing_type=EXCLUDED.casing_type, lines_json=EXCLUDED.lines_json,
+                        cavities_json=EXCLUDED.cavities_json, source_workbook=EXCLUDED.source_workbook,
                         updated_at=CURRENT_TIMESTAMP
                     """
                 ),
-                {
-                    "import_run_id": int(import_run_id),
-                    "plan_date": row_date,
-                    "sap_code": sap,
-                    "item_description": rec["description"],
-                    "day_plan_qty": day_qty,
-                    "night_plan_qty": night_qty,
-                    "total_plan_qty": day_qty + night_qty,
-                    "today_qty_evidence": sum(rec["today_rows"].values()),
-                    "distinct_cavity_count": len(cavities),
-                    "allocation_slot_count": len(rec["slots"]),
-                    "distinct_line_count": len(lines),
-                    "primary_line": primary_line,
-                    "mold_key": rec["mold_key"],
-                    "mold_code": (rec["mold_codes"].most_common(1)[0][0] if rec["mold_codes"] else ""),
-                    "casing_type": rec["casing_type"],
-                    "lines_json": json.dumps(lines),
-                    "cavities_json": json.dumps(cavities),
-                    "source_workbook": str(getattr(analysis, "workbook_name", "") or ""),
-                },
+                daily_params,
             )
 
         # BAND mold-code shift usage. One unique row per workbook/date/shift/mold
         # prevents duplicate master memory while retaining dated observations.
-        for (usage_date, usage_shift, mold_code), usage in mold_shift_group.items():
+        mold_usage_params = [
+            {
+                "run_id": int(import_run_id),
+                "plan_date": usage_date,
+                "shift_name": usage_shift,
+                "mold_code": mold_code,
+                "cavity_count": len(usage["cavities"]),
+                "planned_qty": int(usage["planned_qty"]),
+                "saps": json.dumps(sorted(usage["saps"])),
+                "source_workbook": str(getattr(analysis, "workbook_name", "") or ""),
+            }
+            for (usage_date, usage_shift, mold_code), usage in mold_shift_group.items()
+        ]
+        if mold_usage_params:
             session.execute(
                 text(
                     """
@@ -924,16 +933,7 @@ class FactoryResourceIntelligenceService:
                         updated_at=CURRENT_TIMESTAMP
                     """
                 ),
-                {
-                    "run_id": int(import_run_id),
-                    "plan_date": usage_date,
-                    "shift_name": usage_shift,
-                    "mold_code": mold_code,
-                    "cavity_count": len(usage["cavities"]),
-                    "planned_qty": int(usage["planned_qty"]),
-                    "saps": json.dumps(sorted(usage["saps"])),
-                    "source_workbook": str(getattr(analysis, "workbook_name", "") or ""),
-                },
+                mold_usage_params,
             )
 
         # Self-learning resource registry.
@@ -956,10 +956,18 @@ class FactoryResourceIntelligenceService:
                 import_mode=import_mode,
                 reference_molds=reference_molds,
             )
-            cls._sync_discovered_technical_resources(
-                session, lines=line_days, cavities=cavity_days
-            )
-            cls.refresh_resource_lifecycle(session, latest_plan_date=workbook_plan_date)
+            bulk_history = str(os.environ.get("MPPS_R741_BULK_HISTORY") or "").strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+            # Historical corpus is evidence, not operational authority. Avoid
+            # repeatedly scanning/updating the live technical registers and the
+            # entire lifecycle registry for every old workbook. Normal/live imports
+            # retain the original behavior.
+            if not bulk_history:
+                cls._sync_discovered_technical_resources(
+                    session, lines=line_days, cavities=cavity_days
+                )
+                cls.refresh_resource_lifecycle(session, latest_plan_date=workbook_plan_date)
         return {
             "fi_plan_allocations": inserted,
             "fi_daily_sap_plans": len(sap_group),
@@ -1000,9 +1008,22 @@ class FactoryResourceIntelligenceService:
                     {"sap_example": sap, "virtual_no_casing": casing == "No Casing"},
                 ))
 
+        registry_params = []
         for resource_type, resource_key, canonical_name, parent_key, metadata in resources:
             if not resource_key:
                 continue
+            registry_params.append({
+                "resource_type": resource_type,
+                "resource_key": resource_key,
+                "canonical_name": canonical_name,
+                "parent_key": parent_key,
+                "source_authority": "LIVE_OVEN" if _norm(import_mode) == "LIVE" else "HISTORICAL_OVEN",
+                "plan_date": plan_date,
+                "confidence_score": 0.52,
+                "metadata_json": json.dumps(metadata),
+                "last_import_run_id": int(import_run_id),
+            })
+        if registry_params:
             session.execute(
                 text(
                     """
@@ -1010,8 +1031,7 @@ class FactoryResourceIntelligenceService:
                         resource_type, resource_key, canonical_name, parent_key,
                         lifecycle_status, source_authority, first_seen_date,
                         last_seen_date, observed_workbooks, observed_days,
-                        confidence_score, metadata_json, last_import_run_id,
-                        updated_at
+                        confidence_score, metadata_json, last_import_run_id, updated_at
                     ) VALUES (
                         :resource_type, :resource_key, :canonical_name, :parent_key,
                         'LEARNING', :source_authority, :plan_date, :plan_date,
@@ -1020,14 +1040,10 @@ class FactoryResourceIntelligenceService:
                     )
                     ON CONFLICT (resource_type, resource_key)
                     DO UPDATE SET
-                        canonical_name = CASE
-                            WHEN BTRIM(mpps_fi_resource_registry.canonical_name) = ''
-                            THEN EXCLUDED.canonical_name
-                            ELSE mpps_fi_resource_registry.canonical_name END,
-                        parent_key = CASE
-                            WHEN BTRIM(mpps_fi_resource_registry.parent_key) = ''
-                            THEN EXCLUDED.parent_key
-                            ELSE mpps_fi_resource_registry.parent_key END,
+                        canonical_name = CASE WHEN BTRIM(mpps_fi_resource_registry.canonical_name) = ''
+                            THEN EXCLUDED.canonical_name ELSE mpps_fi_resource_registry.canonical_name END,
+                        parent_key = CASE WHEN BTRIM(mpps_fi_resource_registry.parent_key) = ''
+                            THEN EXCLUDED.parent_key ELSE mpps_fi_resource_registry.parent_key END,
                         last_seen_date = GREATEST(
                             COALESCE(mpps_fi_resource_registry.last_seen_date, EXCLUDED.last_seen_date),
                             EXCLUDED.last_seen_date
@@ -1041,36 +1057,19 @@ class FactoryResourceIntelligenceService:
                             THEN mpps_fi_resource_registry.observed_days + 1
                             ELSE mpps_fi_resource_registry.observed_days END,
                         lifecycle_status = CASE
-                            -- A future OVEN plan is stronger evidence than an old
-                            -- ML retirement state: learned resources auto-reactivate.
                             WHEN GREATEST(mpps_fi_resource_registry.observed_workbooks, 1) + 1 >= 3
-                            THEN 'ACTIVE'
-                            ELSE 'LEARNING' END,
-                        confidence_score = LEAST(
-                            0.99,
-                            0.45 + 0.07 * (
-                                CASE
-                                WHEN mpps_fi_resource_registry.last_import_run_id IS DISTINCT FROM EXCLUDED.last_import_run_id
-                                THEN mpps_fi_resource_registry.observed_workbooks + 1
-                                ELSE mpps_fi_resource_registry.observed_workbooks END
-                            )
-                        ),
+                            THEN 'ACTIVE' ELSE 'LEARNING' END,
+                        confidence_score = LEAST(0.99, 0.45 + 0.07 * (
+                            CASE WHEN mpps_fi_resource_registry.last_import_run_id IS DISTINCT FROM EXCLUDED.last_import_run_id
+                            THEN mpps_fi_resource_registry.observed_workbooks + 1
+                            ELSE mpps_fi_resource_registry.observed_workbooks END
+                        )),
                         metadata_json = mpps_fi_resource_registry.metadata_json || EXCLUDED.metadata_json,
                         last_import_run_id = EXCLUDED.last_import_run_id,
                         updated_at = CURRENT_TIMESTAMP
                     """
                 ),
-                {
-                    "resource_type": resource_type,
-                    "resource_key": resource_key,
-                    "canonical_name": canonical_name,
-                    "parent_key": parent_key,
-                    "source_authority": "LIVE_OVEN" if _norm(import_mode) == "LIVE" else "HISTORICAL_OVEN",
-                    "plan_date": plan_date,
-                    "confidence_score": 0.52,
-                    "metadata_json": json.dumps(metadata),
-                    "last_import_run_id": int(import_run_id),
-                },
+                registry_params,
             )
 
     @classmethod

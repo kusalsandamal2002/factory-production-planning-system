@@ -1,9 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import date
 from typing import Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QPageLayout, QPageSize, QTextDocument
 from PySide6.QtPrintSupport import QPrintDialog, QPrintPreviewDialog, QPrinter
 from PySide6.QtWidgets import (
@@ -37,6 +37,7 @@ from app.services.shift_daily_report_service import (
     build_shift_report_html,
 )
 from app.services.ai_planning_service import AIPlanningService
+from app.core.task_manager import TaskManager
 
 
 
@@ -1040,20 +1041,26 @@ class _ShiftReportEditor(QWidget):
 class ShiftPlanPage(_OperationsPage):
     title_text = "Day / Night Shift Control"
     subtitle_text = (
-        "Live OVEN allocations plus Excel-format DAY/NIGHT production summary reports. "
-        "Targets are calculated from the imported oven plan; actuals, quality and loss data are saved by date and shift."
+        "Saved production-plan DAY/NIGHT allocations are the operational authority. "
+        "Imported OVEN allocations remain available only as historical/fallback evidence; "
+        "actuals, quality and loss data are saved by date and shift."
     )
+    TASK_PREFIX = "shift-plan-r5:"
 
     def __init__(self, current_user=None, *args, **kwargs):
         super().__init__(current_user, *args, **kwargs)
-        ShiftDailyReportService.ensure_schema()
+        self.tasks = TaskManager.instance()
+        self._loaded_once = False
+        self._load_generation = 0
 
         filter_row = QHBoxLayout()
         filter_row.addWidget(QLabel("Plan Date"))
         self.date_filter = QComboBox()
-        self.date_filter.currentIndexChanged.connect(self._load_selected)
+        self.date_filter.currentIndexChanged.connect(self._load_selected_async)
         filter_row.addWidget(self.date_filter)
-        filter_row.addStretch()
+        self.status_label = QLabel("Preparing shift plan in background...")
+        self.status_label.setStyleSheet("color:#64748b;font-weight:750;")
+        filter_row.addWidget(self.status_label, 1)
         self.root.addLayout(filter_row)
 
         self.tabs = QTabWidget()
@@ -1082,99 +1089,159 @@ class ShiftPlanPage(_OperationsPage):
         self.tabs.addTab(self.night_report, "NIGHT Report / Print")
         self.root.addWidget(self.tabs, 1)
 
-    def refresh(self) -> None:
-        try:
-            dates = self._query(
-                """
-                SELECT DISTINCT plan_date
-                FROM mpps_oven_plan
-                WHERE plan_date IS NOT NULL
-                ORDER BY plan_date DESC
-                LIMIT 180
-                """
-            )
-            selected = self.date_filter.currentText()
-            self.date_filter.blockSignals(True)
-            self.date_filter.clear()
-            self.date_filter.addItems([str(r["plan_date"]) for r in dates])
-            if selected:
-                index = self.date_filter.findText(selected)
-                if index >= 0:
-                    self.date_filter.setCurrentIndex(index)
-            self.date_filter.blockSignals(False)
-            self._load_selected()
-        except Exception as exc:
-            QMessageBox.critical(self, "Shift Plan Data", str(exc))
+        QTimer.singleShot(40, self.refresh)
 
-    def _load_selected(self) -> None:
+    def showEvent(self, event) -> None:
+        QWidget.showEvent(self, event)
+        if not self._loaded_once:
+            QTimer.singleShot(0, self.refresh)
+
+    def refresh(self) -> None:
+        self.status_label.setText("Loading shift dates in background...")
+
+        def load_dates_job():
+            ShiftDailyReportService.ensure_schema()
+            return ShiftDailyReportService.list_plan_dates(180)
+
+        self.tasks.submit(
+            self.TASK_PREFIX + "dates",
+            load_dates_job,
+            on_result=self._dates_loaded,
+            on_error=self._async_error,
+            replace=True,
+        )
+
+    def _dates_loaded(self, dates: list[str]) -> None:
         selected = self.date_filter.currentText()
+        self.date_filter.blockSignals(True)
+        self.date_filter.clear()
+        self.date_filter.addItems(list(dates or []))
+        if selected:
+            index = self.date_filter.findText(selected)
+            if index >= 0:
+                self.date_filter.setCurrentIndex(index)
+        self.date_filter.blockSignals(False)
+        self._loaded_once = True
+        self._load_selected_async()
+
+    def _load_selected_async(self, *_args) -> None:
+        selected = self.date_filter.currentText().strip()
         if not selected:
             self.table.setRowCount(0)
+            self.status_label.setText("No shift-plan date is available.")
             return
-        try:
-            summary = self._query(
-                """
-                SELECT
-                    COALESCE(NULLIF(shift_name, ''), 'UNSPECIFIED') AS shift_name,
-                    COUNT(*) AS allocation_rows,
-                    SUM(planned_qty) AS planned_qty,
-                    SUM(planned_weight_kg) AS planned_weight_kg,
-                    COUNT(DISTINCT oven_code) AS ovens
-                FROM mpps_oven_plan
-                WHERE plan_date = CAST(:plan_date AS DATE)
-                GROUP BY COALESCE(NULLIF(shift_name, ''), 'UNSPECIFIED')
-                ORDER BY shift_name
-                """,
-                {"plan_date": selected},
+
+        self._load_generation += 1
+        generation = self._load_generation
+        self.status_label.setText(f"Loading {selected} shift plan in background...")
+
+        def load_selected_job():
+            live = ShiftDailyReportService.load_live_plan(selected)
+            live.update(
+                {
+                    "DAY": {
+                        "plan_date": selected,
+                        "targets": ShiftDailyReportService.load_targets(
+                            selected,
+                            "DAY",
+                        ),
+                        "report": ShiftDailyReportService.load_report(
+                            selected,
+                            "DAY",
+                        ),
+                    },
+                    "NIGHT": {
+                        "plan_date": selected,
+                        "targets": ShiftDailyReportService.load_targets(
+                            selected,
+                            "NIGHT",
+                        ),
+                        "report": ShiftDailyReportService.load_report(
+                            selected,
+                            "NIGHT",
+                        ),
+                    },
+                }
             )
-            while self.metrics.count():
-                item = self.metrics.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
-            for index, row in enumerate(summary):
-                self.metrics.addWidget(
-                    self._metric(
-                        f"{row['shift_name']} — {row['ovens']} ovens / {row['allocation_rows']} rows",
-                        f"{int(row['planned_qty'] or 0):,} pcs | {float(row['planned_weight_kg'] or 0):,.2f} kg",
-                    ),
-                    0,
-                    index,
-                )
-            rows = self._query(
-                """
-                SELECT
-                    shift_name,
-                    oven_code,
-                    material_code,
-                    item_description,
-                    planned_qty,
-                    planned_weight_kg,
-                    CONCAT(COALESCE(source_workbook, ''), ' / ', COALESCE(source_sheet, '')) AS source
-                FROM mpps_oven_plan
-                WHERE plan_date = CAST(:plan_date AS DATE)
-                ORDER BY shift_name, oven_code, material_code
-                """,
-                {"plan_date": selected},
+            return live
+
+        self.tasks.submit(
+            self.TASK_PREFIX + "selected",
+            load_selected_job,
+            on_result=lambda payload, gen=generation: self._selected_loaded(gen, payload),
+            on_error=self._async_error,
+            replace=True,
+        )
+
+    def _selected_loaded(self, generation: int, payload: dict[str, Any]) -> None:
+        if generation != self._load_generation:
+            return
+
+        summary = list(payload.get("summary") or [])
+        while self.metrics.count():
+            item = self.metrics.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for index, row in enumerate(summary):
+            self.metrics.addWidget(
+                self._metric(
+                    f"{row['shift_name']} — {row['ovens']} ovens / {row['allocation_rows']} rows",
+                    f"{int(row['planned_qty'] or 0):,} pcs | {float(row['planned_weight_kg'] or 0):,.2f} kg",
+                ),
+                0,
+                index,
             )
-            self._fill(
-                self.table,
+
+        rows = list(payload.get("rows") or [])
+        self._fill(
+            self.table,
+            [
                 [
-                    [
-                        r["shift_name"],
-                        r["oven_code"],
-                        r["material_code"],
-                        r["item_description"],
-                        r["planned_qty"],
-                        r["planned_weight_kg"],
-                        r["source"],
-                    ]
-                    for r in rows
-                ],
-            )
-            self.day_report.load(selected)
-            self.night_report.load(selected)
-        except Exception as exc:
-            QMessageBox.critical(self, "Shift Plan Data", str(exc))
+                    row.get("shift_name"),
+                    row.get("oven_code"),
+                    row.get("material_code"),
+                    row.get("item_description"),
+                    row.get("planned_qty"),
+                    row.get("planned_weight_kg"),
+                    row.get("source"),
+                ]
+                for row in rows
+            ],
+        )
+
+        self._apply_report_payload(self.day_report, payload.get("DAY") or {})
+        self._apply_report_payload(self.night_report, payload.get("NIGHT") or {})
+        authority = str(payload.get("authority") or "UNKNOWN")
+        source_label = (
+            "saved production plan"
+            if authority == "SAVED_R6_CAVITY_PLAN"
+            else "imported OVEN fallback"
+        )
+        self.status_label.setText(
+            f"{payload.get('plan_date') or '—'} • {len(rows):,} allocation row(s) • {source_label}"
+        )
+
+    @staticmethod
+    def _apply_report_payload(editor: _ShiftReportEditor, payload: dict[str, Any]) -> None:
+        editor.report_date = str(payload.get("plan_date") or payload.get("report", {}).get("report_date") or editor.report_date or "")
+        if not editor.report_date:
+            return
+        editor.date_label.setText(f"Date: {editor.report_date}")
+        editor._loading = True
+        try:
+            editor.target_summary = dict(payload.get("targets") or {})
+            editor._load_payload(dict(payload.get("report") or {}))
+            editor._load_targets()
+            editor._load_loss_reason_labels()
+            editor._update_reconciliation()
+            editor._refresh_calculated_fields()
+        finally:
+            editor._loading = False
+
+    def _async_error(self, message: str) -> None:
+        self.status_label.setText(
+            "Shift plan load failed: " + (message.splitlines()[-1] if message else "unknown error")
+        )
 
 
 class OperationsReportsPage(_OperationsPage):
@@ -1352,3 +1419,28 @@ def _display(value: Any) -> str:
             return f"{int(value):,}"
         return f"{value:,.3f}".rstrip("0").rstrip(".")
     return str(value)
+
+# MPPS V32 OPERATIONS LOAD ONCE
+from PySide6.QtCore import QTimer as _V32OpsTimer
+
+
+def _v32_operations_show_event(self, event):
+    QWidget.showEvent(self, event)
+
+    if getattr(
+        self,
+        "_mpps_v32_loaded_once",
+        False,
+    ):
+        return
+
+    self._mpps_v32_loaded_once = True
+
+    # Let the page shell paint before the first refresh.
+    _V32OpsTimer.singleShot(
+        30,
+        self.refresh,
+    )
+
+
+_OperationsPage.showEvent = _v32_operations_show_event

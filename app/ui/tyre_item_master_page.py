@@ -1,4 +1,4 @@
-
+﻿
 from __future__ import annotations
 
 import re
@@ -457,12 +457,23 @@ class TyreItemMasterPage(QWidget):
         self.mold_casing_rules_page = self._build_mold_casing_rules_page()
         self.stack.addWidget(self.mold_casing_rules_page)
         self.stack.addWidget(self._build_line_process_mapping_page())
-        self.smds_master_page = SMDSMasterPage(on_back=self._back_to_overview)
-        self.stack.addWidget(self.smds_master_page)
+        # V19 performance: heavy SMDS child workspaces are lazy.
+        # Do not construct/query them while the overview is opening.
+        self.smds_master_page = None
+        self._smds_master_placeholder = QWidget()
+        self._smds_master_placeholder.setProperty(
+            "page_key",
+            "lazy_smds_master",
+        )
+        self.stack.addWidget(self._smds_master_placeholder)
 
-
-        self.smds_mold_casing_page = SmdsMoldCasingPage(on_back=self._back_to_overview)
-        self.stack.addWidget(self.smds_mold_casing_page)
+        self.smds_mold_casing_page = None
+        self._smds_mold_casing_placeholder = QWidget()
+        self._smds_mold_casing_placeholder.setProperty(
+            "page_key",
+            "lazy_smds_mold_casing",
+        )
+        self.stack.addWidget(self._smds_mold_casing_placeholder)
 
         root.addWidget(self.stack, 1)
 
@@ -494,7 +505,7 @@ class TyreItemMasterPage(QWidget):
         text_area = QVBoxLayout()
         text_area.setSpacing(8)
 
-        breadcrumb = QLabel("Master Data  /  Tyre Item Master")
+        breadcrumb = QLabel("Data / Tyre Item Master")
         breadcrumb.setObjectName("Breadcrumb")
 
         title = QLabel("Tyre Item Master")
@@ -693,7 +704,7 @@ class TyreItemMasterPage(QWidget):
         text_area = QVBoxLayout()
         text_area.setSpacing(8)
 
-        breadcrumb = QLabel("Master Data  /  Tyre Item Master  /  Item Data")
+        breadcrumb = QLabel("Data / Tyre Item Master  /  Item Data")
         breadcrumb.setObjectName("Breadcrumb")
 
         title = QLabel("Tyre Item Data")
@@ -807,7 +818,7 @@ class TyreItemMasterPage(QWidget):
         text_area = QVBoxLayout()
         text_area.setSpacing(8)
 
-        breadcrumb = QLabel("Master Data  /  Tyre Item Master  /  Tyre Size")
+        breadcrumb = QLabel("Data / Tyre Item Master  /  Tyre Size")
         breadcrumb.setObjectName("Breadcrumb")
 
         title = QLabel("Tyre Size Data")
@@ -960,7 +971,7 @@ class TyreItemMasterPage(QWidget):
         text_area = QVBoxLayout()
         text_area.setSpacing(8)
 
-        breadcrumb = QLabel("Master Data  /  Tyre Item Master  /  Production Curing Time")
+        breadcrumb = QLabel("Data / Tyre Item Master  /  Production Curing Time")
         breadcrumb.setObjectName("Breadcrumb")
 
         title = QLabel("Production / Curing Time")
@@ -1135,7 +1146,7 @@ class TyreItemMasterPage(QWidget):
         text_area = QVBoxLayout()
         text_area.setSpacing(8)
 
-        breadcrumb = QLabel("Master Data  /  Tyre Item Master  /  Tyre Group Key Mapping")
+        breadcrumb = QLabel("Data / Tyre Item Master  /  Tyre Group Key Mapping")
         breadcrumb.setObjectName("Breadcrumb")
 
         title = QLabel("Tyre Group Key Mapping")
@@ -1440,7 +1451,7 @@ class TyreItemMasterPage(QWidget):
         text_area = QVBoxLayout()
         text_area.setSpacing(8)
 
-        breadcrumb = QLabel("Master Data  /  Tyre Item Master  /  Line & Process Mapping")
+        breadcrumb = QLabel("Data / Tyre Item Master  /  Line & Process Mapping")
         breadcrumb.setObjectName("Breadcrumb")
 
         title = QLabel("Line Mapping")
@@ -1871,7 +1882,7 @@ class TyreItemMasterPage(QWidget):
         text_area = QVBoxLayout()
         text_area.setSpacing(8)
 
-        breadcrumb = QLabel("Master Data  /  Tyre Item Master  /  Mold & Casing Rules")
+        breadcrumb = QLabel("Data / Tyre Item Master  /  Mold & Casing Rules")
         breadcrumb.setObjectName("Breadcrumb")
 
         title = QLabel("Mold & Casing Rules")
@@ -2710,7 +2721,7 @@ def _v7_line_process_mapping_header(self) -> QHBoxLayout:
     text_area = QVBoxLayout()
     text_area.setSpacing(8)
 
-    breadcrumb = QLabel("Master Data  /  Tyre Item Master  /  Line Mapping")
+    breadcrumb = QLabel("Data / Tyre Item Master  /  Line Mapping")
     breadcrumb.setObjectName("Breadcrumb")
 
     title = QLabel("Line Mapping")
@@ -3839,7 +3850,7 @@ def _smds_v15_weight_product_group_header(self) -> QHBoxLayout:
     text_area = QVBoxLayout()
     text_area.setSpacing(8)
 
-    breadcrumb = QLabel("Master Data  /  Tyre Item Master  /  Weight & Product Group")
+    breadcrumb = QLabel("Data / Tyre Item Master  /  Weight & Product Group")
     breadcrumb.setObjectName("Breadcrumb")
 
     title = QLabel("Weight & Product Group")
@@ -4338,3 +4349,1994 @@ except NameError:
     pass
 # --- SMDS V15 WEIGHT PRODUCT GROUP END ---
 
+
+
+# MPPS V19 LAZY TYRE ITEM MASTER CHILD WORKSPACES
+def _mpps_v19_replace_lazy_page(self, placeholder_attr, page_attr, factory):
+    page = getattr(self, page_attr, None)
+    created_now = False
+
+    if page is None:
+        placeholder = getattr(self, placeholder_attr, None)
+        target_index = (
+            self.stack.indexOf(placeholder)
+            if placeholder is not None
+            else -1
+        )
+
+        page = factory()
+        setattr(self, page_attr, page)
+
+        if placeholder is not None and target_index >= 0:
+            self.stack.removeWidget(placeholder)
+            placeholder.deleteLater()
+            self.stack.insertWidget(target_index, page)
+        else:
+            self.stack.addWidget(page)
+
+        created_now = True
+
+    self.stack.setCurrentWidget(page)
+    return page, created_now
+
+
+def _mpps_v19_open_smds_master(self):
+    page, created_now = _mpps_v19_replace_lazy_page(
+        self,
+        "_smds_master_placeholder",
+        "smds_master_page",
+        lambda: SMDSMasterPage(
+            on_back=self._back_to_overview
+        ),
+    )
+
+    # Constructor performs its initial load. Only explicitly refresh
+    # when revisiting an already-created child page.
+    if not created_now:
+        refresh = getattr(page, "refresh", None)
+        if callable(refresh):
+            refresh()
+
+
+def _mpps_v19_open_mold_casing_rules(self):
+    page, created_now = _mpps_v19_replace_lazy_page(
+        self,
+        "_smds_mold_casing_placeholder",
+        "smds_mold_casing_page",
+        lambda: SmdsMoldCasingPage(
+            on_back=self._back_to_overview
+        ),
+    )
+
+    if not created_now:
+        refresh = getattr(page, "refresh", None)
+        if callable(refresh):
+            refresh()
+
+
+# Final aliases intentionally come after legacy V11/V15 aliases.
+TyreItemMasterPage._open_smds_master = _mpps_v19_open_smds_master
+TyreItemMasterPage._open_mold_casing_rules = _mpps_v19_open_mold_casing_rules
+
+try:
+    TireItemMasterPage._open_smds_master = _mpps_v19_open_smds_master
+    TireItemMasterPage._open_mold_casing_rules = _mpps_v19_open_mold_casing_rules
+except NameError:
+    pass
+
+# MPPS V30 TYRE ITEM MASTER PRO NONBLOCKING WORKSPACE
+from PySide6.QtCore import QThread as _V30QThread, Signal as _V30Signal, QTimer as _V30QTimer
+from PySide6.QtWidgets import (
+    QAbstractItemView as _V30AbstractItemView,
+    QButtonGroup as _V30ButtonGroup,
+    QComboBox as _V30ComboBox,
+)
+from app.database import get_session as _v30_get_session
+from app.services.tyre_master_intelligence_service import (
+    TyreMasterIntelligenceService as _V30TyreIntelligence,
+)
+
+
+_TyreItemMasterLegacyV30 = TyreItemMasterPage
+
+
+def _v30_smds_columns():
+    with engine.connect() as conn:
+        return [
+            str(row[0])
+            for row in conn.execute(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'smds'
+                    ORDER BY ordinal_position
+                    """
+                )
+            ).all()
+        ]
+
+
+def _v30_pick(columns, *names):
+    pool = set(columns)
+    return next((name for name in names if name in pool), None)
+
+
+def _v30_load_line_rows(search_text=""):
+    columns = _v30_smds_columns()
+    if not columns:
+        return []
+
+    sap = _v30_pick(columns, "sap_code", "sap", "sap_no")
+    desc = _v30_pick(columns, "material_description", "description")
+    line = _v30_pick(columns, "line", "production_line")
+    key = _v30_pick(columns, "key_code")
+    casing = _v30_pick(columns, "casing_type")
+    curing = _v30_pick(columns, "normal_curing_minutes", "curing_cycle")
+    day = _v30_pick(columns, "day_plan")
+    night = _v30_pick(columns, "night_plan")
+    total = _v30_pick(columns, "total_plan")
+
+    def expr(column, alias, default="''"):
+        return f"{column} AS {alias}" if column else f"{default} AS {alias}"
+
+    selected = [
+        expr(sap, "sap_code"),
+        expr(desc, "description"),
+        expr(line, "production_line"),
+        expr(key, "key_code"),
+        expr(casing, "casing_type"),
+        expr(curing, "curing"),
+        expr(day, "day_plan", "0"),
+        expr(night, "night_plan", "0"),
+        expr(total, "total_plan", "0"),
+    ]
+
+    params = {}
+    where = ""
+    search = str(search_text or "").strip()
+    searchable = [value for value in (sap, desc, line, key, casing) if value]
+
+    if search and searchable:
+        where = "WHERE " + " OR ".join(
+            f"CAST({column} AS TEXT) ILIKE :search"
+            for column in searchable
+        )
+        params["search"] = f"%{search}%"
+
+    order = sap or desc or columns[0]
+    query = f"""
+        SELECT {', '.join(selected)}
+        FROM smds
+        {where}
+        ORDER BY {order}
+        LIMIT 1500
+    """
+
+    with engine.connect() as conn:
+        return [
+            dict(row)
+            for row in conn.execute(text(query), params).mappings().all()
+        ]
+
+
+def _v30_load_mold_rows(search_text=""):
+    search = str(search_text or "").strip()
+    params = {}
+    where = ""
+
+    if search:
+        where = """
+            WHERE CAST(sap_code AS TEXT) ILIKE :search
+               OR COALESCE(material_description, '') ILIKE :search
+               OR COALESCE(key_code, '') ILIKE :search
+               OR COALESCE(casing_type, '') ILIKE :search
+        """
+        params["search"] = f"%{search}%"
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                f"""
+                SELECT id,
+                       COALESCE(sap_code, '') AS sap_code,
+                       COALESCE(material_description, '') AS description,
+                       COALESCE(key_code, '-') AS mold_key_code,
+                       COALESCE(casing_type, '-') AS casing_type
+                FROM smds
+                {where}
+                ORDER BY sap_code
+                LIMIT 1500
+                """
+            ),
+            params,
+        ).mappings().all()
+        return [dict(row) for row in rows]
+
+
+def _v30_load_group_rows(search_text=""):
+    search = str(search_text or "").strip()
+    params = {}
+    where = ""
+
+    if search:
+        where = """
+            WHERE g.group_key ILIKE :search
+               OR g.tyre_size ILIKE :search
+               OR COALESCE(g.pattern, '') ILIKE :search
+               OR COALESCE(g.layer, '') ILIKE :search
+               OR COALESCE(g.color, '') ILIKE :search
+        """
+        params["search"] = f"%{search}%"
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                f"""
+                SELECT g.id,
+                       g.group_key,
+                       g.tyre_size,
+                       COALESCE(g.pattern, '-') AS tread,
+                       COALESCE(g.layer, '-') AS layer,
+                       COALESCE(g.color, '-') AS color,
+                       COUNT(i.sap_code) AS sap_count
+                FROM tyre_process_groups g
+                LEFT JOIN tyre_process_group_items i
+                  ON i.group_id = g.id
+                {where}
+                GROUP BY g.id, g.group_key, g.tyre_size,
+                         g.pattern, g.layer, g.color
+                ORDER BY COUNT(i.sap_code) DESC, g.group_key
+                LIMIT 1200
+                """
+            ),
+            params,
+        ).mappings().all()
+        return [dict(row) for row in rows]
+
+
+def _v30_load_smds_rows(search_text=""):
+    search = str(search_text or "").strip()
+    params = {}
+    where = ""
+
+    if search:
+        where = """
+            WHERE CAST(sap_code AS TEXT) ILIKE :search
+               OR COALESCE(material_description, '') ILIKE :search
+               OR COALESCE(key_code, '') ILIKE :search
+               OR COALESCE(casing_type, '') ILIKE :search
+        """
+        params["search"] = f"%{search}%"
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                f"""
+                SELECT *
+                FROM smds
+                {where}
+                ORDER BY sap_code
+                LIMIT 1000
+                """
+            ),
+            params,
+        ).mappings().all()
+        return [dict(row) for row in rows]
+
+
+class _V30DataWorker(_V30QThread):
+    completed = _V30Signal(str, object)
+    failed = _V30Signal(str, str)
+
+    def __init__(self, action, search_text=""):
+        super().__init__()
+        self.action = str(action)
+        self.search_text = str(search_text or "")
+
+    def run(self):
+        try:
+            if self.action in {"items", "size", "curing"}:
+                rows = TyreItemRepository().list_items(
+                    search_text=self.search_text
+                )
+            elif self.action == "line":
+                rows = _v30_load_line_rows(self.search_text)
+            elif self.action == "mold":
+                rows = _v30_load_mold_rows(self.search_text)
+            elif self.action == "groups":
+                rows = _v30_load_group_rows(self.search_text)
+            elif self.action == "smds":
+                rows = _v30_load_smds_rows(self.search_text)
+            else:
+                rows = []
+
+            self.completed.emit(self.action, rows)
+        except Exception as exc:
+            self.failed.emit(self.action, str(exc))
+
+
+class _V30AIWorker(_V30QThread):
+    completed = _V30Signal(object)
+    failed = _V30Signal(str)
+
+    def run(self):
+        try:
+            with _v30_get_session() as session:
+                result = _V30TyreIntelligence.dashboard(session)
+            self.completed.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class _V30TrainAllWorker(_V30QThread):
+    completed = _V30Signal(object)
+    failed = _V30Signal(str)
+
+    def run(self):
+        try:
+            with _v30_get_session() as session:
+                result = _V30TyreIntelligence.request_train_all(session)
+                session.commit()
+            self.completed.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class TyreItemMasterPage(QWidget):
+    """Professional non-blocking Tyre Item Master workspace.
+
+    V30 intentionally does not instantiate the old all-in-one page in the
+    constructor. Data is fetched in background workers and rendered in chunks.
+    The original full SMDS editor is available only when explicitly requested.
+    """
+
+    TABS = (
+        ("Tyre Items", "items"),
+        ("Tyre Size", "size"),
+        ("Process & Curing", "curing"),
+        ("Line Mapping", "line"),
+        ("Mold & Casing", "mold"),
+        ("Product Groups", "groups"),
+        ("SMDS", "smds"),
+        ("AI / ML", "ai"),
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self._active_key = "items"
+        self._tab_buttons = {}
+        self._pages = {}
+        self._tables = {}
+        self._searches = {}
+        self._status_labels = {}
+        self._rows = {}
+        self._render_tokens = {}
+        self._data_worker = None
+        self._ai_worker = None
+        self._train_worker = None
+        self._ai_dashboard = {}
+        self._legacy_smds_dialog = None
+        self._search_timer = _V30QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(300)
+        self._search_timer.timeout.connect(self._reload_active)
+
+        self._build_ui()
+
+        # Event-loop handoff: shell paints first, data starts asynchronously.
+        _V30QTimer.singleShot(
+            0,
+            lambda: self._activate_tab("Tyre Items", "items"),
+        )
+        _V30QTimer.singleShot(
+            450,
+            self._refresh_ai_background,
+        )
+
+    def _build_ui(self):
+        self.setStyleSheet(
+            """
+            QWidget { font-family: "Segoe UI"; }
+
+            QFrame#V30Header,
+            QFrame#V30Panel,
+            QFrame#V30Metric {
+                background:#ffffff;
+                border:1px solid #dbe4ef;
+                border-radius:16px;
+            }
+
+            QLabel#V30Breadcrumb {
+                color:#2563eb;
+                font-size:9pt;
+                font-weight:950;
+            }
+
+            QLabel#V30Title {
+                color:#0f172a;
+                font-size:24pt;
+                font-weight:950;
+            }
+
+            QLabel#V30Subtitle {
+                color:#64748b;
+                font-size:9pt;
+                font-weight:650;
+            }
+
+            QLabel#V30Health {
+                background:#ecfdf5;
+                color:#047857;
+                border:1px solid #a7f3d0;
+                border-radius:12px;
+                padding:8px 12px;
+                font-size:8.5pt;
+                font-weight:950;
+            }
+
+            QPushButton#V30Tab {
+                background:transparent;
+                color:#334155;
+                border:none;
+                border-radius:0px;
+                padding:10px 14px;
+                font-size:9pt;
+                font-weight:900;
+            }
+
+            QPushButton#V30Tab:hover {
+                background:#eff6ff;
+                color:#1d4ed8;
+            }
+
+            QPushButton#V30Tab:checked {
+                background:#2563eb;
+                color:#ffffff;
+            }
+
+            QPushButton#V30Primary {
+                background:#2563eb;
+                color:#ffffff;
+                border:none;
+                border-radius:9px;
+                padding:9px 15px;
+                font-weight:950;
+            }
+
+            QPushButton#V30Secondary {
+                background:#e2e8f0;
+                color:#0f172a;
+                border:none;
+                border-radius:9px;
+                padding:9px 15px;
+                font-weight:900;
+            }
+
+            QLineEdit {
+                background:#ffffff;
+                border:1px solid #cbd5e1;
+                border-radius:9px;
+                padding:8px 11px;
+                color:#0f172a;
+            }
+
+            QLineEdit:focus {
+                border:1px solid #2563eb;
+            }
+
+            QTableWidget {
+                background:#ffffff;
+                alternate-background-color:#f8fafc;
+                border:1px solid #dbe4ef;
+                gridline-color:#e2e8f0;
+                selection-background-color:#dbeafe;
+                selection-color:#0f172a;
+            }
+
+            QTableWidget::item {
+                padding:6px 8px;
+            }
+
+            QHeaderView::section {
+                background:#edf3f9;
+                color:#1e293b;
+                border:none;
+                border-right:1px solid #dbe4ef;
+                border-bottom:1px solid #dbe4ef;
+                padding:9px 8px;
+                font-weight:950;
+            }
+
+            QLabel#V30MetricValue {
+                color:#0f172a;
+                font-size:19pt;
+                font-weight:950;
+            }
+
+            QLabel#V30MetricLabel {
+                color:#64748b;
+                font-size:8.3pt;
+                font-weight:850;
+            }
+
+            QLabel#V30Notice {
+                background:#f8fafc;
+                color:#475569;
+                border:1px solid #e2e8f0;
+                border-radius:9px;
+                padding:8px 10px;
+                font-size:8.5pt;
+                font-weight:700;
+            }
+            """
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(9)
+
+        header = QFrame()
+        header.setObjectName("V30Header")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(22, 14, 20, 14)
+        header_layout.setSpacing(14)
+
+        title_box = QVBoxLayout()
+        title_box.setSpacing(3)
+
+        breadcrumb = QLabel("Data / Tyre Item Master")
+        breadcrumb.setObjectName("V30Breadcrumb")
+
+        title = QLabel("Tyre Item Master")
+        title.setObjectName("V30Title")
+
+        subtitle = QLabel(
+            "Central tyre master, process rules, production compatibility "
+            "and training-ready AI / ML intelligence."
+        )
+        subtitle.setObjectName("V30Subtitle")
+
+        title_box.addWidget(breadcrumb)
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
+
+        header_layout.addLayout(title_box, 1)
+
+        self._health_badge = QLabel("MASTER HEALTH  --")
+        self._health_badge.setObjectName("V30Health")
+        self._health_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._health_badge.setMinimumWidth(155)
+        header_layout.addWidget(self._health_badge)
+
+        root.addWidget(header)
+
+        tab_layout = QHBoxLayout()
+        tab_layout.setSpacing(0)
+
+        self._tab_group = _V30ButtonGroup(self)
+        self._tab_group.setExclusive(True)
+
+        for label, key in self.TABS:
+            button = QPushButton(label)
+            button.setObjectName("V30Tab")
+            button.setCheckable(True)
+            button.setMinimumHeight(38)
+            button.clicked.connect(
+                lambda checked=False, tab_label=label, tab_key=key:
+                    self._activate_tab(tab_label, tab_key)
+            )
+            self._tab_group.addButton(button)
+            self._tab_buttons[label] = button
+            tab_layout.addWidget(button)
+
+        tab_layout.addStretch()
+        root.addLayout(tab_layout)
+
+        self._stack = QStackedWidget()
+
+        self._pages["items"] = self._build_data_page(
+            "items",
+            "Tyre Items",
+            "SAP code and tyre description master.",
+            ["SAP Code", "Description", "Tyre Size", "Status"],
+            add_actions=True,
+        )
+        self._pages["size"] = self._build_data_page(
+            "size",
+            "Tyre Size",
+            "Tyre size derived from the central item description.",
+            ["SAP Code", "Description", "Tyre Size", "Status"],
+            add_actions=True,
+        )
+        self._pages["curing"] = self._build_data_page(
+            "curing",
+            "Process & Curing",
+            "Curing and handling master values used by production planning.",
+            [
+                "SAP Code",
+                "Description",
+                "Normal Curing",
+                "Short Cycle",
+                "Handling",
+                "Status",
+            ],
+            add_actions=True,
+        )
+        self._pages["line"] = self._build_data_page(
+            "line",
+            "Line Mapping",
+            "Production line, key code, casing and daily planning compatibility from SMDS.",
+            [
+                "SAP Code",
+                "Description",
+                "Line",
+                "Key Code",
+                "Casing",
+                "Curing",
+                "Day",
+                "Night",
+                "Total",
+            ],
+        )
+        self._pages["mold"] = self._build_data_page(
+            "mold",
+            "Mold & Casing",
+            "SMDS mold key code and casing-type control.",
+            ["SAP Code", "Description", "Mold Key Code", "Casing Type"],
+            mold_actions=True,
+        )
+        self._pages["groups"] = self._build_data_page(
+            "groups",
+            "Product Groups",
+            "Tyre process-group mapping and linked SAP coverage.",
+            ["Group Key", "Tyre Size", "Tread", "Layer", "Color", "SAP Count"],
+        )
+        self._pages["smds"] = self._build_data_page(
+            "smds",
+            "SMDS",
+            "Central SMDS master preview. Full editor is loaded only on demand.",
+            [
+                "SAP Code",
+                "Description",
+                "Key Code",
+                "Casing",
+                "Curing",
+                "Day",
+                "Night",
+                "Total",
+                "Weight",
+            ],
+            smds_actions=True,
+        )
+        self._pages["ai"] = self._build_ai_page()
+
+        for _, key in self.TABS:
+            self._stack.addWidget(self._pages[key])
+
+        root.addWidget(self._stack, 1)
+
+    def _build_data_page(
+        self,
+        key,
+        title_text,
+        subtitle_text,
+        headers,
+        add_actions=False,
+        mold_actions=False,
+        smds_actions=False,
+    ):
+        page = QFrame()
+        page.setObjectName("V30Panel")
+
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(9)
+
+        top = QHBoxLayout()
+        text_box = QVBoxLayout()
+        text_box.setSpacing(2)
+
+        title = QLabel(title_text)
+        title.setStyleSheet(
+            "font-size:15pt;font-weight:950;color:#0f172a;"
+        )
+        subtitle = QLabel(subtitle_text)
+        subtitle.setObjectName("V30Subtitle")
+        subtitle.setWordWrap(True)
+
+        text_box.addWidget(title)
+        text_box.addWidget(subtitle)
+        top.addLayout(text_box, 1)
+
+        status = QLabel("Ready")
+        status.setObjectName("V30Notice")
+        self._status_labels[key] = status
+        top.addWidget(status)
+
+        search = QLineEdit()
+        search.setPlaceholderText(f"Search {title_text.lower()}...")
+        search.setMinimumWidth(330)
+        search.textChanged.connect(
+            lambda _value, tab_key=key: self._queue_search(tab_key)
+        )
+        self._searches[key] = search
+        top.addWidget(search)
+
+        if add_actions:
+            add_btn = QPushButton("+ Add Tyre Item")
+            add_btn.setObjectName("V30Primary")
+            add_btn.clicked.connect(self._add_item)
+            top.addWidget(add_btn)
+
+            manage_btn = QPushButton("Manage Selected")
+            manage_btn.setObjectName("V30Secondary")
+            manage_btn.clicked.connect(
+                lambda checked=False, tab_key=key:
+                    self._manage_selected_item(tab_key)
+            )
+            top.addWidget(manage_btn)
+
+        if mold_actions:
+            edit_btn = QPushButton("Edit Selected")
+            edit_btn.setObjectName("V30Primary")
+            edit_btn.clicked.connect(self._edit_selected_mold)
+            top.addWidget(edit_btn)
+
+        if smds_actions:
+            full_btn = QPushButton("Open Full SMDS Editor")
+            full_btn.setObjectName("V30Primary")
+            full_btn.clicked.connect(self._open_full_smds)
+            top.addWidget(full_btn)
+
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.setObjectName("V30Secondary")
+        refresh_btn.clicked.connect(
+            lambda checked=False, tab_key=key: self._load_tab(tab_key)
+        )
+        top.addWidget(refresh_btn)
+
+        layout.addLayout(top)
+
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setAlternatingRowColors(True)
+        table.setEditTriggers(
+            _V30AbstractItemView.EditTrigger.NoEditTriggers
+        )
+        table.setSelectionBehavior(
+            _V30AbstractItemView.SelectionBehavior.SelectRows
+        )
+        table.setSelectionMode(
+            _V30AbstractItemView.SelectionMode.SingleSelection
+        )
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(38)
+        table.horizontalHeader().setMinimumHeight(40)
+        table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+
+        if len(headers) > 1:
+            table.horizontalHeader().setSectionResizeMode(
+                1,
+                QHeaderView.ResizeMode.Stretch,
+            )
+
+        if add_actions:
+            table.doubleClicked.connect(
+                lambda _index, tab_key=key:
+                    self._manage_selected_item(tab_key)
+            )
+
+        self._tables[key] = table
+        layout.addWidget(table, 1)
+
+        return page
+
+    def _metric(self, key, label_text):
+        card = QFrame()
+        card.setObjectName("V30Metric")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 9, 12, 9)
+        layout.setSpacing(2)
+
+        value = QLabel("0")
+        value.setObjectName("V30MetricValue")
+        label = QLabel(label_text)
+        label.setObjectName("V30MetricLabel")
+        label.setWordWrap(True)
+
+        layout.addWidget(value)
+        layout.addWidget(label)
+        self._ai_metrics[key] = value
+        return card
+
+    def _build_ai_page(self):
+        page = QFrame()
+        page.setObjectName("V30Panel")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(10)
+
+        self._ai_metrics = {}
+
+        top = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title = QLabel("Tyre Master AI / ML Training Suite")
+        title.setStyleSheet(
+            "font-size:15pt;font-weight:950;color:#0f172a;"
+        )
+        self._ai_history = QLabel("Historical evidence: loading...")
+        self._ai_history.setObjectName("V30Subtitle")
+        title_box.addWidget(title)
+        title_box.addWidget(self._ai_history)
+        top.addLayout(title_box, 1)
+
+        refresh_btn = QPushButton("Refresh Intelligence")
+        refresh_btn.setObjectName("V30Secondary")
+        refresh_btn.clicked.connect(self._refresh_ai_background)
+        top.addWidget(refresh_btn)
+
+        self._train_all_btn = QPushButton("Train All Models")
+        self._train_all_btn.setObjectName("V30Primary")
+        self._train_all_btn.setEnabled(False)
+        self._train_all_btn.clicked.connect(self._train_all)
+        top.addWidget(self._train_all_btn)
+
+        layout.addLayout(top)
+
+        metrics = QHBoxLayout()
+        metrics.setSpacing(9)
+        metrics.addWidget(self._metric("items", "Master Items"))
+        metrics.addWidget(self._metric("health", "Master Health"))
+        metrics.addWidget(self._metric("modules", "AI / ML Modules"))
+        metrics.addWidget(self._metric("ready", "Ready To Train"))
+        metrics.addWidget(self._metric("trained", "Trained Models"))
+        layout.addLayout(metrics)
+
+        notice = QLabel(
+            "Official SMDS / tyre master data remains authoritative. "
+            "AI / ML is advisory and never silently overwrites master values. "
+            "All modules share one future Train-All pipeline."
+        )
+        notice.setObjectName("V30Notice")
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+
+        self._ai_table = QTableWidget(0, 7)
+        self._ai_table.setHorizontalHeaderLabels(
+            [
+                "Module",
+                "Purpose",
+                "Training Mode",
+                "Min History",
+                "Readiness",
+                "Model Status",
+                "Last Trained",
+            ]
+        )
+        self._ai_table.setAlternatingRowColors(True)
+        self._ai_table.setEditTriggers(
+            _V30AbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self._ai_table.verticalHeader().setVisible(False)
+        self._ai_table.verticalHeader().setDefaultSectionSize(42)
+        self._ai_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self._ai_table.horizontalHeader().setSectionResizeMode(
+            1,
+            QHeaderView.ResizeMode.Stretch
+        )
+        layout.addWidget(self._ai_table, 1)
+
+        self._ai_notice = QLabel("AI / ML readiness is loading in background.")
+        self._ai_notice.setObjectName("V30Notice")
+        self._ai_notice.setWordWrap(True)
+        layout.addWidget(self._ai_notice)
+
+        return page
+
+    def _activate_tab(self, label, key):
+        self._active_key = key
+        button = self._tab_buttons.get(label)
+        if button is not None:
+            button.setChecked(True)
+
+        index = [item_key for _, item_key in self.TABS].index(key)
+        self._stack.setCurrentIndex(index)
+
+        if key == "ai":
+            self._refresh_ai_background()
+        else:
+            self._load_tab(key)
+
+    def _queue_search(self, key):
+        if key != self._active_key:
+            return
+        self._search_timer.start()
+
+    def _reload_active(self):
+        if self._active_key != "ai":
+            self._load_tab(self._active_key)
+
+    def _load_tab(self, key):
+        if key == "ai":
+            self._refresh_ai_background()
+            return
+
+        if self._data_worker is not None and self._data_worker.isRunning():
+            self._status_labels.get(key, QLabel()).setText(
+                "Previous load finishing..."
+            )
+            return
+
+        search = ""
+        if key in self._searches:
+            search = self._searches[key].text().strip()
+
+        status = self._status_labels.get(key)
+        if status is not None:
+            status.setText("Loading in background...")
+
+        worker = _V30DataWorker(key, search)
+        worker.setParent(self)
+        worker.completed.connect(self._data_loaded)
+        worker.failed.connect(self._data_failed)
+        worker.finished.connect(self._data_worker_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._data_worker = worker
+        worker.start()
+
+    def _data_worker_finished(self):
+        self._data_worker = None
+
+    def _data_loaded(self, key, rows):
+        self._rows[key] = list(rows or [])
+        status = self._status_labels.get(key)
+        if status is not None:
+            status.setText(f"{len(self._rows[key]):,} rows")
+
+        self._render_table_chunked(key)
+
+    def _data_failed(self, key, message):
+        status = self._status_labels.get(key)
+        if status is not None:
+            status.setText("Load failed")
+            status.setToolTip(str(message))
+
+        table = self._tables.get(key)
+        if table is not None:
+            table.setRowCount(0)
+
+    def _display(self, value, default="-"):
+        text_value = str(value or "").strip()
+        return text_value if text_value else default
+
+    def _item_values(self, key, row):
+        if key in {"items", "size"}:
+            return [
+                row.get("sap_code"),
+                row.get("description"),
+                row.get("tyre_size"),
+                row.get("status"),
+            ]
+
+        if key == "curing":
+            return [
+                row.get("sap_code"),
+                row.get("description"),
+                self._number(row.get("normal_curing_minutes")),
+                self._number(row.get("short_cycle_curing_minutes")),
+                self._number(row.get("handling_minutes")),
+                row.get("status"),
+            ]
+
+        if key == "line":
+            return [
+                row.get("sap_code"),
+                row.get("description"),
+                row.get("production_line"),
+                row.get("key_code"),
+                row.get("casing_type"),
+                row.get("curing"),
+                self._number(row.get("day_plan")),
+                self._number(row.get("night_plan")),
+                self._number(row.get("total_plan")),
+            ]
+
+        if key == "mold":
+            return [
+                row.get("sap_code"),
+                row.get("description"),
+                row.get("mold_key_code"),
+                row.get("casing_type"),
+            ]
+
+        if key == "groups":
+            return [
+                row.get("group_key"),
+                row.get("tyre_size"),
+                row.get("tread"),
+                row.get("layer"),
+                row.get("color"),
+                row.get("sap_count"),
+            ]
+
+        if key == "smds":
+            return [
+                row.get("sap_code"),
+                row.get("material_description") or row.get("description"),
+                row.get("key_code"),
+                row.get("casing_type"),
+                row.get("normal_curing_minutes") or row.get("curing_cycle"),
+                row.get("day_plan"),
+                row.get("night_plan"),
+                row.get("total_plan"),
+                row.get("weight_per_tyre_kg") or row.get("weight_kg"),
+            ]
+
+        return []
+
+    def _number(self, value):
+        try:
+            number = float(value or 0)
+            if number == 0:
+                return "-"
+            if number.is_integer():
+                return str(int(number))
+            return f"{number:.2f}".rstrip("0").rstrip(".")
+        except Exception:
+            return self._display(value)
+
+    def _render_table_chunked(self, key):
+        table = self._tables.get(key)
+        rows = self._rows.get(key, [])
+
+        if table is None:
+            return
+
+        token = int(self._render_tokens.get(key, 0)) + 1
+        self._render_tokens[key] = token
+
+        table.setUpdatesEnabled(False)
+        table.clearContents()
+        table.setRowCount(len(rows))
+        table.setUpdatesEnabled(True)
+
+        def render_from(start):
+            if self._render_tokens.get(key) != token:
+                return
+
+            end = min(start + 120, len(rows))
+            table.setUpdatesEnabled(False)
+
+            for row_index in range(start, end):
+                values = self._item_values(key, rows[row_index])
+
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(self._display(value))
+                    if column != 1:
+                        item.setTextAlignment(
+                            Qt.AlignmentFlag.AlignCenter
+                        )
+                    table.setItem(row_index, column, item)
+
+            table.setUpdatesEnabled(True)
+            table.viewport().update()
+
+            if end < len(rows):
+                _V30QTimer.singleShot(
+                    0,
+                    lambda: render_from(end),
+                )
+
+        render_from(0)
+
+    def _selected_row(self, key):
+        table = self._tables.get(key)
+        rows = self._rows.get(key, [])
+
+        if table is None:
+            return None
+
+        current = table.currentRow()
+        if current < 0 or current >= len(rows):
+            return None
+
+        return rows[current]
+
+    def _add_item(self):
+        dialog = TyreItemDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        data = dialog.data()
+        try:
+            TyreItemRepository().create_item(
+                data["sap_code"],
+                data["description"],
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Add Failed",
+                f"Could not add tyre item.\n\n{exc}",
+            )
+            return
+
+        self._load_tab(self._active_key)
+
+    def _manage_selected_item(self, key):
+        row = self._selected_row(key)
+        if row is None:
+            QMessageBox.information(
+                self,
+                "Tyre Item",
+                "Select a tyre item first.",
+            )
+            return
+
+        dialog = TyreItemDialog(self, row=row)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        data = dialog.data()
+        try:
+            TyreItemRepository().update_item(
+                int(row["id"]),
+                data["sap_code"],
+                data["description"],
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Update Failed",
+                f"Could not update tyre item.\n\n{exc}",
+            )
+            return
+
+        self._load_tab(key)
+
+    def _edit_selected_mold(self):
+        row = self._selected_row("mold")
+        if row is None:
+            QMessageBox.information(
+                self,
+                "Mold & Casing",
+                "Select a row first.",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit Mold & Casing")
+        dialog.setMinimumWidth(560)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        title = QLabel(
+            f"{row.get('sap_code', '')}  -  {row.get('description', '')}"
+        )
+        title.setWordWrap(True)
+        title.setStyleSheet(
+            "font-size:13pt;font-weight:950;color:#0f172a;"
+        )
+        layout.addWidget(title)
+
+        form = QGridLayout()
+        mold_input = QLineEdit(
+            self._display(row.get("mold_key_code"))
+        )
+        casing_input = QLineEdit(
+            self._display(row.get("casing_type"))
+        )
+        form.addWidget(QLabel("Mold Key Code"), 0, 0)
+        form.addWidget(mold_input, 0, 1)
+        form.addWidget(QLabel("Casing Type"), 1, 0)
+        form.addWidget(casing_input, 1, 1)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE smds
+                        SET key_code = :key_code,
+                            casing_type = :casing_type,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = :id
+                        """
+                    ),
+                    {
+                        "id": row.get("id"),
+                        "key_code": mold_input.text().strip() or "-",
+                        "casing_type": casing_input.text().strip() or "-",
+                    },
+                )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Save Failed",
+                f"Could not update SMDS.\n\n{exc}",
+            )
+            return
+
+        self._load_tab("mold")
+
+    def _open_full_smds(self):
+        if self._legacy_smds_dialog is not None:
+            self._legacy_smds_dialog.raise_()
+            self._legacy_smds_dialog.activateWindow()
+            return
+
+        self._status_labels["smds"].setText(
+            "Opening full editor..."
+        )
+
+        # Explicit user action only. This heavy editor is never created during
+        # Tyre Item Master page startup.
+        dialog = QDialog(self)
+        dialog.setWindowTitle("SMDS Master")
+        dialog.resize(1450, 820)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        try:
+            editor = SMDSMasterPage(
+                on_back=dialog.close
+            )
+            layout.addWidget(editor)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "SMDS Editor",
+                f"Could not open full SMDS editor.\n\n{exc}",
+            )
+            dialog.deleteLater()
+            self._status_labels["smds"].setText(
+                "Full editor failed"
+            )
+            return
+
+        dialog.finished.connect(
+            lambda _result: self._smds_dialog_closed()
+        )
+        self._legacy_smds_dialog = dialog
+        dialog.show()
+
+    def _smds_dialog_closed(self):
+        self._legacy_smds_dialog = None
+        self._load_tab("smds")
+
+    def _refresh_ai_background(self):
+        if self._ai_worker is not None and self._ai_worker.isRunning():
+            return
+
+        self._ai_notice.setText(
+            "Refreshing AI / ML readiness in background..."
+        )
+        worker = _V30AIWorker()
+        worker.setParent(self)
+        worker.completed.connect(self._ai_loaded)
+        worker.failed.connect(self._ai_failed)
+        worker.finished.connect(self._ai_worker_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._ai_worker = worker
+        worker.start()
+
+    def _ai_worker_finished(self):
+        self._ai_worker = None
+
+    def _ai_failed(self, message):
+        self._ai_notice.setText(
+            f"AI / ML readiness unavailable: {message}"
+        )
+
+    def _ai_loaded(self, dashboard):
+        self._ai_dashboard = dict(dashboard or {})
+        master = self._ai_dashboard.get("master", {})
+        history = self._ai_dashboard.get("history", {})
+
+        health = float(master.get("health_score") or 0)
+        self._health_badge.setText(
+            f"MASTER HEALTH  {health:.1f}%"
+        )
+
+        self._ai_metrics["items"].setText(
+            f"{int(master.get('items') or 0):,}"
+        )
+        self._ai_metrics["health"].setText(
+            f"{health:.1f}%"
+        )
+        self._ai_metrics["modules"].setText(
+            str(int(self._ai_dashboard.get("module_count") or 0))
+        )
+        self._ai_metrics["ready"].setText(
+            str(int(self._ai_dashboard.get("ready_count") or 0))
+        )
+        self._ai_metrics["trained"].setText(
+            str(int(self._ai_dashboard.get("trained_count") or 0))
+        )
+
+        self._ai_history.setText(
+            "Historical evidence: "
+            f"{int(history.get('historical_days') or 0):,} production days  •  "
+            f"{int(history.get('historical_workbooks') or 0):,} workbooks"
+        )
+
+        modules = self._ai_dashboard.get("modules", [])
+        self._ai_table.setRowCount(len(modules))
+
+        for row_index, row in enumerate(modules):
+            min_history = int(row.get("minimum_history_days") or 0)
+            values = [
+                row.get("name"),
+                row.get("purpose"),
+                row.get("training_mode"),
+                "Master only" if min_history <= 0 else f"{min_history} days",
+                row.get("readiness"),
+                row.get("status"),
+                row.get("last_trained_at") or "-",
+            ]
+
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(self._display(value))
+                if column in {0, 2, 3, 4, 5, 6}:
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignCenter
+                    )
+                self._ai_table.setItem(
+                    row_index,
+                    column,
+                    item,
+                )
+
+            readiness_item = self._ai_table.item(row_index, 4)
+            if readiness_item is not None:
+                readiness_item.setToolTip(
+                    str(row.get("explanation") or "")
+                )
+
+        all_ready = bool(self._ai_dashboard.get("all_ready"))
+        self._train_all_btn.setEnabled(all_ready)
+
+        if all_ready:
+            self._ai_notice.setText(
+                "All AI / ML modules passed readiness gates. "
+                "Train All is enabled for the shared training pipeline."
+            )
+        else:
+            self._ai_notice.setText(
+                f"{int(self._ai_dashboard.get('ready_count') or 0)} of "
+                f"{int(self._ai_dashboard.get('module_count') or 0)} modules "
+                "are training-ready. No fake training is performed."
+            )
+
+    def _train_all(self):
+        if self._train_worker is not None and self._train_worker.isRunning():
+            return
+
+        self._train_all_btn.setEnabled(False)
+        self._ai_notice.setText(
+            "Validating the shared Train-All pipeline..."
+        )
+
+        worker = _V30TrainAllWorker()
+        worker.setParent(self)
+        worker.completed.connect(self._train_all_complete)
+        worker.failed.connect(self._train_all_failed)
+        worker.finished.connect(self._train_worker_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._train_worker = worker
+        worker.start()
+
+    def _train_worker_finished(self):
+        self._train_worker = None
+
+    def _train_all_complete(self, result):
+        self._ai_notice.setText(
+            str(result.get("message") or result.get("status") or "")
+        )
+        self._refresh_ai_background()
+
+    def _train_all_failed(self, message):
+        self._ai_notice.setText(
+            f"Train-All validation failed: {message}"
+        )
+        self._refresh_ai_background()
+
+    # MainWindow compatibility hooks.
+    def refresh(self):
+        if self._active_key == "ai":
+            self._refresh_ai_background()
+        else:
+            self._load_tab(self._active_key)
+
+    refresh_page = refresh
+    load_data = refresh
+
+# MPPS V29 TYRE ITEM MASTER PRO + AI/ML WORKSPACE
+from PySide6.QtCore import QThread as _TyreQThread, Signal as _TyreSignal
+from PySide6.QtWidgets import (
+    QAbstractItemView as _TyreAbstractItemView,
+    QButtonGroup as _TyreButtonGroup,
+)
+from app.database import get_session as _tyre_get_session
+from app.services.tyre_master_intelligence_service import (
+    TyreMasterIntelligenceService as _TyreMasterIntelligenceService,
+)
+
+
+_LegacyTyreItemMasterPageV29 = TyreItemMasterPage
+
+
+class _TyreMLWorkerV29(_TyreQThread):
+    completed = _TyreSignal(object)
+    failed = _TyreSignal(str)
+
+    def run(self) -> None:
+        try:
+            with _tyre_get_session() as session:
+                service = _TyreMasterIntelligenceService()
+                result = service.request_train_all(session)
+                session.commit()
+            self.completed.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class TyreItemMasterPage(QWidget):
+    """Unified professional tyre master workspace.
+
+    Existing master-data modules remain the operational editors. V29 replaces
+    only the card-grid navigation with Factory-Capacity-style tabs and adds a
+    training-ready AI/ML intelligence control tab.
+    """
+
+    TAB_MAP = (
+        ("Tyre Items", 1),
+        ("Tyre Size", 2),
+        ("Process & Curing", 3),
+        ("Line Mapping", 6),
+        ("Mold & Casing", 5),
+        ("Product Groups", 4),
+        ("SMDS", 7),
+        ("AI / ML", None),
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self._legacy = _LegacyTyreItemMasterPageV29()
+        self._ai_service = _TyreMasterIntelligenceService()
+        self._worker = None
+        self._tab_buttons = {}
+        self._metrics = {}
+
+        self.setStyleSheet(
+            """
+            QWidget {
+                font-family: "Segoe UI";
+            }
+
+            QFrame#TyreProHeader,
+            QFrame#TyreAISection,
+            QFrame#TyreMetricCard {
+                background: #ffffff;
+                border: 1px solid #dbe4ef;
+                border-radius: 16px;
+            }
+
+            QLabel#TyreBreadcrumb {
+                color: #2563eb;
+                font-size: 9pt;
+                font-weight: 950;
+            }
+
+            QLabel#TyreTitle {
+                color: #0f172a;
+                font-size: 24pt;
+                font-weight: 950;
+            }
+
+            QLabel#TyreSubtitle {
+                color: #64748b;
+                font-size: 9.2pt;
+                font-weight: 650;
+            }
+
+            QLabel#TyreStatusBadge {
+                background: #ecfdf5;
+                color: #047857;
+                border: 1px solid #a7f3d0;
+                border-radius: 12px;
+                padding: 8px 13px;
+                font-size: 8.5pt;
+                font-weight: 950;
+            }
+
+            QPushButton#TyreTab {
+                background: transparent;
+                color: #334155;
+                border: none;
+                border-radius: 0px;
+                padding: 10px 15px;
+                font-size: 9pt;
+                font-weight: 900;
+            }
+
+            QPushButton#TyreTab:hover {
+                background: #eff6ff;
+                color: #1d4ed8;
+            }
+
+            QPushButton#TyreTab:checked {
+                background: #2563eb;
+                color: #ffffff;
+            }
+
+            QLabel#TyreMetricValue {
+                color: #0f172a;
+                font-size: 20pt;
+                font-weight: 950;
+            }
+
+            QLabel#TyreMetricLabel {
+                color: #64748b;
+                font-size: 8.4pt;
+                font-weight: 850;
+            }
+
+            QLabel#TyreSectionTitle {
+                color: #0f172a;
+                font-size: 15pt;
+                font-weight: 950;
+            }
+
+            QLabel#TyreNotice {
+                background: #f8fafc;
+                color: #475569;
+                border: 1px solid #e2e8f0;
+                border-radius: 10px;
+                padding: 9px 12px;
+                font-size: 8.7pt;
+                font-weight: 700;
+            }
+
+            QPushButton#TyrePrimary {
+                background: #2563eb;
+                color: #ffffff;
+                border: none;
+                border-radius: 9px;
+                padding: 9px 16px;
+                font-weight: 950;
+                min-height: 22px;
+            }
+
+            QPushButton#TyrePrimary:hover {
+                background: #1d4ed8;
+            }
+
+            QPushButton#TyreSecondary {
+                background: #e2e8f0;
+                color: #0f172a;
+                border: none;
+                border-radius: 9px;
+                padding: 9px 16px;
+                font-weight: 900;
+                min-height: 22px;
+            }
+
+            QTableWidget#TyreMLTable {
+                background: #ffffff;
+                border: 1px solid #dbe4ef;
+                gridline-color: #e2e8f0;
+                alternate-background-color: #f8fafc;
+                selection-background-color: #dbeafe;
+                selection-color: #0f172a;
+            }
+
+            QTableWidget#TyreMLTable::item {
+                padding: 7px 9px;
+            }
+
+            QTableWidget#TyreMLTable QHeaderView::section {
+                background: #edf3f9;
+                color: #1e293b;
+                border: none;
+                border-right: 1px solid #dbe4ef;
+                border-bottom: 1px solid #dbe4ef;
+                padding: 9px 8px;
+                font-weight: 950;
+            }
+            """
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+
+        root.addWidget(self._build_header())
+        root.addLayout(self._build_tabs())
+
+        self._content = QStackedWidget()
+        self._content.addWidget(self._legacy)
+        self._ai_page = self._build_ai_page()
+        self._content.addWidget(self._ai_page)
+        root.addWidget(self._content, 1)
+
+        self._suppress_legacy_overview_chrome()
+        self._select_tab("Tyre Items")
+        self._refresh_ai()
+
+    def _build_header(self):
+        card = QFrame()
+        card.setObjectName("TyreProHeader")
+
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(22, 15, 20, 15)
+        layout.setSpacing(14)
+
+        text_box = QVBoxLayout()
+        text_box.setSpacing(4)
+
+        breadcrumb = QLabel("Data / Tyre Item Master")
+        breadcrumb.setObjectName("TyreBreadcrumb")
+
+        title = QLabel("Tyre Item Master")
+        title.setObjectName("TyreTitle")
+
+        subtitle = QLabel(
+            "Central tyre master, process rules, production compatibility "
+            "and training-ready AI / ML intelligence."
+        )
+        subtitle.setObjectName("TyreSubtitle")
+        subtitle.setWordWrap(True)
+
+        text_box.addWidget(breadcrumb)
+        text_box.addWidget(title)
+        text_box.addWidget(subtitle)
+
+        layout.addLayout(text_box, 1)
+
+        self._health_badge = QLabel("MASTER HEALTH  --")
+        self._health_badge.setObjectName("TyreStatusBadge")
+        self._health_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._health_badge.setMinimumWidth(150)
+        layout.addWidget(self._health_badge)
+
+        return card
+
+    def _build_tabs(self):
+        layout = QHBoxLayout()
+        layout.setContentsMargins(2, 0, 2, 0)
+        layout.setSpacing(0)
+
+        self._tab_group = _TyreButtonGroup(self)
+        self._tab_group.setExclusive(True)
+
+        for name, _legacy_index in self.TAB_MAP:
+            button = QPushButton(name)
+            button.setObjectName("TyreTab")
+            button.setCheckable(True)
+            button.setMinimumHeight(38)
+            button.clicked.connect(
+                lambda checked=False, tab_name=name: self._select_tab(tab_name)
+            )
+            self._tab_group.addButton(button)
+            self._tab_buttons[name] = button
+            layout.addWidget(button)
+
+        layout.addStretch()
+        return layout
+
+    def _suppress_legacy_overview_chrome(self):
+        for label in self._legacy.findChildren(QLabel):
+            if label.objectName() in {
+                "Breadcrumb",
+                "PageTitle",
+                "PageSubtitle",
+            }:
+                label.hide()
+
+        for button in self._legacy.findChildren(QPushButton):
+            caption = button.text().strip().lower()
+            if caption in {
+                "back",
+                "← back",
+                "back to tyre item master",
+                "back to master",
+            }:
+                button.hide()
+
+    def _select_tab(self, name: str):
+        button = self._tab_buttons.get(name)
+        if button is not None:
+            button.setChecked(True)
+
+        mapping = dict(self.TAB_MAP)
+        legacy_index = mapping.get(name)
+
+        if name == "AI / ML":
+            self._content.setCurrentIndex(1)
+            self._refresh_ai()
+            return
+
+        self._content.setCurrentIndex(0)
+
+        if legacy_index is not None:
+            try:
+                self._legacy.stack.setCurrentIndex(int(legacy_index))
+            except Exception:
+                pass
+
+        try:
+            self._legacy.refresh()
+        except Exception:
+            pass
+
+        self._suppress_legacy_overview_chrome()
+
+    def _metric_card(self, key: str, caption: str):
+        card = QFrame()
+        card.setObjectName("TyreMetricCard")
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(13, 10, 13, 10)
+        layout.setSpacing(2)
+
+        value = QLabel("0")
+        value.setObjectName("TyreMetricValue")
+
+        label = QLabel(caption)
+        label.setObjectName("TyreMetricLabel")
+        label.setWordWrap(True)
+
+        layout.addWidget(value)
+        layout.addWidget(label)
+
+        self._metrics[key] = value
+        return card
+
+    def _build_ai_page(self):
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+
+        metrics = QHBoxLayout()
+        metrics.setSpacing(10)
+        metrics.addWidget(self._metric_card("items", "Master Items"))
+        metrics.addWidget(self._metric_card("health", "Master Health"))
+        metrics.addWidget(self._metric_card("modules", "AI / ML Modules"))
+        metrics.addWidget(self._metric_card("ready", "Ready To Train"))
+        metrics.addWidget(self._metric_card("trained", "Trained Models"))
+        root.addLayout(metrics)
+
+        section = QFrame()
+        section.setObjectName("TyreAISection")
+        layout = QVBoxLayout(section)
+        layout.setContentsMargins(16, 14, 16, 16)
+        layout.setSpacing(10)
+
+        top = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title_box.setSpacing(2)
+
+        title = QLabel("Tyre Master AI / ML Training Suite")
+        title.setObjectName("TyreSectionTitle")
+
+        self._history_label = QLabel("Historical data: --")
+        self._history_label.setObjectName("TyreSubtitle")
+
+        title_box.addWidget(title)
+        title_box.addWidget(self._history_label)
+        top.addLayout(title_box, 1)
+
+        refresh_btn = QPushButton("Refresh Intelligence")
+        refresh_btn.setObjectName("TyreSecondary")
+        refresh_btn.clicked.connect(self._refresh_ai)
+        top.addWidget(refresh_btn)
+
+        self._train_all_btn = QPushButton("Train All Models")
+        self._train_all_btn.setObjectName("TyrePrimary")
+        self._train_all_btn.clicked.connect(self._request_train_all)
+        top.addWidget(self._train_all_btn)
+
+        layout.addLayout(top)
+
+        notice = QLabel(
+            "AI / ML is advisory. Official SMDS / tyre master values are never "
+            "silently overwritten. V29 provides one shared Train-All pipeline "
+            "and strict data-readiness gates; no fake model accuracy is created."
+        )
+        notice.setObjectName("TyreNotice")
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+
+        self._module_table = QTableWidget(0, 8)
+        self._module_table.setObjectName("TyreMLTable")
+        self._module_table.setHorizontalHeaderLabels(
+            [
+                "Module",
+                "Purpose",
+                "Training Mode",
+                "Data Source",
+                "Min History",
+                "Readiness",
+                "Model Status",
+                "Last Trained",
+            ]
+        )
+        self._module_table.setAlternatingRowColors(True)
+        self._module_table.setEditTriggers(
+            _TyreAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self._module_table.setSelectionBehavior(
+            _TyreAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self._module_table.verticalHeader().setVisible(False)
+        self._module_table.verticalHeader().setDefaultSectionSize(44)
+
+        header = self._module_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setStretchLastSection(False)
+
+        layout.addWidget(self._module_table, 1)
+
+        self._training_notice = QLabel("")
+        self._training_notice.setObjectName("TyreNotice")
+        self._training_notice.setWordWrap(True)
+        layout.addWidget(self._training_notice)
+
+        root.addWidget(section, 1)
+        return page
+
+    def _refresh_ai(self):
+        try:
+            with _tyre_get_session() as session:
+                dashboard = self._ai_service.dashboard(session)
+                session.commit()
+        except Exception as exc:
+            self._training_notice.setText(
+                f"AI / ML dashboard unavailable: {exc}"
+            )
+            return
+
+        master = dashboard.get("master", {})
+        history = dashboard.get("history", {})
+
+        self._metrics["items"].setText(
+            f"{int(master.get('items') or 0):,}"
+        )
+        self._metrics["health"].setText(
+            f"{float(master.get('health_score') or 0):.1f}%"
+        )
+        self._metrics["modules"].setText(
+            str(int(dashboard.get("module_count") or 0))
+        )
+        self._metrics["ready"].setText(
+            str(int(dashboard.get("ready_count") or 0))
+        )
+        self._metrics["trained"].setText(
+            str(int(dashboard.get("trained_count") or 0))
+        )
+
+        health = float(master.get("health_score") or 0)
+        self._health_badge.setText(
+            f"MASTER HEALTH  {health:.1f}%"
+        )
+
+        self._history_label.setText(
+            "Historical evidence: "
+            f"{int(history.get('historical_days') or 0):,} production days  •  "
+            f"{int(history.get('historical_workbooks') or 0):,} workbooks"
+        )
+
+        modules = dashboard.get("modules", [])
+        self._module_table.setRowCount(len(modules))
+
+        for row_index, row in enumerate(modules):
+            values = [
+                row.get("name"),
+                row.get("purpose"),
+                row.get("training_mode"),
+                row.get("data_source"),
+                (
+                    "Master only"
+                    if int(row.get("minimum_history_days") or 0) <= 0
+                    else f"{int(row.get('minimum_history_days') or 0)} days"
+                ),
+                row.get("readiness"),
+                row.get("status"),
+                row.get("last_trained_at") or "-",
+            ]
+
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value or ""))
+                if column in {0, 4, 5, 6, 7}:
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignCenter
+                    )
+                self._module_table.setItem(
+                    row_index,
+                    column,
+                    item,
+                )
+
+            ready_item = self._module_table.item(row_index, 5)
+            if ready_item is not None:
+                ready_item.setToolTip(
+                    str(row.get("explanation") or "")
+                )
+
+        all_ready = bool(dashboard.get("all_ready"))
+        self._train_all_btn.setEnabled(all_ready)
+
+        if all_ready:
+            self._training_notice.setText(
+                "All AI / ML modules passed data-readiness gates. "
+                "The single Train-All orchestration pipeline is ready."
+            )
+        else:
+            self._training_notice.setText(
+                f"{int(dashboard.get('ready_count') or 0)} of "
+                f"{int(dashboard.get('module_count') or 0)} modules are "
+                "currently training-ready. Train All remains locked until "
+                "every module has the required master/history evidence."
+            )
+
+    def _request_train_all(self):
+        if self._worker and self._worker.isRunning():
+            return
+
+        self._train_all_btn.setEnabled(False)
+        self._training_notice.setText(
+            "Validating all Tyre Master AI / ML modules..."
+        )
+
+        self._worker = _TyreMLWorkerV29()
+        self._worker.setParent(self)
+        self._worker.completed.connect(
+            self._train_all_complete
+        )
+        self._worker.failed.connect(
+            self._train_all_failed
+        )
+        self._worker.finished.connect(
+            self._worker.deleteLater
+        )
+        self._worker.start()
+
+    def _train_all_complete(self, result):
+        self._training_notice.setText(
+            str(result.get("message") or result.get("status") or "")
+        )
+        self._worker = None
+        self._refresh_ai()
+
+    def _train_all_failed(self, message: str):
+        self._training_notice.setText(
+            f"Train-All validation failed: {message}"
+        )
+        self._worker = None
+        self._refresh_ai()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._refresh_ai()

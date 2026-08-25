@@ -198,8 +198,8 @@ class MasterDataHubPage(QWidget):
             (
                 "Stock Master",
                 "STOCK CONTROL",
-                "Open stock master area for finished tyre stock and SAP-code based stock balances.",
-                "Stock Master Hub",
+                "Open the same Stock Master workspace used by the Data sidebar for monthly stock, current stock, final tyre stock and daily stock.",
+                "Stock Master",
                 "stock",
             ),
             (
@@ -224,6 +224,12 @@ class MasterDataHubPage(QWidget):
         self.root.addWidget(panel, 1)
 
     def render_stock_view(self) -> None:
+        # Canonical Stock Master redirect: never show a second stock UI.
+        index = self.page_indexes.get("Stock Master")
+        if index is not None:
+            self.on_open_page(index)
+            return
+
         self.current_view = "stock"
         self._clear_root()
 
@@ -251,6 +257,18 @@ class MasterDataHubPage(QWidget):
 
         grid.addWidget(
             self._module_card(
+                "Monthly Stock",
+                "MONTHLY OVEN STOCK + ML",
+                "View one selected month at a time. FINAL stock comes from next-month PROD D/E/F; the current LIVE month comes from PROD HS/E/F with ML trend, forecast and risk.",
+                "Monthly Stock",
+                "stock",
+            ),
+            0,
+            0,
+        )
+
+        grid.addWidget(
+            self._module_card(
                 "Final Tyre Stock",
                 "SAP STOCK",
                 "Manage final tyre stock balances by SAP Code. Includes FG, QC, Scrap, Blocked and Available stock.",
@@ -258,7 +276,7 @@ class MasterDataHubPage(QWidget):
                 "stock",
             ),
             0,
-            0,
+            1,
         )
 
         grid.addWidget(
@@ -269,8 +287,8 @@ class MasterDataHubPage(QWidget):
                 "Daily Stock",
                 "stock",
             ),
-            0,
             1,
+            0,
         )
 
         layout.addLayout(grid)
@@ -402,9 +420,11 @@ class MasterDataHubPage(QWidget):
         return card
 
     def _open_module(self, key: str) -> None:
+        if key == "Final Tyre Stock":
+            key = "Stock Master"
+
         if key == "Stock Master Hub":
-            self.render_stock_view()
-            return
+            key = "Stock Master"
 
         index = self.page_indexes.get(key)
 

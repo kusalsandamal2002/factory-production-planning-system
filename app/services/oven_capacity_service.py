@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -71,7 +71,6 @@ def build_capacity_analysis(
     if not required:
         return []
 
-    FactoryResourceIntelligenceService.ensure_schema(session)
     output: list[CapacityAnalysisRow] = []
 
     for production in required:

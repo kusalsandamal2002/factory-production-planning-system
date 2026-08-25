@@ -7,10 +7,11 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
-from PySide6.QtCore import QDate, Qt
+from PySide6.QtCore import QDate, QTimer, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QDateEdit,
     QDialog,
     QFileDialog,
@@ -105,6 +106,56 @@ class DailyStockEditDialog(QDialog):
                 color: #64748b;
                 font-size: 9.5pt;
                 font-weight: 650;
+            }
+
+            QLabel#DailySourceStatus {
+                color: #475569;
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 9px;
+                padding: 8px 10px;
+                font-size: 9pt;
+                font-weight: 800;
+            }
+
+            QLabel#DailyNoData {
+                color: #9a3412;
+                background: #fff7ed;
+                border: 1px solid #fed7aa;
+                border-radius: 9px;
+                padding: 9px 12px;
+                font-size: 9pt;
+                font-weight: 850;
+            }
+
+            QLabel#DailyLatestBadge {
+                color: #047857;
+                background: #ecfdf5;
+                border: 1px solid #a7f3d0;
+                border-radius: 10px;
+                padding: 7px 11px;
+                font-size: 8.5pt;
+                font-weight: 900;
+            }
+
+            QLabel#DailyEmptyState {
+                color: #64748b;
+                background: #f8fafc;
+                border: 1px dashed #cbd5e1;
+                border-radius: 12px;
+                padding: 28px;
+                font-size: 10pt;
+                font-weight: 750;
+            }
+
+            QComboBox#DailyStockFilter {
+                background: #ffffff;
+                color: #0f172a;
+                border: 1px solid #cbd5e1;
+                border-radius: 10px;
+                padding: 9px 12px;
+                min-height: 24px;
+                font-weight: 700;
             }
 
             QLabel#FieldLabel {
@@ -1077,3 +1128,781 @@ class DailyStockPage(QWidget):
             return f"{int(value or 0):,}"
         except Exception:
             return "0"
+
+# MPPS V22 DAILY STOCK COMMITTED EXCEL SNAPSHOT
+def _mpps_v22_daily_stock_init(self):
+    QWidget.__init__(self)
+    self.selected_sap_code = None
+    self._latest_date_initialized = False
+    self._selected_source = None
+
+    self.date_input = QDateEdit()
+    self.date_input.setCalendarPopup(True)
+    self.date_input.setDisplayFormat("yyyy-MM-dd")
+    self.date_input.setDate(QDate.currentDate())
+    self.date_input.dateChanged.connect(self.refresh)
+
+    self.search_input = QLineEdit()
+    self.search_input.setPlaceholderText("Search SAP code or tyre description...")
+    self.search_input.textChanged.connect(self.refresh_table)
+
+    self.source_status = QLabel("Loading latest committed OVEN date...")
+    self.source_status.setObjectName("DailySourceStatus")
+    self.source_status.setWordWrap(True)
+
+    self.table = QTableWidget(0, 8)
+    self.table.setHorizontalHeaderLabels([
+        "SAP Code",
+        "Tyre Description",
+        "Production Qty",
+        "FG",
+        "QC",
+        "Scrap",
+        "Blocked",
+        "Available",
+    ])
+
+    self._setup_table()
+    self._apply_styles()
+    self._build_ui()
+    QTimer.singleShot(0, self.refresh)
+
+
+def _mpps_v22_daily_stock_build_control_card(self):
+    card = QFrame()
+    card.setObjectName("ControlCard")
+
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(18, 16, 18, 18)
+    layout.setSpacing(14)
+
+    title = QLabel("Daily Stock")
+    title.setObjectName("PageTitle")
+
+    hint = QLabel(
+        "Read-only daily stock snapshots from committed OVEN Excel data. "
+        "The latest available Excel date is selected automatically."
+    )
+    hint.setObjectName("PageHint")
+    hint.setWordWrap(True)
+
+    layout.addWidget(title)
+    layout.addWidget(hint)
+
+    form = QGridLayout()
+    form.setHorizontalSpacing(12)
+    form.setVerticalSpacing(10)
+
+    date_label = QLabel("Date")
+    date_label.setObjectName("FieldLabel")
+    search_label = QLabel("Search")
+    search_label.setObjectName("FieldLabel")
+
+    form.addWidget(date_label, 0, 0)
+    form.addWidget(self.date_input, 0, 1)
+    form.addWidget(self.source_status, 0, 2, 1, 4)
+    form.addWidget(search_label, 1, 0)
+    form.addWidget(self.search_input, 1, 1, 1, 5)
+
+    form.setColumnStretch(1, 1)
+    form.setColumnStretch(2, 1)
+
+    layout.addLayout(form)
+    return card
+
+
+def _mpps_v22_daily_stock_build_table_card(self):
+    card = QFrame()
+    card.setObjectName("TableCard")
+
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(18, 16, 18, 18)
+    layout.setSpacing(14)
+
+    title = QLabel("Daily Production List")
+    title.setObjectName("PageTitle")
+
+    hint = QLabel(
+        "Selected-date snapshot from the committed OVEN workbook. "
+        "This page does not create, edit, or overwrite factory stock data."
+    )
+    hint.setObjectName("PageHint")
+    hint.setWordWrap(True)
+
+    layout.addWidget(title)
+    layout.addWidget(hint)
+    layout.addWidget(self.table, 1)
+    return card
+
+
+def _mpps_v22_daily_stock_setup_table(self):
+    self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    self.table.verticalHeader().setVisible(False)
+    self.table.verticalHeader().setDefaultSectionSize(44)
+    self.table.setAlternatingRowColors(True)
+    self.table.setSortingEnabled(False)
+
+    header = self.table.horizontalHeader()
+    header.setStretchLastSection(False)
+    header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+    header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+    for col in range(2, 8):
+        header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+
+    self.table.setColumnWidth(0, 150)
+    self.table.setColumnWidth(2, 125)
+    self.table.setColumnWidth(3, 90)
+    self.table.setColumnWidth(4, 90)
+    self.table.setColumnWidth(5, 90)
+    self.table.setColumnWidth(6, 95)
+    self.table.setColumnWidth(7, 105)
+
+
+def _mpps_v22_daily_stock_latest_date(self):
+    with engine.begin() as connection:
+        exists = connection.execute(
+            text("SELECT to_regclass('public.excel_import_runs')")
+        ).scalar()
+        if not exists:
+            return None
+
+        value = connection.execute(
+            text(
+                "SELECT plan_date "
+                "FROM excel_import_runs "
+                "WHERE status LIKE 'COMMITTED%' "
+                "AND rollback_at IS NULL "
+                "AND plan_date IS NOT NULL "
+                "ORDER BY plan_date DESC, id DESC "
+                "LIMIT 1"
+            )
+        ).scalar()
+
+    if value is None:
+        return None
+    if hasattr(value, "date") and not isinstance(value, date):
+        value = value.date()
+    return value
+
+
+def _mpps_v22_daily_stock_source_for_date(self, stock_date):
+    with engine.begin() as connection:
+        exists = connection.execute(
+            text("SELECT to_regclass('public.excel_import_runs')")
+        ).scalar()
+        if not exists:
+            return None
+
+        row = connection.execute(
+            text(
+                "SELECT id, workbook_name, workbook_hash, plan_date, "
+                "workbook_path, archive_path "
+                "FROM excel_import_runs "
+                "WHERE status LIKE 'COMMITTED%' "
+                "AND rollback_at IS NULL "
+                "AND plan_date = :plan_date "
+                "ORDER BY id DESC "
+                "LIMIT 1"
+            ),
+            {"plan_date": stock_date},
+        ).mappings().first()
+
+    return dict(row) if row else None
+
+
+def _mpps_v22_daily_stock_refresh(self):
+    try:
+        if not self._latest_date_initialized:
+            latest = self._latest_committed_excel_date()
+            self._latest_date_initialized = True
+            if latest is not None:
+                self.date_input.blockSignals(True)
+                self.date_input.setDate(QDate(latest.year, latest.month, latest.day))
+                self.date_input.blockSignals(False)
+
+        self.refresh_table()
+    except Exception as exc:
+        self.table.setRowCount(0)
+        self.source_status.setText(f"Daily Stock unavailable: {exc}")
+
+
+def _mpps_v22_daily_stock_refresh_table(self):
+    stock_date = self.selected_date()
+    source = self._committed_source_for_date(stock_date)
+    self._selected_source = source
+    self.table.setRowCount(0)
+
+    if source is None:
+        self.source_status.setText(
+            "NO DATA • No committed OVEN Excel data for "
+            f"{stock_date.isoformat()}."
+        )
+        return
+
+    workbook_name = str(source.get("workbook_name") or "").strip()
+    search = self.search_input.text().strip()
+
+    params = {
+        "stock_date": stock_date,
+        "search": f"%{search}%",
+        "workbook_name": workbook_name,
+        "workbook_like": f"%{Path(workbook_name).name}%",
+    }
+
+    with engine.begin() as connection:
+        daily_table = connection.execute(
+            text("SELECT to_regclass('public.mpps_daily_stock_entries')")
+        ).scalar()
+
+        if not daily_table:
+            rows = []
+        else:
+            where = (
+                "WHERE stock_date = :stock_date "
+                "AND source_file IS NOT NULL "
+                "AND BTRIM(source_file) <> '' "
+                "AND (source_file = :workbook_name "
+                "OR source_file ILIKE :workbook_like) "
+            )
+            if search:
+                where += (
+                    "AND (sap_code ILIKE :search "
+                    "OR tyre_description ILIKE :search) "
+                )
+
+            rows = connection.execute(
+                text(
+                    "SELECT sap_code, tyre_description, production_qty, "
+                    "fg_qty, qc_qty, scrap_qty, blocked_qty, "
+                    "(fg_qty + qc_qty - scrap_qty - blocked_qty) AS available_qty "
+                    "FROM mpps_daily_stock_entries "
+                    + where +
+                    "ORDER BY available_qty DESC, sap_code ASC"
+                ),
+                params,
+            ).mappings().all()
+
+    if not rows:
+        self.source_status.setText(
+            "NO DATA • Committed OVEN workbook found for "
+            f"{stock_date.isoformat()}, but no Excel-backed "
+            "Daily Stock rows are stored for this date."
+        )
+        return
+
+    self.source_status.setText(
+        f"OVEN {stock_date.isoformat()} • "
+        f"{workbook_name or 'committed workbook'} • {len(rows):,} rows"
+    )
+
+    for row_index, row in enumerate(rows):
+        self.table.insertRow(row_index)
+
+        values = [
+            row["sap_code"],
+            row["tyre_description"],
+            self._format_int(row["production_qty"]),
+            self._format_int(row["fg_qty"]),
+            self._format_int(row["qc_qty"]),
+            self._format_int(row["scrap_qty"]),
+            self._format_int(row["blocked_qty"]),
+            self._format_int(row["available_qty"]),
+        ]
+
+        for col_index, value in enumerate(values):
+            item = QTableWidgetItem(str(value))
+            item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+
+            if col_index in {0, 2, 3, 4, 5, 6, 7}:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            if col_index == 7:
+                self._apply_available_style(
+                    item,
+                    int(row["available_qty"] or 0),
+                )
+
+            self.table.setItem(row_index, col_index, item)
+
+
+DailyStockPage.__init__ = _mpps_v22_daily_stock_init
+DailyStockPage._build_control_card = _mpps_v22_daily_stock_build_control_card
+DailyStockPage._build_table_card = _mpps_v22_daily_stock_build_table_card
+DailyStockPage._setup_table = _mpps_v22_daily_stock_setup_table
+DailyStockPage._latest_committed_excel_date = _mpps_v22_daily_stock_latest_date
+DailyStockPage._committed_source_for_date = _mpps_v22_daily_stock_source_for_date
+DailyStockPage.refresh = _mpps_v22_daily_stock_refresh
+DailyStockPage.refresh_table = _mpps_v22_daily_stock_refresh_table
+
+
+# MPPS V22.2 DAILY STOCK CLEAN HEADER
+_mpps_v22_2_base_init = DailyStockPage.__init__
+_mpps_v22_2_base_refresh_table = DailyStockPage.refresh_table
+
+
+def _mpps_v22_2_build_control_card(self):
+    card = QFrame()
+    card.setObjectName("ControlCard")
+
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(18, 16, 18, 18)
+    layout.setSpacing(14)
+
+    title = QLabel("Daily Stock")
+    title.setObjectName("PageTitle")
+    layout.addWidget(title)
+
+    form = QGridLayout()
+    form.setHorizontalSpacing(12)
+    form.setVerticalSpacing(10)
+
+    date_label = QLabel("Date")
+    date_label.setObjectName("FieldLabel")
+
+    search_label = QLabel("Search")
+    search_label.setObjectName("FieldLabel")
+
+    form.addWidget(date_label, 0, 0)
+    form.addWidget(self.date_input, 0, 1, 1, 5)
+
+    form.addWidget(search_label, 1, 0)
+    form.addWidget(self.search_input, 1, 1, 1, 5)
+
+    form.setColumnStretch(1, 1)
+
+    layout.addLayout(form)
+    return card
+
+
+def _mpps_v22_2_build_table_card(self):
+    card = QFrame()
+    card.setObjectName("TableCard")
+
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(18, 16, 18, 18)
+    layout.setSpacing(14)
+
+    title = QLabel("Daily Production List")
+    title.setObjectName("PageTitle")
+
+    hint = QLabel(
+        "Selected-date snapshot from the committed OVEN workbook. "
+        "This page does not create, edit, or overwrite factory stock data."
+    )
+    hint.setObjectName("PageHint")
+    hint.setWordWrap(True)
+
+    self.no_data_label = QLabel("")
+    self.no_data_label.setObjectName("DailyNoData")
+    self.no_data_label.setWordWrap(True)
+    self.no_data_label.setAlignment(
+        Qt.AlignmentFlag.AlignCenter
+    )
+    self.no_data_label.hide()
+
+    layout.addWidget(title)
+    layout.addWidget(hint)
+    layout.addWidget(self.no_data_label)
+    layout.addWidget(self.table, 1)
+    return card
+
+
+def _mpps_v22_2_init(self):
+    _mpps_v22_2_base_init(self)
+
+    if hasattr(self, "source_status"):
+        self.source_status.hide()
+
+
+def _mpps_v22_2_refresh_table(self):
+    _mpps_v22_2_base_refresh_table(self)
+
+    label = getattr(self, "no_data_label", None)
+    if label is None:
+        return
+
+    status = ""
+    source_status = getattr(self, "source_status", None)
+    if source_status is not None:
+        status = source_status.text().strip()
+
+    if status.startswith("NO DATA"):
+        label.setText(status)
+        label.show()
+    elif status.startswith("Daily Stock unavailable"):
+        label.setText(status)
+        label.show()
+    else:
+        label.clear()
+        label.hide()
+
+
+DailyStockPage._build_control_card = (
+    _mpps_v22_2_build_control_card
+)
+DailyStockPage._build_table_card = (
+    _mpps_v22_2_build_table_card
+)
+DailyStockPage.__init__ = _mpps_v22_2_init
+DailyStockPage.refresh_table = (
+    _mpps_v22_2_refresh_table
+)
+
+
+# MPPS V23 DAILY STOCK PROFESSIONAL VIEW
+_mpps_v23_source_for_date = DailyStockPage._committed_source_for_date
+_mpps_v23_latest_date = DailyStockPage._latest_committed_excel_date
+
+
+def _mpps_v23_daily_stock_init(self):
+    QWidget.__init__(self)
+    self.selected_sap_code = None
+    self._latest_date_initialized = False
+    self._selected_source = None
+    self._daily_rows = []
+    self._daily_source_state = "loading"
+
+    self.date_input = QDateEdit()
+    self.date_input.setCalendarPopup(True)
+    self.date_input.setDisplayFormat("yyyy-MM-dd")
+    self.date_input.setMinimumWidth(190)
+    self.date_input.setMaximumWidth(230)
+    self.date_input.setDate(QDate.currentDate())
+    self.date_input.dateChanged.connect(self.refresh)
+
+    self.latest_badge = QLabel("LATEST DATA\n—")
+    self.latest_badge.setObjectName("DailyLatestBadge")
+    self.latest_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    self.latest_badge.setMinimumWidth(135)
+
+    self.search_input = QLineEdit()
+    self.search_input.setPlaceholderText("Search SAP code or tyre description...")
+    self.search_input.textChanged.connect(self._apply_daily_filters)
+
+    self.filter_combo = QComboBox()
+    self.filter_combo.setObjectName("DailyStockFilter")
+    self.filter_combo.addItems(
+        [
+            "All Items",
+            "Produced Items",
+            "Available Stock > 0",
+            "Scrap / Blocked Items",
+        ]
+    )
+    self.filter_combo.setMinimumWidth(190)
+    self.filter_combo.currentTextChanged.connect(self._apply_daily_filters)
+
+    self.source_status = QLabel("")
+    self.source_status.hide()
+
+    self.table = QTableWidget(0, 8)
+    self.table.setHorizontalHeaderLabels(
+        [
+            "SAP Code",
+            "Tyre Description",
+            "Production Qty",
+            "FG",
+            "QC",
+            "Scrap",
+            "Blocked",
+            "Available",
+        ]
+    )
+
+    self._setup_table()
+    self._apply_styles()
+    self._build_ui()
+    QTimer.singleShot(0, self.refresh)
+
+
+def _mpps_v23_build_control_card(self):
+    card = QFrame()
+    card.setObjectName("ControlCard")
+
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(18, 16, 18, 18)
+    layout.setSpacing(14)
+
+    title = QLabel("Daily Stock")
+    title.setObjectName("PageTitle")
+    layout.addWidget(title)
+
+    controls = QHBoxLayout()
+    controls.setSpacing(12)
+
+    date_box = QVBoxLayout()
+    date_box.setSpacing(5)
+    date_label = QLabel("Date")
+    date_label.setObjectName("FieldLabel")
+    date_box.addWidget(date_label)
+    date_box.addWidget(self.date_input)
+
+    search_box = QVBoxLayout()
+    search_box.setSpacing(5)
+    search_label = QLabel("Search")
+    search_label.setObjectName("FieldLabel")
+    search_box.addWidget(search_label)
+    search_box.addWidget(self.search_input)
+
+    filter_box = QVBoxLayout()
+    filter_box.setSpacing(5)
+    filter_label = QLabel("Filter")
+    filter_label.setObjectName("FieldLabel")
+    filter_box.addWidget(filter_label)
+    filter_box.addWidget(self.filter_combo)
+
+    controls.addLayout(date_box)
+    controls.addWidget(self.latest_badge)
+    controls.addLayout(search_box, 1)
+    controls.addLayout(filter_box)
+
+    layout.addLayout(controls)
+    return card
+
+
+def _mpps_v23_build_table_card(self):
+    card = QFrame()
+    card.setObjectName("TableCard")
+
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(18, 16, 18, 18)
+    layout.setSpacing(14)
+
+    title = QLabel("Daily Production List")
+    title.setObjectName("PageTitle")
+
+    self.empty_state = QLabel("")
+    self.empty_state.setObjectName("DailyEmptyState")
+    self.empty_state.setWordWrap(True)
+    self.empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    self.empty_state.setMinimumHeight(220)
+    self.empty_state.hide()
+
+    layout.addWidget(title)
+    layout.addWidget(self.empty_state, 1)
+    layout.addWidget(self.table, 1)
+    return card
+
+
+def _mpps_v23_setup_table(self):
+    self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    self.table.verticalHeader().setVisible(False)
+    self.table.verticalHeader().setDefaultSectionSize(44)
+    self.table.setAlternatingRowColors(True)
+    self.table.setSortingEnabled(False)
+
+    header = self.table.horizontalHeader()
+    header.setStretchLastSection(False)
+    header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+    header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+    for col in range(2, 8):
+        header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+
+    self.table.setColumnWidth(0, 135)
+    self.table.setColumnWidth(2, 120)
+    self.table.setColumnWidth(3, 85)
+    self.table.setColumnWidth(4, 85)
+    self.table.setColumnWidth(5, 85)
+    self.table.setColumnWidth(6, 90)
+    self.table.setColumnWidth(7, 100)
+
+
+def _mpps_v23_set_empty_state(self, title, detail):
+    self.table.setRowCount(0)
+    self.table.hide()
+    self.empty_state.setText(f"{title}\n\n{detail}")
+    self.empty_state.show()
+
+
+def _mpps_v23_clear_empty_state(self):
+    self.empty_state.hide()
+    self.empty_state.clear()
+    self.table.show()
+
+
+def _mpps_v23_load_selected_date(self):
+    stock_date = self.selected_date()
+    source = _mpps_v23_source_for_date(self, stock_date)
+    self._selected_source = source
+    self._daily_rows = []
+
+    if source is None:
+        self._daily_source_state = "no_source"
+        self._set_daily_empty_state(
+            "No Daily Stock Data",
+            "No committed OVEN Excel snapshot is available "
+            f"for {stock_date.isoformat()}.\n"
+            "Select another date from the calendar.",
+        )
+        return
+
+    workbook_name = str(source.get("workbook_name") or "").strip()
+    params = {
+        "stock_date": stock_date,
+        "workbook_name": workbook_name,
+        "workbook_like": f"%{Path(workbook_name).name}%",
+    }
+
+    with engine.begin() as connection:
+        daily_table = connection.execute(
+            text("SELECT to_regclass('public.mpps_daily_stock_entries')")
+        ).scalar()
+
+        if not daily_table:
+            rows = []
+        else:
+            rows = connection.execute(
+                text(
+                    "SELECT sap_code, tyre_description, production_qty, "
+                    "fg_qty, qc_qty, scrap_qty, blocked_qty, "
+                    "(fg_qty + qc_qty - scrap_qty - blocked_qty) AS available_qty "
+                    "FROM mpps_daily_stock_entries "
+                    "WHERE stock_date = :stock_date "
+                    "AND source_file IS NOT NULL "
+                    "AND BTRIM(source_file) <> '' "
+                    "AND (source_file = :workbook_name "
+                    "OR source_file ILIKE :workbook_like) "
+                    "ORDER BY available_qty DESC, sap_code ASC"
+                ),
+                params,
+            ).mappings().all()
+
+    self._daily_rows = [dict(row) for row in rows]
+
+    if not self._daily_rows:
+        self._daily_source_state = "no_rows"
+        self._set_daily_empty_state(
+            "No Daily Stock Data",
+            "A committed OVEN workbook exists for "
+            f"{stock_date.isoformat()}, but no Excel-backed Daily Stock "
+            "snapshot is stored for this date.\n"
+            "Select another date from the calendar.",
+        )
+        return
+
+    self._daily_source_state = "ready"
+    self._apply_daily_filters()
+
+
+def _mpps_v23_apply_filters(self, *_args):
+    if self._daily_source_state != "ready":
+        return
+
+    query = self.search_input.text().strip().lower()
+    mode = self.filter_combo.currentText().strip()
+    visible = []
+
+    for row in self._daily_rows:
+        sap_code = str(row.get("sap_code") or "")
+        description = str(row.get("tyre_description") or "")
+
+        if query and query not in sap_code.lower() and query not in description.lower():
+            continue
+
+        production = int(row.get("production_qty") or 0)
+        available = int(row.get("available_qty") or 0)
+        scrap = int(row.get("scrap_qty") or 0)
+        blocked = int(row.get("blocked_qty") or 0)
+
+        if mode == "Produced Items" and production <= 0:
+            continue
+        if mode == "Available Stock > 0" and available <= 0:
+            continue
+        if mode == "Scrap / Blocked Items" and scrap <= 0 and blocked <= 0:
+            continue
+
+        visible.append(row)
+
+    if not visible:
+        self.table.setRowCount(0)
+        self.table.hide()
+        self.empty_state.setText(
+            "No Matching Items\n\n"
+            "No Daily Stock items match the current search and filter."
+        )
+        self.empty_state.show()
+        return
+
+    self._clear_daily_empty_state()
+    self.table.setRowCount(0)
+
+    zero_color = QColor("#94a3b8")
+    warning_color = QColor("#b45309")
+    danger_color = QColor("#b91c1c")
+    positive_color = QColor("#047857")
+
+    for row_index, row in enumerate(visible):
+        self.table.insertRow(row_index)
+
+        raw_values = [
+            row.get("sap_code") or "",
+            row.get("tyre_description") or "",
+            int(row.get("production_qty") or 0),
+            int(row.get("fg_qty") or 0),
+            int(row.get("qc_qty") or 0),
+            int(row.get("scrap_qty") or 0),
+            int(row.get("blocked_qty") or 0),
+            int(row.get("available_qty") or 0),
+        ]
+
+        for col_index, value in enumerate(raw_values):
+            display_value = value if col_index < 2 else self._format_int(value)
+            item = QTableWidgetItem(str(display_value))
+            item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+
+            if col_index in {0, 2, 3, 4, 5, 6, 7}:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            if col_index >= 2 and int(value or 0) == 0:
+                item.setForeground(zero_color)
+
+            if col_index == 5 and int(value or 0) > 0:
+                item.setForeground(warning_color)
+
+            if col_index == 6 and int(value or 0) > 0:
+                item.setForeground(danger_color)
+
+            if col_index == 7 and int(value or 0) > 0:
+                item.setForeground(positive_color)
+
+            self.table.setItem(row_index, col_index, item)
+
+
+def _mpps_v23_refresh(self):
+    try:
+        latest = _mpps_v23_latest_date(self)
+        self.latest_badge.setText(
+            "LATEST DATA\n" + (latest.isoformat() if latest is not None else "—")
+        )
+
+        if not self._latest_date_initialized:
+            self._latest_date_initialized = True
+            if latest is not None:
+                self.date_input.blockSignals(True)
+                self.date_input.setDate(QDate(latest.year, latest.month, latest.day))
+                self.date_input.blockSignals(False)
+
+        self._load_daily_selected_date()
+    except Exception as exc:
+        self._daily_source_state = "error"
+        self._set_daily_empty_state("Daily Stock Unavailable", str(exc))
+
+
+def _mpps_v23_refresh_table(self):
+    self._load_daily_selected_date()
+
+
+DailyStockPage.__init__ = _mpps_v23_daily_stock_init
+DailyStockPage._build_control_card = _mpps_v23_build_control_card
+DailyStockPage._build_table_card = _mpps_v23_build_table_card
+DailyStockPage._setup_table = _mpps_v23_setup_table
+DailyStockPage._set_daily_empty_state = _mpps_v23_set_empty_state
+DailyStockPage._clear_daily_empty_state = _mpps_v23_clear_empty_state
+DailyStockPage._load_daily_selected_date = _mpps_v23_load_selected_date
+DailyStockPage._apply_daily_filters = _mpps_v23_apply_filters
+DailyStockPage.refresh = _mpps_v23_refresh
+DailyStockPage.refresh_table = _mpps_v23_refresh_table

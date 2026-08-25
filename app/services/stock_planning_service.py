@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -722,7 +722,6 @@ def build_capacity_preview(
     stock: StockPlanningRow,
 ) -> CapacityPreviewRow:
     """Capacity preview routed through the V11 real-capacity resolver."""
-    FactoryResourceIntelligenceService.ensure_schema(session)
     resolved = FactoryResourceIntelligenceService.resolve_capacity(
         session,
         stock.material_code,

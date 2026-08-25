@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date
@@ -226,6 +226,142 @@ def _merge_payload(stored: dict[str, Any] | None) -> dict[str, Any]:
     return result
 
 
+def _table_exists(session, table_name: str) -> bool:
+    try:
+        return bool(
+            session.execute(
+                text("SELECT to_regclass(:name) IS NOT NULL"),
+                {"name": f"public.{table_name}"},
+            ).scalar()
+        )
+    except Exception:
+        return False
+
+
+def _latest_saved_run_id(session, report_date: str | date) -> int | None:
+    if not _table_exists(session, "mpps_cavity_plan_runs"):
+        return None
+    row = session.execute(
+        text(
+            """
+            SELECT id
+            FROM mpps_cavity_plan_runs
+            WHERE plan_date=CAST(:report_date AS DATE)
+              AND UPPER(COALESCE(status,'SAVED')) NOT IN (
+                  'CANCELLED','VOID','REJECTED'
+              )
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """
+        ),
+        {"report_date": str(report_date)},
+    ).first()
+    return int(row[0]) if row else None
+
+
+def _saved_shift_rows(
+    session,
+    report_date: str | date,
+    shift_name: str | None = None,
+) -> tuple[int | None, list[dict[str, Any]]]:
+    run_id = _latest_saved_run_id(session, report_date)
+    if run_id is None or not _table_exists(session, "mpps_cavity_plan_rows"):
+        return None, []
+
+    where_shift = ""
+    params: dict[str, Any] = {"run_id": run_id}
+    if shift_name:
+        shift = str(shift_name).strip().upper()
+        if shift not in {"DAY", "NIGHT"}:
+            return run_id, []
+        params["shift_name"] = shift
+        where_shift = """
+          AND (
+                CASE
+                    WHEN :shift_name='DAY' THEN COALESCE(day_plan_pcs,0)
+                    ELSE COALESCE(night_plan_pcs,0)
+                END
+              ) > 0
+        """
+
+    rows = session.execute(
+        text(
+            f"""
+            SELECT
+                run_id,
+                plan_date,
+                priority_no,
+                shipment_id,
+                shipment_item_id,
+                line_name,
+                oven_no,
+                tyre_code AS sap_code,
+                description,
+                day_plan_pcs,
+                night_plan_pcs,
+                day_plan_weight,
+                night_plan_weight,
+                allocation_status
+            FROM mpps_cavity_plan_rows
+            WHERE run_id=:run_id
+              AND UPPER(COALESCE(allocation_status,'PLANNED'))='PLANNED'
+              {where_shift}
+            ORDER BY
+                COALESCE(priority_no,2147483647),
+                line_name,
+                oven_no,
+                sequence_no,
+                id
+            """
+        ),
+        params,
+    ).mappings().all()
+    return run_id, [dict(row) for row in rows]
+
+
+def _oven_shift_rows(
+    session,
+    report_date: str | date,
+    shift_name: str | None = None,
+) -> list[dict[str, Any]]:
+    if not _table_exists(session, "mpps_oven_plan"):
+        return []
+
+    params: dict[str, Any] = {"report_date": str(report_date)}
+    where_shift = ""
+    if shift_name:
+        params["shift_name"] = str(shift_name).strip().upper()
+        where_shift = (
+            "AND UPPER(COALESCE(shift_name,'')) = UPPER(:shift_name)"
+        )
+
+    rows = session.execute(
+        text(
+            f"""
+            SELECT
+                COALESCE(NULLIF(shift_name,''),'UNSPECIFIED') AS shift_name,
+                COALESCE(oven_code,'') AS oven_no,
+                COALESCE(material_code,'') AS sap_code,
+                COALESCE(item_description,'') AS description,
+                COALESCE(source_note,'') AS source_note,
+                COALESCE(planned_qty,0) AS planned_qty,
+                COALESCE(planned_weight_kg,0) AS planned_weight_kg,
+                CONCAT(
+                    COALESCE(source_workbook,''),
+                    ' / ',
+                    COALESCE(source_sheet,'')
+                ) AS source
+            FROM mpps_oven_plan
+            WHERE plan_date=CAST(:report_date AS DATE)
+              {where_shift}
+            ORDER BY shift_name, oven_code, material_code, source_row
+            """
+        ),
+        params,
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
 class ShiftDailyReportService:
     @staticmethod
     def ensure_schema() -> None:
@@ -256,50 +392,249 @@ class ShiftDailyReportService:
             )
 
     @staticmethod
-    def load_targets(report_date: str | date, shift_name: str) -> dict[str, Any]:
-        # mpps_oven_plan intentionally stores the imported Excel line in
-        # source_note ("...; line=<name>; ...") rather than in a dedicated
-        # line_name column.  Older code queried line_name directly and failed
-        # on the production schema with psycopg UndefinedColumn.
+    def list_plan_dates(limit: int = 180) -> list[str]:
+        """Saved production-plan dates first; imported OVEN dates are fallback/history."""
+        bounded = max(1, min(730, int(limit)))
         with _get_session() as session:
-            database_rows = [
-                dict(row)
-                for row in session.execute(
-                    text(
-                        """
-                        SELECT
-                            COALESCE(oven_code, '') AS oven_code,
-                            COALESCE(source_note, '') AS source_note,
-                            COALESCE(planned_qty, 0) AS planned_qty,
-                            COALESCE(planned_weight_kg, 0) AS planned_weight_kg
-                        FROM mpps_oven_plan
-                        WHERE plan_date = CAST(:report_date AS DATE)
-                          AND UPPER(COALESCE(shift_name, '')) = UPPER(:shift_name)
-                        ORDER BY oven_code, material_code, source_row
-                        """
+            dates: list[date] = []
+            if _table_exists(session, "mpps_cavity_plan_runs"):
+                dates.extend(
+                    row[0]
+                    for row in session.execute(
+                        text(
+                            """
+                            SELECT DISTINCT plan_date
+                            FROM mpps_cavity_plan_runs
+                            WHERE plan_date IS NOT NULL
+                              AND UPPER(COALESCE(status,'SAVED')) NOT IN (
+                                  'CANCELLED','VOID','REJECTED'
+                              )
+                            ORDER BY plan_date DESC
+                            LIMIT :limit
+                            """
+                        ),
+                        {"limit": bounded},
+                    ).all()
+                    if row[0] is not None
+                )
+            if _table_exists(session, "mpps_oven_plan"):
+                dates.extend(
+                    row[0]
+                    for row in session.execute(
+                        text(
+                            """
+                            SELECT DISTINCT plan_date
+                            FROM mpps_oven_plan
+                            WHERE plan_date IS NOT NULL
+                            ORDER BY plan_date DESC
+                            LIMIT :limit
+                            """
+                        ),
+                        {"limit": bounded},
+                    ).all()
+                    if row[0] is not None
+                )
+        return [
+            str(value)
+            for value in sorted(set(dates), reverse=True)[:bounded]
+        ]
+
+    @staticmethod
+    def load_live_plan(report_date: str | date) -> dict[str, Any]:
+        """Canonical shift-plan view.
+
+        A saved cavity-level R6 plan is the operational planning authority.
+        Imported OVEN allocations are used only when no saved plan exists for
+        the requested date, preserving historical/fallback visibility.
+        """
+        with _get_session() as session:
+            run_id, saved = _saved_shift_rows(session, report_date)
+
+            if saved:
+                rows: list[dict[str, Any]] = []
+                summary_map: dict[str, dict[str, Any]] = {
+                    "DAY": {
+                        "shift_name": "DAY",
+                        "allocation_rows": 0,
+                        "planned_qty": 0,
+                        "planned_weight_kg": 0.0,
+                        "ovens": set(),
+                    },
+                    "NIGHT": {
+                        "shift_name": "NIGHT",
+                        "allocation_rows": 0,
+                        "planned_qty": 0,
+                        "planned_weight_kg": 0.0,
+                        "ovens": set(),
+                    },
+                }
+                for row in saved:
+                    for shift, qty_key, weight_key in (
+                        ("DAY", "day_plan_pcs", "day_plan_weight"),
+                        ("NIGHT", "night_plan_pcs", "night_plan_weight"),
+                    ):
+                        qty = int(row.get(qty_key) or 0)
+                        weight = float(row.get(weight_key) or 0)
+                        if qty <= 0 and abs(weight) <= 1e-12:
+                            continue
+                        target = summary_map[shift]
+                        target["allocation_rows"] += 1
+                        target["planned_qty"] += qty
+                        target["planned_weight_kg"] += weight
+                        target["ovens"].add(str(row.get("oven_no") or ""))
+                        rows.append(
+                            {
+                                "shift_name": shift,
+                                "oven_code": row.get("oven_no"),
+                                "material_code": row.get("sap_code"),
+                                "item_description": row.get("description"),
+                                "planned_qty": qty,
+                                "planned_weight_kg": weight,
+                                "priority_no": row.get("priority_no"),
+                                "source": f"SAVED R6 PLAN / RUN {run_id}",
+                            }
+                        )
+                summary = []
+                for shift in ("DAY", "NIGHT"):
+                    item = summary_map[shift]
+                    if item["allocation_rows"] <= 0:
+                        continue
+                    summary.append(
+                        {
+                            "shift_name": shift,
+                            "allocation_rows": item["allocation_rows"],
+                            "planned_qty": item["planned_qty"],
+                            "planned_weight_kg": round(
+                                item["planned_weight_kg"], 5
+                            ),
+                            "ovens": len(
+                                {value for value in item["ovens"] if value}
+                            ),
+                        }
+                    )
+                return {
+                    "plan_date": str(report_date),
+                    "authority": "SAVED_R6_CAVITY_PLAN",
+                    "run_id": run_id,
+                    "summary": summary,
+                    "rows": rows,
+                }
+
+            imported = _oven_shift_rows(session, report_date)
+            summary_map: dict[str, dict[str, Any]] = {}
+            rows: list[dict[str, Any]] = []
+            for row in imported:
+                shift = str(row.get("shift_name") or "UNSPECIFIED").upper()
+                bucket = summary_map.setdefault(
+                    shift,
+                    {
+                        "shift_name": shift,
+                        "allocation_rows": 0,
+                        "planned_qty": 0,
+                        "planned_weight_kg": 0.0,
+                        "ovens": set(),
+                    },
+                )
+                qty = int(row.get("planned_qty") or 0)
+                weight = float(row.get("planned_weight_kg") or 0)
+                bucket["allocation_rows"] += 1
+                bucket["planned_qty"] += qty
+                bucket["planned_weight_kg"] += weight
+                bucket["ovens"].add(str(row.get("oven_no") or ""))
+                rows.append(
+                    {
+                        "shift_name": shift,
+                        "oven_code": row.get("oven_no"),
+                        "material_code": row.get("sap_code"),
+                        "item_description": row.get("description"),
+                        "planned_qty": qty,
+                        "planned_weight_kg": weight,
+                        "priority_no": None,
+                        "source": row.get("source") or "IMPORTED OVEN FALLBACK",
+                    }
+                )
+            summary = [
+                {
+                    "shift_name": value["shift_name"],
+                    "allocation_rows": value["allocation_rows"],
+                    "planned_qty": value["planned_qty"],
+                    "planned_weight_kg": round(
+                        value["planned_weight_kg"], 5
                     ),
-                    {"report_date": str(report_date), "shift_name": shift_name},
-                ).mappings().all()
+                    "ovens": len(
+                        {item for item in value["ovens"] if item}
+                    ),
+                }
+                for value in summary_map.values()
             ]
+            return {
+                "plan_date": str(report_date),
+                "authority": "IMPORTED_OVEN_FALLBACK",
+                "run_id": None,
+                "summary": sorted(
+                    summary, key=lambda row: row["shift_name"]
+                ),
+                "rows": rows,
+            }
+
+    @staticmethod
+    def load_targets(report_date: str | date, shift_name: str) -> dict[str, Any]:
+        shift = str(shift_name or "").strip().upper()
+        if shift not in {"DAY", "NIGHT"}:
+            raise ValueError("Shift target must be DAY or NIGHT.")
+
+        with _get_session() as session:
+            run_id, saved = _saved_shift_rows(
+                session,
+                report_date,
+                shift,
+            )
+            if saved:
+                qty_key = "day_plan_pcs" if shift == "DAY" else "night_plan_pcs"
+                weight_key = (
+                    "day_plan_weight" if shift == "DAY" else "night_plan_weight"
+                )
+                rows = [
+                    {
+                        "line_name": row.get("line_name"),
+                        "planned_qty": row.get(qty_key) or 0,
+                        "planned_weight_kg": row.get(weight_key) or 0,
+                    }
+                    for row in saved
+                ]
+                result = aggregate_excel_report_targets(rows)
+                result["authority"] = "SAVED_R6_CAVITY_PLAN"
+                result["run_id"] = run_id
+                return result
+
+            database_rows = _oven_shift_rows(
+                session,
+                report_date,
+                shift,
+            )
 
         rows: list[dict[str, Any]] = []
         for row in database_rows:
             source_note = str(row.get("source_note") or "")
-            match = re.search(r"(?:^|;\s*)line=([^;]*)", source_note, flags=re.IGNORECASE)
+            match = re.search(
+                r"(?:^|;\s*)line=([^;]*)",
+                source_note,
+                flags=re.IGNORECASE,
+            )
             imported_line = match.group(1).strip() if match else ""
             rows.append(
                 {
-                    # Fall back to oven_code for legacy rows that pre-date the
-                    # importer trace note.  Known Excel line labels can still
-                    # be classified, while unknown ones are surfaced as
-                    # unmapped instead of being silently discarded.
-                    "line_name": imported_line or str(row.get("oven_code") or ""),
+                    "line_name": imported_line
+                    or str(row.get("oven_no") or ""),
                     "planned_qty": row.get("planned_qty") or 0,
                     "planned_weight_kg": row.get("planned_weight_kg") or 0,
                 }
             )
 
-        return aggregate_excel_report_targets(rows)
+        result = aggregate_excel_report_targets(rows)
+        result["authority"] = "IMPORTED_OVEN_FALLBACK"
+        result["run_id"] = None
+        return result
 
     @staticmethod
     def load_report(report_date: str | date, shift_name: str) -> dict[str, Any]:

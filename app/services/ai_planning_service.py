@@ -1,9 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, timedelta
 import json
+import os
 import math
 from statistics import mean, median
 from typing import Any
@@ -300,6 +301,11 @@ class AIPlanningService:
         return [dict(row) for row in rows]
 
     def capture_final_excel_plan(self, session, *, import_run_id: int, analysis) -> dict[str, int]:
+        """Persist per-workbook final-plan truth with one batched PostgreSQL write.
+
+        R7.4.3 MAX-THROUGHPUT keeps the exact row semantics but removes one
+        client/server round trip per SAP/date item.
+        """
         self.ensure_schema(session)
         grouped: dict[tuple[date, str], dict[str, Any]] = {}
         for row in analysis.oven_rows:
@@ -332,8 +338,17 @@ class AIPlanningService:
                 record["night_plan_qty"] += qty
             record["planned_weight_kg"] += max(0.0, _float(row.get("planned_weight_kg")))
 
+        params = []
         for record in grouped.values():
-            total = record["day_plan_qty"] + record["night_plan_qty"]
+            params.append(
+                {
+                    "import_run_id": int(import_run_id),
+                    "total_plan_qty": record["day_plan_qty"] + record["night_plan_qty"],
+                    "source_workbook": analysis.workbook_name,
+                    **record,
+                }
+            )
+        if params:
             session.execute(
                 text(
                     """
@@ -356,24 +371,34 @@ class AIPlanningService:
                         source_workbook = EXCLUDED.source_workbook
                     """
                 ),
-                {
-                    "import_run_id": int(import_run_id),
-                    "total_plan_qty": total,
-                    "source_workbook": analysis.workbook_name,
-                    **record,
-                },
+                params,
             )
         return {"final_excel_plan_items": len(grouped)}
 
     def capture_actual_production(self, session, *, import_run_id: int, analysis) -> dict[str, int]:
+        """Persist verified actual-production truth using batched UPSERTs."""
         self.ensure_schema(session)
         rows = getattr(analysis, "production_history_rows", []) or []
         actual_dates = getattr(analysis, "actual_production_dates", []) or []
+
+        date_params = []
         for date_row in actual_dates:
             try:
                 production_date = date.fromisoformat(str(date_row.get("production_date")))
             except Exception:
                 continue
+            date_params.append(
+                {
+                    "production_date": production_date,
+                    "source_workbook": analysis.workbook_name,
+                    "source_sheet": str(date_row.get("source_sheet") or "PROD"),
+                    "source_day_column": str(date_row.get("source_day_column") or ""),
+                    "source_night_column": str(date_row.get("source_night_column") or ""),
+                    "source_import_run_id": int(import_run_id),
+                    "is_complete": bool(date_row.get("is_complete", True)),
+                }
+            )
+        if date_params:
             session.execute(
                 text(
                     """
@@ -406,17 +431,10 @@ class AIPlanningService:
                           )
                     """
                 ),
-                {
-                    "production_date": production_date,
-                    "source_workbook": analysis.workbook_name,
-                    "source_sheet": str(date_row.get("source_sheet") or "PROD"),
-                    "source_day_column": str(date_row.get("source_day_column") or ""),
-                    "source_night_column": str(date_row.get("source_night_column") or ""),
-                    "source_import_run_id": int(import_run_id),
-                    "is_complete": bool(date_row.get("is_complete", True)),
-                },
+                date_params,
             )
-        captured = 0
+
+        row_params = []
         for row in rows:
             sap = _code(row.get("sap_code"))
             if not sap:
@@ -430,9 +448,24 @@ class AIPlanningService:
             total_qty = max(0, _int(row.get("production_qty", day_qty + night_qty)))
             if total_qty <= 0:
                 continue
-            # Prefer explicit paired total if supplied by the importer.
             if day_qty + night_qty > 0:
                 total_qty = day_qty + night_qty
+            row_params.append(
+                {
+                    "production_date": production_date,
+                    "sap_code": sap,
+                    "item_description": str(row.get("description") or ""),
+                    "day_actual_qty": day_qty,
+                    "night_actual_qty": night_qty,
+                    "total_actual_qty": total_qty,
+                    "source_day_column": str(row.get("source_day_column") or ""),
+                    "source_night_column": str(row.get("source_night_column") or ""),
+                    "source_workbook": analysis.workbook_name,
+                    "source_sheet": str(row.get("source_sheet") or "PROD"),
+                    "source_import_run_id": int(import_run_id),
+                }
+            )
+        if row_params:
             session.execute(
                 text(
                     """
@@ -473,27 +506,20 @@ class AIPlanningService:
                           )
                     """
                 ),
-                {
-                    "production_date": production_date,
-                    "sap_code": sap,
-                    "item_description": str(row.get("description") or ""),
-                    "day_actual_qty": day_qty,
-                    "night_actual_qty": night_qty,
-                    "total_actual_qty": total_qty,
-                    "source_day_column": str(row.get("source_day_column") or ""),
-                    "source_night_column": str(row.get("source_night_column") or ""),
-                    "source_workbook": analysis.workbook_name,
-                    "source_sheet": str(row.get("source_sheet") or "PROD"),
-                    "source_import_run_id": int(import_run_id),
-                },
+                row_params,
             )
-            captured += 1
         return {
-            "verified_actual_production_rows": captured,
-            "verified_actual_production_dates": len(actual_dates),
+            "verified_actual_production_rows": len(row_params),
+            "verified_actual_production_dates": len(date_params),
         }
 
     def reconcile_plan_vs_actual(self, session) -> dict[str, int]:
+        """Rebuild plan-vs-actual reconciliation without rewriting unchanged rows.
+
+        R7.4.2 batches PostgreSQL writes and adds an IS DISTINCT FROM guard.
+        This preserves the exact reconciliation truth while avoiding millions of
+        no-op UPDATE row versions during repeated learning refreshes.
+        """
         self.ensure_schema(session)
         final_rows = self._latest_final_plan_rows(session)
         actual_rows = session.execute(
@@ -509,6 +535,71 @@ class AIPlanningService:
                 text("SELECT production_date FROM mpps_actual_production_dates WHERE is_complete = TRUE")
             ).mappings().all()
         }
+
+        upsert_sql = text(
+            """
+            INSERT INTO mpps_plan_actual_reconciliation (
+                production_date, sap_code, item_description,
+                plan_day_qty, plan_night_qty, plan_total_qty,
+                actual_day_qty, actual_night_qty, actual_total_qty,
+                variance_qty, achievement_pct, abs_error_pct, status,
+                source_plan_run_id, source_actual_run_id, updated_at
+            ) VALUES (
+                :production_date, :sap_code, :item_description,
+                :plan_day_qty, :plan_night_qty, :plan_total_qty,
+                :actual_day_qty, :actual_night_qty, :actual_total_qty,
+                :variance_qty, :achievement_pct, :abs_error_pct, :status,
+                :source_plan_run_id, :source_actual_run_id, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (production_date, sap_code)
+            DO UPDATE SET
+                item_description = EXCLUDED.item_description,
+                plan_day_qty = EXCLUDED.plan_day_qty,
+                plan_night_qty = EXCLUDED.plan_night_qty,
+                plan_total_qty = EXCLUDED.plan_total_qty,
+                actual_day_qty = EXCLUDED.actual_day_qty,
+                actual_night_qty = EXCLUDED.actual_night_qty,
+                actual_total_qty = EXCLUDED.actual_total_qty,
+                variance_qty = EXCLUDED.variance_qty,
+                achievement_pct = EXCLUDED.achievement_pct,
+                abs_error_pct = EXCLUDED.abs_error_pct,
+                status = EXCLUDED.status,
+                source_plan_run_id = EXCLUDED.source_plan_run_id,
+                source_actual_run_id = EXCLUDED.source_actual_run_id,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE (
+                mpps_plan_actual_reconciliation.item_description,
+                mpps_plan_actual_reconciliation.plan_day_qty,
+                mpps_plan_actual_reconciliation.plan_night_qty,
+                mpps_plan_actual_reconciliation.plan_total_qty,
+                mpps_plan_actual_reconciliation.actual_day_qty,
+                mpps_plan_actual_reconciliation.actual_night_qty,
+                mpps_plan_actual_reconciliation.actual_total_qty,
+                mpps_plan_actual_reconciliation.variance_qty,
+                mpps_plan_actual_reconciliation.achievement_pct,
+                mpps_plan_actual_reconciliation.abs_error_pct,
+                mpps_plan_actual_reconciliation.status,
+                mpps_plan_actual_reconciliation.source_plan_run_id,
+                mpps_plan_actual_reconciliation.source_actual_run_id
+            ) IS DISTINCT FROM (
+                EXCLUDED.item_description,
+                EXCLUDED.plan_day_qty,
+                EXCLUDED.plan_night_qty,
+                EXCLUDED.plan_total_qty,
+                EXCLUDED.actual_day_qty,
+                EXCLUDED.actual_night_qty,
+                EXCLUDED.actual_total_qty,
+                EXCLUDED.variance_qty,
+                EXCLUDED.achievement_pct,
+                EXCLUDED.abs_error_pct,
+                EXCLUDED.status,
+                EXCLUDED.source_plan_run_id,
+                EXCLUDED.source_actual_run_id
+            )
+            """
+        )
+
+        batch: list[dict[str, Any]] = []
         reconciled = 0
         for plan in final_rows:
             key = (plan["plan_date"], _code(plan["sap_code"]))
@@ -523,6 +614,7 @@ class AIPlanningService:
                 }
             if actual is None:
                 continue
+
             plan_total = max(0, _int(plan.get("total_plan_qty")))
             actual_total = max(0, _int(actual.get("total_actual_qty")))
             variance = actual_total - plan_total
@@ -540,40 +632,8 @@ class AIPlanningService:
                 status = "SHORT PRODUCTION"
             else:
                 status = "OVER PRODUCED"
-            session.execute(
-                text(
-                    """
-                    INSERT INTO mpps_plan_actual_reconciliation (
-                        production_date, sap_code, item_description,
-                        plan_day_qty, plan_night_qty, plan_total_qty,
-                        actual_day_qty, actual_night_qty, actual_total_qty,
-                        variance_qty, achievement_pct, abs_error_pct, status,
-                        source_plan_run_id, source_actual_run_id, updated_at
-                    ) VALUES (
-                        :production_date, :sap_code, :item_description,
-                        :plan_day_qty, :plan_night_qty, :plan_total_qty,
-                        :actual_day_qty, :actual_night_qty, :actual_total_qty,
-                        :variance_qty, :achievement_pct, :abs_error_pct, :status,
-                        :source_plan_run_id, :source_actual_run_id, CURRENT_TIMESTAMP
-                    )
-                    ON CONFLICT (production_date, sap_code)
-                    DO UPDATE SET
-                        item_description = EXCLUDED.item_description,
-                        plan_day_qty = EXCLUDED.plan_day_qty,
-                        plan_night_qty = EXCLUDED.plan_night_qty,
-                        plan_total_qty = EXCLUDED.plan_total_qty,
-                        actual_day_qty = EXCLUDED.actual_day_qty,
-                        actual_night_qty = EXCLUDED.actual_night_qty,
-                        actual_total_qty = EXCLUDED.actual_total_qty,
-                        variance_qty = EXCLUDED.variance_qty,
-                        achievement_pct = EXCLUDED.achievement_pct,
-                        abs_error_pct = EXCLUDED.abs_error_pct,
-                        status = EXCLUDED.status,
-                        source_plan_run_id = EXCLUDED.source_plan_run_id,
-                        source_actual_run_id = EXCLUDED.source_actual_run_id,
-                        updated_at = CURRENT_TIMESTAMP
-                    """
-                ),
+
+            batch.append(
                 {
                     "production_date": plan["plan_date"],
                     "sap_code": plan["sap_code"],
@@ -590,9 +650,15 @@ class AIPlanningService:
                     "status": status,
                     "source_plan_run_id": plan.get("import_run_id"),
                     "source_actual_run_id": actual.get("source_import_run_id"),
-                },
+                }
             )
             reconciled += 1
+            if len(batch) >= 5000:
+                session.execute(upsert_sql, batch)
+                batch.clear()
+
+        if batch:
+            session.execute(upsert_sql, batch)
         return {"plan_actual_reconciled_rows": reconciled}
 
     @staticmethod
@@ -967,6 +1033,12 @@ class AIPlanningService:
         }
 
     def evaluate_ai_runs(self, session) -> dict[str, int]:
+        """Evaluate all shadow AI plan items with batched, no-op-safe upserts.
+
+        The evaluation table is derived state. R7.4.2 avoids one round trip and
+        one new row version per AI item by batching writes and updating only
+        rows whose evaluation values actually changed.
+        """
         self.ensure_schema(session)
         final_map = {
             (row["plan_date"], _code(row["sap_code"])): row
@@ -994,8 +1066,58 @@ class AIPlanningService:
                 """
             )
         ).mappings().all()
+
+        upsert_sql = text(
+            """
+            INSERT INTO mpps_ai_plan_evaluation (
+                ai_run_id, plan_date, sap_code,
+                ai_recommended_total_qty, ai_expected_actual_qty,
+                final_excel_total_qty, actual_total_qty,
+                ai_vs_final_error_pct, ai_expected_vs_actual_error_pct,
+                evaluation_status, updated_at
+            ) VALUES (
+                :ai_run_id, :plan_date, :sap_code,
+                :ai_recommended_total_qty, :ai_expected_actual_qty,
+                :final_excel_total_qty, :actual_total_qty,
+                :ai_vs_final_error_pct, :ai_expected_vs_actual_error_pct,
+                :evaluation_status, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (ai_run_id, sap_code)
+            DO UPDATE SET
+                plan_date = EXCLUDED.plan_date,
+                ai_recommended_total_qty = EXCLUDED.ai_recommended_total_qty,
+                ai_expected_actual_qty = EXCLUDED.ai_expected_actual_qty,
+                final_excel_total_qty = EXCLUDED.final_excel_total_qty,
+                actual_total_qty = EXCLUDED.actual_total_qty,
+                ai_vs_final_error_pct = EXCLUDED.ai_vs_final_error_pct,
+                ai_expected_vs_actual_error_pct = EXCLUDED.ai_expected_vs_actual_error_pct,
+                evaluation_status = EXCLUDED.evaluation_status,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE (
+                mpps_ai_plan_evaluation.plan_date,
+                mpps_ai_plan_evaluation.ai_recommended_total_qty,
+                mpps_ai_plan_evaluation.ai_expected_actual_qty,
+                mpps_ai_plan_evaluation.final_excel_total_qty,
+                mpps_ai_plan_evaluation.actual_total_qty,
+                mpps_ai_plan_evaluation.ai_vs_final_error_pct,
+                mpps_ai_plan_evaluation.ai_expected_vs_actual_error_pct,
+                mpps_ai_plan_evaluation.evaluation_status
+            ) IS DISTINCT FROM (
+                EXCLUDED.plan_date,
+                EXCLUDED.ai_recommended_total_qty,
+                EXCLUDED.ai_expected_actual_qty,
+                EXCLUDED.final_excel_total_qty,
+                EXCLUDED.actual_total_qty,
+                EXCLUDED.ai_vs_final_error_pct,
+                EXCLUDED.ai_expected_vs_actual_error_pct,
+                EXCLUDED.evaluation_status
+            )
+            """
+        )
+
         evaluated = 0
         validated = 0
+        batch: list[dict[str, Any]] = []
         for raw in rows:
             row = dict(raw)
             plan_date = row.get("run_plan_date") or row.get("plan_date")
@@ -1039,35 +1161,8 @@ class AIPlanningService:
                 status = "RETROSPECTIVE"
             else:
                 status = "PENDING"
-            session.execute(
-                text(
-                    """
-                    INSERT INTO mpps_ai_plan_evaluation (
-                        ai_run_id, plan_date, sap_code,
-                        ai_recommended_total_qty, ai_expected_actual_qty,
-                        final_excel_total_qty, actual_total_qty,
-                        ai_vs_final_error_pct, ai_expected_vs_actual_error_pct,
-                        evaluation_status, updated_at
-                    ) VALUES (
-                        :ai_run_id, :plan_date, :sap_code,
-                        :ai_recommended_total_qty, :ai_expected_actual_qty,
-                        :final_excel_total_qty, :actual_total_qty,
-                        :ai_vs_final_error_pct, :ai_expected_vs_actual_error_pct,
-                        :evaluation_status, CURRENT_TIMESTAMP
-                    )
-                    ON CONFLICT (ai_run_id, sap_code)
-                    DO UPDATE SET
-                        plan_date = EXCLUDED.plan_date,
-                        ai_recommended_total_qty = EXCLUDED.ai_recommended_total_qty,
-                        ai_expected_actual_qty = EXCLUDED.ai_expected_actual_qty,
-                        final_excel_total_qty = EXCLUDED.final_excel_total_qty,
-                        actual_total_qty = EXCLUDED.actual_total_qty,
-                        ai_vs_final_error_pct = EXCLUDED.ai_vs_final_error_pct,
-                        ai_expected_vs_actual_error_pct = EXCLUDED.ai_expected_vs_actual_error_pct,
-                        evaluation_status = EXCLUDED.evaluation_status,
-                        updated_at = CURRENT_TIMESTAMP
-                    """
-                ),
+
+            batch.append(
                 {
                     "ai_run_id": int(row["run_id"]),
                     "plan_date": plan_date,
@@ -1079,9 +1174,16 @@ class AIPlanningService:
                     "ai_vs_final_error_pct": round(final_error, 4) if final_error is not None else None,
                     "ai_expected_vs_actual_error_pct": round(actual_error, 4) if actual_error is not None else None,
                     "evaluation_status": status,
-                },
+                }
             )
             evaluated += 1
+            if len(batch) >= 5000:
+                session.execute(upsert_sql, batch)
+                batch.clear()
+
+        if batch:
+            session.execute(upsert_sql, batch)
+
         return {
             "ai_plan_evaluations": evaluated,
             "ai_plan_validated_items": validated,
@@ -1571,6 +1673,43 @@ class AIPlanningService:
             "ai_overall_confidence_pct": round(overall_conf, 2),
         }
 
+    def rebuild_after_historical_ingestion(self, session) -> dict[str, Any]:
+        """Run the expensive global AI refresh exactly once after bulk history.
+
+        Historical workbooks still capture their final-plan and verified-actual
+        evidence transactionally. Only whole-history reconciliation/model/evaluation
+        and shadow-plan regeneration are deferred until ingestion is complete.
+        """
+        self.ensure_schema(session)
+        result: dict[str, Any] = {}
+        result.update(self.reconcile_plan_vs_actual(session))
+        result.update(self.train_models(session))
+        result.update(self.evaluate_ai_runs(session))
+
+        source = OperationalSourceService.latest(session)
+        if source.plan_date:
+            target_date = source.plan_date + timedelta(days=1)
+            source_run_id = source.import_run_id
+        else:
+            latest_plan_date = session.execute(
+                text("SELECT MAX(plan_date) FROM mpps_final_plan_history")
+            ).scalar()
+            target_date = (latest_plan_date or date.today()) + timedelta(days=1)
+            source_run_id = None
+
+        result.update(
+            self.generate_candidate_plan(
+                session,
+                plan_date=target_date,
+                source_import_run_id=source_run_id,
+            )
+        )
+        result.update(self.evaluate_ai_runs(session))
+        result["ai_operational_source_date"] = source.plan_date.isoformat() if source.plan_date else None
+        result["ai_import_mode"] = "DEFERRED_HISTORICAL_REBUILD"
+        result["ai_history_training_only"] = False
+        return result
+
     def post_excel_import(
         self,
         session,
@@ -1579,21 +1718,39 @@ class AIPlanningService:
         analysis,
         import_mode: str = "LIVE",
     ) -> dict[str, Any]:
-        """Run V10 learning after every workbook without moving live truth backwards.
+        """Capture workbook AI evidence and refresh global AI state when appropriate.
 
-        Both LIVE and HISTORICAL workbooks contribute final-plan/actual observations
-        to training. The candidate plan is always regenerated for the day after the
-        newest LIVE OVEN workbook, never for an older historical workbook date.
+        R7.4.2 keeps per-workbook truth capture unchanged. During the dedicated
+        historical bulk-training launcher, however, global reconciliation/model/
+        evaluation/shadow-plan work is deferred and rebuilt once after ingestion.
+        Normal LIVE app imports retain the original immediate-refresh behavior.
         """
         self.ensure_schema(session)
         result: dict[str, Any] = {}
         result.update(self.capture_final_excel_plan(session, import_run_id=import_run_id, analysis=analysis))
         result.update(self.capture_actual_production(session, import_run_id=import_run_id, analysis=analysis))
+
+        normalized_mode = str(import_mode or "LIVE").upper()
+        bulk_history = (
+            normalized_mode == "HISTORICAL"
+            and str(os.environ.get("MPPS_R741_BULK_HISTORY") or "").strip().lower()
+            in {"1", "true", "yes", "on"}
+            and str(os.environ.get("MPPS_R742_DEFER_AI_GLOBAL") or "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        source = OperationalSourceService.latest(session)
+
+        if bulk_history:
+            result["ai_global_rebuild_deferred"] = True
+            result["ai_operational_source_date"] = source.plan_date.isoformat() if source.plan_date else None
+            result["ai_import_mode"] = normalized_mode
+            result["ai_history_training_only"] = True
+            return result
+
         result.update(self.reconcile_plan_vs_actual(session))
         result.update(self.train_models(session))
         result.update(self.evaluate_ai_runs(session))
 
-        source = OperationalSourceService.latest(session)
         if source.plan_date:
             target_date = source.plan_date + timedelta(days=1)
             source_run_id = source.import_run_id
@@ -1614,9 +1771,10 @@ class AIPlanningService:
         )
         result.update(self.evaluate_ai_runs(session))
         result["ai_operational_source_date"] = source.plan_date.isoformat() if source.plan_date else None
-        result["ai_import_mode"] = str(import_mode or "LIVE").upper()
-        result["ai_history_training_only"] = str(import_mode or "LIVE").upper() == "HISTORICAL"
+        result["ai_import_mode"] = normalized_mode
+        result["ai_history_training_only"] = normalized_mode == "HISTORICAL"
         return result
+
     def dashboard(self, session, limit: int = 500) -> dict[str, Any]:
         self.ensure_schema(session)
         readiness = self.get_readiness(session)

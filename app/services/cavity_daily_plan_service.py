@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -134,6 +134,7 @@ class CavityPlanRow:
     shift_name: str = ""
     shipment_id: int | None = None
     shipment_item_id: int | None = None
+    priority_no: int | None = None
     allocation_status: str = ""
     risk_reason: str = ""
 
@@ -174,6 +175,7 @@ class _Demand:
     remaining_qty: int
     shipment_id: int | None
     shipment_item_id: int | None
+    priority_no: int | None
     approval_status: str
     line_names: set[str]
     mold_type: str
@@ -337,6 +339,15 @@ def ensure_cavity_plan_schema(session: Session) -> None:
             """
         )
     )
+    session.execute(
+        text(
+            """
+            ALTER TABLE mpps_cavity_plan_rows
+            ADD COLUMN IF NOT EXISTS priority_no INTEGER
+            """
+        )
+    )
+
     for statement in [
         (
             "CREATE INDEX IF NOT EXISTS "
@@ -357,6 +368,11 @@ def ensure_cavity_plan_schema(session: Session) -> None:
             "CREATE INDEX IF NOT EXISTS "
             "ix_mpps_cavity_plan_rows_sap "
             "ON mpps_cavity_plan_rows(tyre_code)"
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS "
+            "ix_mpps_cavity_plan_rows_priority "
+            "ON mpps_cavity_plan_rows(plan_date, priority_no, shipment_id)"
         ),
     ]:
         session.execute(text(statement))
@@ -453,14 +469,14 @@ def generate_cavity_plan(
     )
 
     first_remaining = {
-        demand.sap_code: demand.remaining_qty
+        _demand_key(demand): demand.remaining_qty
         for demand in first_day_demands
     }
 
     next_day_demands: list[_Demand] = []
     for original in eligible:
         remaining = first_remaining.get(
-            original.sap_code,
+            _demand_key(original),
             original.required_qty,
         )
         if remaining <= 0:
@@ -506,29 +522,10 @@ def generate_cavity_plan(
         settings=settings,
     )
 
-    today_by_sap: dict[str, int] = defaultdict(int)
-    next_by_sap: dict[str, int] = defaultdict(int)
-    for unit in first_units:
-        today_by_sap[unit.sap_code] += 1
-    for unit in next_units:
-        next_by_sap[unit.sap_code] += 1
-
-    required_by_sap = {
-        demand.sap_code: demand.required_qty
-        for demand in demands
-    }
-    total_required = sum(required_by_sap.values())
-    total_today = sum(today_by_sap.values())
-    total_next = sum(next_by_sap.values())
-    total_balance = sum(
-        max(
-            0,
-            required_by_sap[sap]
-            - today_by_sap.get(sap, 0)
-            - next_by_sap.get(sap, 0),
-        )
-        for sap in required_by_sap
-    )
+    total_required = sum(max(0, demand.required_qty) for demand in demands)
+    total_today = len(first_units)
+    total_next = len(next_units)
+    total_balance = max(0, total_required - total_today - total_next)
 
     planned_cavity_ids = {
         unit.cavity_id for unit in first_units
@@ -679,6 +676,7 @@ def save_cavity_plan(
             shift_name,
             shipment_id,
             shipment_item_id,
+            priority_no,
             tyre_code,
             description,
             heel,
@@ -716,6 +714,7 @@ def save_cavity_plan(
             :shift_name,
             :shipment_id,
             :shipment_item_id,
+            :priority_no,
             :tyre_code,
             :description,
             :heel,
@@ -849,6 +848,7 @@ def load_latest_saved_plan(
             shift_name=str(record["shift_name"] or ""),
             shipment_id=record["shipment_id"],
             shipment_item_id=record["shipment_item_id"],
+            priority_no=(int(record["priority_no"]) if record.get("priority_no") is not None else None),
             allocation_status=str(
                 record["allocation_status"] or ""
             ),
@@ -1032,9 +1032,36 @@ def _load_production_demands(
 ) -> tuple[list[_Demand], dict[str, int]]:
     """Load one demand per shipment item in shipment-priority order."""
     item_rows = session.execute(text("""
+        WITH ranked_shipments AS (
+            SELECT
+                shipment.*,
+                ROW_NUMBER() OVER (
+                    ORDER BY
+                        CASE
+                            WHEN COALESCE(shipment.target_date_is_manual, FALSE) THEN 0
+                            WHEN shipment.target_date IS NOT NULL
+                             AND LOWER(COALESCE(shipment.target_date_source,'')) NOT LIKE 'auto%'
+                             AND LOWER(COALESCE(shipment.target_date_source,'')) NOT LIKE 'automatic%'
+                            THEN 0
+                            ELSE 1
+                        END,
+                        shipment.target_date ASC NULLS LAST,
+                        COALESCE(shipment.created_at, CURRENT_TIMESTAMP),
+                        shipment.id
+                )::INTEGER AS dynamic_priority_no
+            FROM mpps_shipments shipment
+            WHERE LOWER(TRIM(COALESCE(shipment.status, 'Planned'))) NOT IN (
+                'cancelled', 'canceled', 'closed', 'complete',
+                'completed', 'shipped', 'done', 'hold', 'on hold'
+            )
+              AND UPPER(COALESCE(shipment.lifecycle_status,'ACTIVE')) NOT IN (
+                'SHIPPED','CANCELLED','HOLD','CLOSURE_REVIEW'
+              )
+        )
         SELECT
             item.id AS shipment_item_id,
             shipment.id AS shipment_id,
+            shipment.dynamic_priority_no AS priority_no,
             TRIM(item.sap_code) AS sap_code,
             COALESCE(NULLIF(TRIM(item.item_description), ''), '') AS item_description,
             GREATEST(COALESCE(item.quantity, 0), 0) AS order_qty,
@@ -1048,21 +1075,10 @@ def _load_production_demands(
             COALESCE(shipment.target_date_is_manual, FALSE) AS target_date_is_manual,
             COALESCE(shipment.status, 'Planned') AS shipment_status
         FROM mpps_shipment_items item
-        JOIN mpps_shipments shipment ON shipment.id = item.shipment_id
+        JOIN ranked_shipments shipment ON shipment.id = item.shipment_id
         WHERE TRIM(COALESCE(item.sap_code, '')) <> ''
           AND COALESCE(item.quantity, 0) > 0
-          AND LOWER(TRIM(COALESCE(shipment.status, 'Planned'))) NOT IN (
-              'cancelled', 'canceled', 'closed', 'complete',
-              'completed', 'shipped', 'done'
-          )
-        ORDER BY
-            CASE WHEN COALESCE(shipment.target_date_is_manual, FALSE) THEN 0 ELSE 1 END,
-            CASE WHEN COALESCE(shipment.target_date_is_manual, FALSE)
-                 THEN COALESCE(shipment.target_date, DATE '9999-12-31')
-                 ELSE DATE '9999-12-31' END,
-            shipment.created_at,
-            shipment.id,
-            item.id
+        ORDER BY shipment.dynamic_priority_no, item.id
     """)).mappings().all()
 
     stock_map = _load_stock_map(session)
@@ -1120,6 +1136,7 @@ def _load_production_demands(
             remaining_qty=production_qty,
             shipment_id=row.get("shipment_id"),
             shipment_item_id=row.get("shipment_item_id"),
+            priority_no=_to_int(row.get("priority_no")) or None,
             approval_status=approval,
             line_names=line_names,
             mold_type=mold_type,
@@ -1138,6 +1155,28 @@ def _load_production_demands(
 def _load_stock_map(
     session: Session,
 ) -> dict[str, int]:
+    has_snapshot = bool(
+        session.execute(
+            text("SELECT to_regclass('public.mpps_current_stock_snapshots') IS NOT NULL")
+        ).scalar()
+    )
+    if has_snapshot:
+        rows = session.execute(
+            text(
+                """
+                SELECT TRIM(sap_code) AS sap_code, GREATEST(COALESCE(current_stock,0),0) AS available_qty
+                FROM mpps_current_stock_snapshots
+                WHERE import_run_id=(SELECT MAX(import_run_id) FROM mpps_current_stock_snapshots)
+                """
+            )
+        ).mappings().all()
+        if rows:
+            return {
+                _norm_code(row["sap_code"]): _to_int(row["available_qty"])
+                for row in rows
+                if row.get("sap_code")
+            }
+
     rows = session.execute(
         text(
             """
@@ -1155,9 +1194,7 @@ def _load_stock_map(
         )
     ).mappings().all()
     return {
-        _norm_code(row["sap_code"]): _to_int(
-            row["available_qty"]
-        )
+        _norm_code(row["sap_code"]): _to_int(row["available_qty"])
         for row in rows
         if row.get("sap_code")
     }
@@ -1853,26 +1890,21 @@ def _build_display_rows(
         if current:
             grouped[cavity_id].append(current)
 
-    next_by_cavity_sap: dict[
-        tuple[int, str],
+    next_by_cavity_demand: dict[
+        tuple[int, tuple[Any, ...]],
         int,
     ] = defaultdict(int)
-    next_by_sap: dict[str, int] = defaultdict(int)
+    next_by_demand: dict[tuple[Any, ...], int] = defaultdict(int)
     for unit in next_units:
-        next_by_cavity_sap[
-            (unit.cavity_id, unit.sap_code)
-        ] += 1
-        next_by_sap[unit.sap_code] += 1
+        key = _demand_key(unit.demand)
+        next_by_cavity_demand[(unit.cavity_id, key)] += 1
+        next_by_demand[key] += 1
 
-    demand_by_sap = {
-        demand.sap_code: demand
-        for demand in demands
-    }
-    today_by_sap: dict[str, int] = defaultdict(int)
+    today_by_demand: dict[tuple[Any, ...], int] = defaultdict(int)
     for unit in first_units:
-        today_by_sap[unit.sap_code] += 1
+        today_by_demand[_demand_key(unit.demand)] += 1
 
-    next_assigned: dict[str, int] = defaultdict(int)
+    next_assigned: dict[tuple[Any, ...], int] = defaultdict(int)
     rows: list[CavityPlanRow] = []
 
     for cavity in sorted(
@@ -1989,47 +2021,28 @@ def _build_display_rows(
             )
             night_qty = today_qty - day_qty
 
-            planned_next = next_by_cavity_sap.get(
-                (
-                    cavity.cavity_id,
-                    demand.sap_code,
-                ),
+            demand_key = _demand_key(demand)
+            planned_next = next_by_cavity_demand.get(
+                (cavity.cavity_id, demand_key),
                 0,
             )
             if planned_next <= 0:
                 unassigned_next = max(
                     0,
-                    next_by_sap.get(
-                        demand.sap_code,
-                        0,
-                    )
-                    - next_assigned[
-                        demand.sap_code
-                    ],
+                    next_by_demand.get(demand_key, 0)
+                    - next_assigned[demand_key],
                 )
-                planned_next = (
-                    unassigned_next
-                    if sequence_no == 1
-                    else 0
-                )
-            next_assigned[
-                demand.sap_code
-            ] += planned_next
+                planned_next = unassigned_next if sequence_no == 1 else 0
+            next_assigned[demand_key] += planned_next
 
             total_required = demand.required_qty
-            total_today_for_sap = today_by_sap.get(
-                demand.sap_code,
-                0,
-            )
-            total_next_for_sap = next_by_sap.get(
-                demand.sap_code,
-                0,
-            )
+            total_today_for_demand = today_by_demand.get(demand_key, 0)
+            total_next_for_demand = next_by_demand.get(demand_key, 0)
             balance = max(
                 0,
                 total_required
-                - total_today_for_sap
-                - total_next_for_sap,
+                - total_today_for_demand
+                - total_next_for_demand,
             )
             total = today_qty + planned_next
             start = group[0].start_minute
@@ -2140,6 +2153,7 @@ def _build_display_rows(
                     shipment_item_id=(
                         demand.shipment_item_id
                     ),
+                    priority_no=demand.priority_no,
                     allocation_status="PLANNED",
                     risk_reason=(
                         "Planned with compatible line, "
@@ -2346,10 +2360,23 @@ def _line_compatible(
     }
 
 
+def _demand_key(demand: _Demand) -> tuple[Any, ...]:
+    if demand.shipment_item_id is not None:
+        return ("ITEM", int(demand.shipment_item_id))
+    return (
+        "FALLBACK",
+        int(demand.shipment_id or 0),
+        demand.sap_code,
+        demand.due_date,
+    )
+
+
 def _demand_sort_key(
     demand: _Demand,
 ) -> tuple[Any, ...]:
     return (
+        demand.priority_no is None,
+        demand.priority_no or 10**9,
         demand.due_date is None,
         demand.due_date or date.max,
         -demand.remaining_qty,
@@ -2366,6 +2393,7 @@ def _copy_demand(demand: _Demand) -> _Demand:
         remaining_qty=demand.remaining_qty,
         shipment_id=demand.shipment_id,
         shipment_item_id=demand.shipment_item_id,
+        priority_no=demand.priority_no,
         approval_status=demand.approval_status,
         line_names=set(demand.line_names),
         mold_type=demand.mold_type,

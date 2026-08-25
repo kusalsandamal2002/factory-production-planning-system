@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
@@ -1857,6 +1857,7 @@ class WorkbookContinuousSyncService:
                     )
                 update_values = {
                     "source_missing_from_latest": True,
+                    "lifecycle_status": "CLOSURE_REVIEW",
                     "source_latest_run_id": import_run_id,
                     "source_latest_plan_date": plan_date,
                     "source_sync_status": row.action,

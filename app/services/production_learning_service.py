@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
@@ -257,6 +257,11 @@ class ProductionLearningService:
         import_run_id: int,
         analysis,
     ) -> dict[str, int]:
+        """Capture workbook learning observations with one executemany UPSERT.
+
+        This preserves the exact observation keys/semantics while removing
+        thousands of Python->PostgreSQL round trips in historical training.
+        """
         self.ensure_schema(session)
         plan_date = (
             date.fromisoformat(analysis.plan_date)
@@ -264,6 +269,7 @@ class ProductionLearningService:
             else date.today()
         )
         counters: dict[str, int] = defaultdict(int)
+        observations: list[dict[str, Any]] = []
 
         demand_by_sap: dict[str, int] = defaultdict(int)
         demand_by_customer: dict[str, int] = defaultdict(int)
@@ -277,8 +283,7 @@ class ProductionLearningService:
             demand_by_customer[customer] += qty
 
         for sap, qty in demand_by_sap.items():
-            self._insert_observation(
-                session,
+            observations.append(
                 {
                     "import_run_id": import_run_id,
                     "plan_date": plan_date,
@@ -292,21 +297,17 @@ class ProductionLearningService:
                     "shift_name": "",
                     "quantity": qty,
                     "weight_kg": 0,
-                    "features_json": json.dumps(
-                        {"workbook_hash": analysis.workbook_hash},
-                        default=str,
-                    ),
+                    "features_json": json.dumps({"workbook_hash": analysis.workbook_hash}, default=str),
                     "source_workbook": analysis.workbook_name,
                     "source_sheet": "PROD",
                     "source_row": 0,
-                },
+                }
             )
             counters["sap_demand_observations"] += 1
 
         for customer, qty in demand_by_customer.items():
             key = f"CUSTOMER|{customer}"
-            self._insert_observation(
-                session,
+            observations.append(
                 {
                     "import_run_id": import_run_id,
                     "plan_date": plan_date,
@@ -320,14 +321,11 @@ class ProductionLearningService:
                     "shift_name": "",
                     "quantity": qty,
                     "weight_kg": 0,
-                    "features_json": json.dumps(
-                        {"workbook_hash": analysis.workbook_hash},
-                        default=str,
-                    ),
+                    "features_json": json.dumps({"workbook_hash": analysis.workbook_hash}, default=str),
                     "source_workbook": analysis.workbook_name,
                     "source_sheet": "PROD",
                     "source_row": 0,
-                },
+                }
             )
             counters["customer_demand_observations"] += 1
 
@@ -341,8 +339,7 @@ class ProductionLearningService:
                 observation_date = date.fromisoformat(str(observation_date))
             except Exception:
                 observation_date = plan_date
-            self._insert_observation(
-                session,
+            observations.append(
                 {
                     "import_run_id": import_run_id,
                     "plan_date": observation_date,
@@ -370,7 +367,7 @@ class ProductionLearningService:
                     "source_workbook": analysis.workbook_name,
                     "source_sheet": row.get("source_sheet", "PROD"),
                     "source_row": int(row.get("source_row") or 0),
-                },
+                }
             )
             counters["production_signal_observations"] += 1
 
@@ -382,15 +379,13 @@ class ProductionLearningService:
             line = _text(row.get("line_name")).upper()
             shift = _text(row.get("shift_name")).upper()
             oven = _text(row.get("oven_code")).upper()
-            key = f"{sap}|{line}|{shift}"
-            self._insert_observation(
-                session,
+            observations.append(
                 {
                     "import_run_id": import_run_id,
                     "plan_date": plan_date,
                     "observation_type": "OVEN_PLAN_SIGNAL",
                     "source_semantics": "WORKBOOK_PRODUCTION_PLAN",
-                    "entity_key": key,
+                    "entity_key": f"{sap}|{line}|{shift}",
                     "sap_code": sap,
                     "customer_key": "",
                     "line_name": line,
@@ -408,7 +403,7 @@ class ProductionLearningService:
                     "source_workbook": analysis.workbook_name,
                     "source_sheet": row.get("source_sheet", "OVEN"),
                     "source_row": int(row.get("source_row") or 0),
-                },
+                }
             )
             counters["oven_plan_observations"] += 1
 
@@ -421,8 +416,7 @@ class ProductionLearningService:
                 max(0, int(row.get("fg_stock") or 0))
                 + max(0, int(row.get("qc_stock") or 0)),
             )
-            self._insert_observation(
-                session,
+            observations.append(
                 {
                     "import_run_id": import_run_id,
                     "plan_date": plan_date,
@@ -447,10 +441,44 @@ class ProductionLearningService:
                     "source_workbook": analysis.workbook_name,
                     "source_sheet": row.get("source_sheet", "PROD"),
                     "source_row": int(row.get("source_row") or 0),
-                },
+                }
             )
             counters["stock_observations"] += 1
 
+        if observations:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO excel_learning_observations (
+                        import_run_id, plan_date, observation_type, source_semantics,
+                        entity_key, sap_code, customer_key, line_name, oven_code,
+                        shift_name, quantity, weight_kg, features_json,
+                        source_workbook, source_sheet, source_row
+                    ) VALUES (
+                        :import_run_id, :plan_date, :observation_type, :source_semantics,
+                        :entity_key, :sap_code, :customer_key, :line_name, :oven_code,
+                        :shift_name, :quantity, :weight_kg, CAST(:features_json AS JSONB),
+                        :source_workbook, :source_sheet, :source_row
+                    )
+                    ON CONFLICT (
+                        import_run_id, observation_type, entity_key, source_sheet, source_row
+                    )
+                    DO UPDATE SET
+                        plan_date = EXCLUDED.plan_date,
+                        source_semantics = EXCLUDED.source_semantics,
+                        sap_code = EXCLUDED.sap_code,
+                        customer_key = EXCLUDED.customer_key,
+                        line_name = EXCLUDED.line_name,
+                        oven_code = EXCLUDED.oven_code,
+                        shift_name = EXCLUDED.shift_name,
+                        quantity = EXCLUDED.quantity,
+                        weight_kg = EXCLUDED.weight_kg,
+                        features_json = EXCLUDED.features_json,
+                        source_workbook = EXCLUDED.source_workbook
+                    """
+                ),
+                observations,
+            )
         return dict(counters)
 
     @staticmethod
@@ -618,6 +646,7 @@ class ProductionLearningService:
         import_run_id: int,
         analysis,
     ) -> dict[str, int]:
+        """Persist workbook-vs-live reconciliation with one batched UPSERT."""
         self.ensure_schema(session)
         plan_date = (
             date.fromisoformat(analysis.plan_date)
@@ -647,15 +676,8 @@ class ProductionLearningService:
                 JOIN mpps_shipments shipment
                   ON shipment.id = item.shipment_id
                 WHERE COALESCE(LOWER(shipment.status), 'planned') NOT IN (
-                    'cancelled',
-                    'canceled',
-                    'closed',
-                    'complete',
-                    'completed',
-                    'shipped',
-                    'done',
-                    'review required',
-                    'superseded import'
+                    'cancelled','canceled','closed','complete','completed',
+                    'shipped','done','review required','superseded import'
                 )
                 GROUP BY item.sap_code
                 """
@@ -672,6 +694,7 @@ class ProductionLearningService:
 
         codes = sorted(set(excel_demand) | set(excel_required) | set(excel_plan) | set(app))
         counts: dict[str, int] = defaultdict(int)
+        params: list[dict[str, Any]] = []
         for sap in codes:
             app_values = app.get(sap, {"demand": 0, "required": 0, "capacity": 0})
             demand_variance = app_values["demand"] - excel_demand.get(sap, 0)
@@ -689,42 +712,43 @@ class ProductionLearningService:
                     "Excel and app values differ because of cumulative stock allocation, "
                     "manual/actual protection, removed revisions or other active shipments."
                 )
+            params.append(
+                {
+                    "import_run_id": import_run_id,
+                    "plan_date": plan_date,
+                    "sap_code": sap,
+                    "excel_shipment_demand": excel_demand.get(sap, 0),
+                    "excel_production_required": excel_required.get(sap, 0),
+                    "excel_planned_qty": excel_plan.get(sap, 0),
+                    "app_live_demand": app_values["demand"],
+                    "app_production_required": app_values["required"],
+                    "app_daily_capacity": app_values["capacity"],
+                    "demand_variance": demand_variance,
+                    "production_variance": production_variance,
+                    "plan_variance": plan_variance,
+                    "reconciliation_status": status,
+                    "explanation": explanation,
+                }
+            )
+            counts[f"reconciliation_{status.lower()}"] += 1
+            counts["reconciliation_rows"] += 1
+
+        if params:
             session.execute(
                 text(
                     """
                     INSERT INTO excel_plan_reconciliation (
-                        import_run_id,
-                        plan_date,
-                        sap_code,
-                        excel_shipment_demand,
-                        excel_production_required,
-                        excel_planned_qty,
-                        app_live_demand,
-                        app_production_required,
-                        app_daily_capacity,
-                        demand_variance,
-                        production_variance,
-                        plan_variance,
-                        reconciliation_status,
-                        explanation,
-                        updated_at
-                    )
-                    VALUES (
-                        :import_run_id,
-                        :plan_date,
-                        :sap_code,
-                        :excel_shipment_demand,
-                        :excel_production_required,
-                        :excel_planned_qty,
-                        :app_live_demand,
-                        :app_production_required,
-                        :app_daily_capacity,
-                        :demand_variance,
-                        :production_variance,
-                        :plan_variance,
-                        :reconciliation_status,
-                        :explanation,
-                        CURRENT_TIMESTAMP
+                        import_run_id, plan_date, sap_code,
+                        excel_shipment_demand, excel_production_required, excel_planned_qty,
+                        app_live_demand, app_production_required, app_daily_capacity,
+                        demand_variance, production_variance, plan_variance,
+                        reconciliation_status, explanation, updated_at
+                    ) VALUES (
+                        :import_run_id, :plan_date, :sap_code,
+                        :excel_shipment_demand, :excel_production_required, :excel_planned_qty,
+                        :app_live_demand, :app_production_required, :app_daily_capacity,
+                        :demand_variance, :production_variance, :plan_variance,
+                        :reconciliation_status, :explanation, CURRENT_TIMESTAMP
                     )
                     ON CONFLICT (import_run_id, sap_code)
                     DO UPDATE SET
@@ -743,25 +767,8 @@ class ProductionLearningService:
                         updated_at = CURRENT_TIMESTAMP
                     """
                 ),
-                {
-                    "import_run_id": import_run_id,
-                    "plan_date": plan_date,
-                    "sap_code": sap,
-                    "excel_shipment_demand": excel_demand.get(sap, 0),
-                    "excel_production_required": excel_required.get(sap, 0),
-                    "excel_planned_qty": excel_plan.get(sap, 0),
-                    "app_live_demand": app_values["demand"],
-                    "app_production_required": app_values["required"],
-                    "app_daily_capacity": app_values["capacity"],
-                    "demand_variance": demand_variance,
-                    "production_variance": production_variance,
-                    "plan_variance": plan_variance,
-                    "reconciliation_status": status,
-                    "explanation": explanation,
-                },
+                params,
             )
-            counts[f"reconciliation_{status.lower()}"] += 1
-            counts["reconciliation_rows"] += 1
         return dict(counts)
 
     def get_dashboard(self, session, limit: int = 500) -> dict[str, Any]:

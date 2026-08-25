@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
@@ -119,6 +119,18 @@ _PSEUDO_BOM_NAMES = {
 
 def latest_material_planning_date(session: Session) -> date | None:
     candidates: list[date] = []
+    if _table_exists(session, "mpps_cavity_plan_runs"):
+        saved_date = session.execute(
+            text(
+                """
+                SELECT MAX(plan_date)
+                FROM mpps_cavity_plan_runs
+                WHERE UPPER(COALESCE(status,'SAVED')) NOT IN ('CANCELLED','VOID','REJECTED')
+                """
+            )
+        ).scalar()
+        if saved_date:
+            candidates.append(saved_date)
     oven_date = session.execute(
         text("SELECT MAX(plan_date) FROM mpps_oven_plan WHERE planned_qty > 0")
     ).scalar()
@@ -160,6 +172,59 @@ def load_material_demands(
 
     if basis != DEMAND_BASIS_OVEN:
         raise ValueError(f"Unsupported material demand basis: {basis}")
+
+    # R6: the approved saved cavity plan is the primary MRP demand authority.
+    # OVEN/Excel remains a fallback for dates that do not yet have a saved app plan.
+    if (
+        _table_exists(session, "mpps_cavity_plan_runs")
+        and _table_exists(session, "mpps_cavity_plan_rows")
+    ):
+        run_id = session.execute(
+            text(
+                """
+                SELECT id
+                FROM mpps_cavity_plan_runs
+                WHERE plan_date=:planning_date
+                  AND UPPER(COALESCE(status,'SAVED')) NOT IN ('CANCELLED','VOID','REJECTED')
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """
+            ),
+            {"planning_date": planning_date},
+        ).scalar()
+        if run_id:
+            saved_rows = session.execute(
+                text(
+                    """
+                    SELECT
+                        tyre_code AS material_code,
+                        COALESCE(MAX(NULLIF(description,'')),tyre_code) AS item_description,
+                        SUM(GREATEST(COALESCE(day_plan_pcs,0),0))::INTEGER AS day_qty,
+                        SUM(GREATEST(COALESCE(night_plan_pcs,0),0))::INTEGER AS night_qty,
+                        SUM(GREATEST(COALESCE(today_qty,0),0))::INTEGER AS planned_qty
+                    FROM mpps_cavity_plan_rows
+                    WHERE run_id=:run_id
+                      AND TRIM(COALESCE(tyre_code,'')) <> ''
+                      AND GREATEST(COALESCE(today_qty,0),0) > 0
+                    GROUP BY tyre_code
+                    HAVING SUM(GREATEST(COALESCE(today_qty,0),0)) > 0
+                    ORDER BY tyre_code
+                    """
+                ),
+                {"run_id": int(run_id)},
+            ).mappings().all()
+            if saved_rows:
+                return [
+                    MaterialDemandRow(
+                        material_code=str(row["material_code"]),
+                        item_description=str(row["item_description"] or row["material_code"]),
+                        planned_qty=_to_int(row["planned_qty"]),
+                        day_qty=_to_int(row["day_qty"]),
+                        night_qty=_to_int(row["night_qty"]),
+                        source="Approved saved cavity production plan",
+                    )
+                    for row in saved_rows
+                ]
 
     rows = session.execute(
         text(
