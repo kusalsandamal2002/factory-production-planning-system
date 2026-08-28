@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+import logging
 from typing import Any, Mapping
 
 from sqlalchemy import text
+
+
+_LOG = logging.getLogger(__name__)
+_CONTROL_SENTINEL_YEAR = 2060
 
 
 @dataclass(frozen=True)
@@ -43,34 +48,49 @@ def _as_date(value: Any) -> date | None:
         return None
 
 
+def is_control_sentinel_date(value: Any) -> bool:
+    parsed = _as_date(value)
+    return bool(parsed and parsed.year >= _CONTROL_SENTINEL_YEAR)
+
+
 class OperationalSourceService:
     """Resolve the single operational workbook authority.
 
-    V10.2 integrity rule:
-      * the highest committed, non-rolled-back workbook plan date is the
-        operational date;
-      * a committed LIVE sync run is preferred on the same plan date because it
-        proves shipment synchronization completed;
-      * a newer committed import can never be hidden by an older LIVE sync row;
-      * older committed workbooks remain historical/ML evidence and can never
-        move the operational cutoff backwards.
-
-    This fixes the V10.1 edge case where an older LIVE sync row (for example
-    2026-08-04) could mask a newer successfully committed import (for example
-    2026-08-10).
+    Production integrity rules:
+      * historical/forced-historical imports are evidence only, never LIVE;
+      * 2060+ factory control sentinel dates are never operational dates;
+      * among eligible sources, newest real plan date wins;
+      * on the same date, a committed LIVE shipment sync wins.
     """
+
+    @staticmethod
+    def _truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    @classmethod
+    def _candidate_is_operational(cls, candidate: Mapping[str, Any]) -> bool:
+        plan_date = _as_date(candidate.get("plan_date"))
+        if plan_date is None or is_control_sentinel_date(plan_date):
+            return False
+        mode = str(candidate.get("resolved_import_mode") or "").strip().upper()
+        if mode == "HISTORICAL":
+            return False
+        if cls._truthy(candidate.get("force_historical_snapshot")):
+            return False
+        return True
 
     @staticmethod
     def _candidate_key(candidate: Mapping[str, Any]) -> tuple:
         plan_date = _as_date(candidate.get("plan_date")) or date.min
         sync_confirmed = bool(candidate.get("sync_confirmed"))
         run_id = int(candidate.get("sync_run_id") or candidate.get("import_run_id") or 0)
-        # Newest date first. On a tie prefer LIVE-sync confirmation, then latest id.
         return (plan_date, int(sync_confirmed), run_id)
 
     @classmethod
     def _pick_newest_candidate(cls, candidates: list[Mapping[str, Any]]) -> Mapping[str, Any] | None:
-        valid = [candidate for candidate in candidates if _as_date(candidate.get("plan_date"))]
+        valid = [candidate for candidate in candidates if cls._candidate_is_operational(candidate)]
         if not valid:
             return None
         return max(valid, key=cls._candidate_key)
@@ -95,63 +115,59 @@ class OperationalSourceService:
     def latest(cls, session) -> OperationalSource:
         candidates: list[dict[str, Any]] = []
 
-        # Strongest evidence: a committed LIVE shipment-sync run.
         try:
-            row = session.execute(
-                text(
-                    """
-                    SELECT
-                        sr.id AS sync_run_id,
-                        sr.import_run_id,
-                        sr.plan_date,
-                        COALESCE(ir.workbook_name, sr.workbook_name, '') AS workbook_name,
-                        COALESCE(ir.confidence_score, 0) AS confidence_score
-                    FROM excel_shipment_sync_runs sr
-                    LEFT JOIN excel_import_runs ir ON ir.id = sr.import_run_id
-                    WHERE sr.sync_mode = 'LIVE'
-                      AND sr.status = 'COMMITTED'
-                      AND sr.rollback_at IS NULL
-                      AND COALESCE(ir.rollback_at IS NULL, TRUE)
-                      AND sr.plan_date IS NOT NULL
-                    ORDER BY sr.plan_date DESC, sr.id DESC
-                    LIMIT 1
-                    """
-                )
-            ).mappings().first()
+            row = session.execute(text("""
+                SELECT
+                    sr.id AS sync_run_id,
+                    sr.import_run_id,
+                    sr.plan_date,
+                    COALESCE(ir.workbook_name, sr.workbook_name, '') AS workbook_name,
+                    COALESCE(ir.confidence_score, 0) AS confidence_score,
+                    ''::text AS resolved_import_mode,
+                    FALSE AS force_historical_snapshot
+                FROM excel_shipment_sync_runs sr
+                LEFT JOIN excel_import_runs ir ON ir.id = sr.import_run_id
+                WHERE sr.sync_mode = 'LIVE'
+                  AND sr.status = 'COMMITTED'
+                  AND sr.rollback_at IS NULL
+                  AND COALESCE(ir.rollback_at IS NULL, TRUE)
+                  AND sr.plan_date IS NOT NULL
+                  AND sr.plan_date < DATE '2060-01-01'
+                ORDER BY sr.plan_date DESC, sr.id DESC
+                LIMIT 1
+            """)).mappings().first()
             if row:
                 candidate = dict(row)
                 candidate.update({"authority": "LIVE SYNC", "sync_confirmed": True})
                 candidates.append(candidate)
-        except Exception:
-            # Older installations may not yet contain continuous-sync tables.
-            pass
+        except Exception as exc:
+            _LOG.warning("Operational LIVE-sync lookup failed: %s", exc)
 
-        # Independent committed-import candidate. Crucially, this is compared
-        # against the LIVE-sync candidate instead of being used only as a fallback.
         try:
-            row = session.execute(
-                text(
-                    """
-                    SELECT
-                        id AS import_run_id,
-                        plan_date,
-                        workbook_name,
-                        COALESCE(confidence_score, 0) AS confidence_score
-                    FROM excel_import_runs
-                    WHERE status IN ('COMMITTED', 'COMMITTED WITH WARNINGS')
-                      AND rollback_at IS NULL
-                      AND plan_date IS NOT NULL
-                    ORDER BY plan_date DESC, id DESC
-                    LIMIT 1
-                    """
-                )
-            ).mappings().first()
+            row = session.execute(text("""
+                SELECT
+                    r.id AS import_run_id,
+                    r.plan_date,
+                    r.workbook_name,
+                    COALESCE(r.confidence_score, 0) AS confidence_score,
+                    COALESCE(to_jsonb(r)->'options_json'->>'resolved_import_mode', '') AS resolved_import_mode,
+                    COALESCE(to_jsonb(r)->'options_json'->>'force_historical_snapshot', 'false') AS force_historical_snapshot
+                FROM excel_import_runs r
+                WHERE r.status IN ('COMMITTED', 'COMMITTED WITH WARNINGS')
+                  AND r.rollback_at IS NULL
+                  AND r.plan_date IS NOT NULL
+                  AND r.plan_date < DATE '2060-01-01'
+                  AND UPPER(COALESCE(to_jsonb(r)->'options_json'->>'resolved_import_mode', '')) <> 'HISTORICAL'
+                  AND LOWER(COALESCE(to_jsonb(r)->'options_json'->>'force_historical_snapshot', 'false')) NOT IN ('1','true','yes','on')
+                ORDER BY r.plan_date DESC, r.id DESC
+                LIMIT 1
+            """)).mappings().first()
             if row:
                 candidate = dict(row)
                 candidate.update({"authority": "COMMITTED IMPORT", "sync_confirmed": False})
                 candidates.append(candidate)
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOG.warning("Operational committed-import lookup failed: %s", exc)
 
         return cls._to_source(cls._pick_newest_candidate(candidates))
 

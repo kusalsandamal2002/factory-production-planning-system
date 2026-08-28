@@ -1482,7 +1482,11 @@ class WorkbookContinuousSyncService:
                 f"AUTHORITATIVE-{group.shipment_column}",
             )
             stable_no = self._authoritative_shipment_no(plan_date, group)
-            target_date = group.source_target_date
+            target_date = (
+                group.source_target_date
+                if group.source_date_class == "EXCEL_APPROVED"
+                else None
+            )
 
             shipment_values = {
                 "shipment_no": stable_no,
@@ -1857,6 +1861,7 @@ class WorkbookContinuousSyncService:
                     )
                 update_values = {
                     "source_missing_from_latest": True,
+                    "lifecycle_status": "CLOSURE_REVIEW",
                     "source_latest_run_id": import_run_id,
                     "source_latest_plan_date": plan_date,
                     "source_sync_status": row.action,

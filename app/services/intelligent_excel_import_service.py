@@ -8,6 +8,7 @@ from difflib import SequenceMatcher
 from hashlib import sha256
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shutil
@@ -25,6 +26,7 @@ from app.services.production_learning_service import (
 from app.services.ai_planning_service import AIPlanningService
 from app.services.factory_intelligence_service import FactoryIntelligenceService
 from app.services.factory_resource_intelligence_service import FactoryResourceIntelligenceService
+from app.services.monthly_stock_snapshot_service import MonthlyStockSnapshotService
 from app.services.workbook_continuous_sync_service import (
     WorkbookContinuousSyncService,
 )
@@ -423,6 +425,11 @@ class WorkbookAnalysis:
 
 
 class IntelligentExcelImportService:
+    # R7.4.1 bulk-history caches: the training process stays on one verified DB
+    # cluster, so additive DDL and serial-sequence repair only need one preflight.
+    _r741_schema_ready = False
+    _r741_sequences_repaired = False
+
     """Semantic, confidence-scored importer for MPPS/OVEN workbooks.
 
     The engine deliberately separates *source preservation* from *live master
@@ -680,6 +687,7 @@ class IntelligentExcelImportService:
             "protect_manual_fields": True,
             "capture_learning_observations": True,
             "rebuild_learning_models": True,
+            "defer_factory_intelligence_training": False,
             "import_production_history": True,
             **(options or {}),
         }
@@ -714,26 +722,50 @@ class IntelligentExcelImportService:
             else date.today()
         )
 
+        bulk_history = str(os.environ.get("MPPS_R741_BULK_HISTORY") or "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+
         with _get_session() as session:
-            self._progress(progress, 2, "Creating intelligent import schema")
-            self.ensure_schema(session)
             sync_service = WorkbookContinuousSyncService(self.project_root)
-            sync_service.ensure_schema(session)
             learning_service = ProductionLearningService()
-            learning_service.ensure_schema(session)
             ai_planning_service = AIPlanningService()
-            ai_planning_service.ensure_schema(session)
             factory_intelligence = FactoryIntelligenceService()
-            factory_intelligence.ensure_schema(session)
             resource_intelligence = FactoryResourceIntelligenceService()
-            resource_intelligence.ensure_schema(session)
+            monthly_stock = MonthlyStockSnapshotService()
+
+            # R7.4.1: all historical workbooks in this process target the same
+            # already-verified C: PostgreSQL cluster. Replaying dozens of CREATE /
+            # ALTER / index checks for every workbook costs far more than the
+            # actual data write. Run the complete additive preflight once; normal
+            # app imports (without MPPS_R741_BULK_HISTORY) retain old behavior.
+            if (not bulk_history) or (not self.__class__._r741_schema_ready):
+                self._progress(progress, 2, "Creating intelligent import schema")
+                self.ensure_schema(session)
+                sync_service.ensure_schema(session)
+                learning_service.ensure_schema(session)
+                ai_planning_service.ensure_schema(session)
+                factory_intelligence.ensure_schema(session)
+                resource_intelligence.ensure_schema(session)
+                monthly_stock.ensure_schema(session)
+                if bulk_history:
+                    self.__class__._r741_schema_ready = True
 
             # Resolve recoverable SAP/description mismatches before shipment-sync
             # preview.  Only very-high-confidence matches are auto-corrected;
             # ambiguous rows stay unchanged and are retained for review/history.
+            identity_started = datetime.now()
             identity_preview = factory_intelligence.resolve_analysis(
                 session, analysis, import_run_id=None, persist=False
             )
+            if bulk_history:
+                identity_seconds = (datetime.now() - identity_started).total_seconds()
+                print(
+                    f"[R7.4.4 ID MAX] {analysis.workbook_name}: "
+                    f"{int(identity_preview.get('identity_unique_pairs') or 0)} unique pairs "
+                    f"in {identity_seconds:.1f}s",
+                    flush=True,
+                )
 
             # A few long-lived local MPPS databases were restored/imported
             # from backups over time.  PostgreSQL row data can then be ahead
@@ -741,7 +773,14 @@ class IntelligentExcelImportService:
             # healthy.  Advancing a sequence to the current MAX(id) is safe
             # and prevents false duplicate-primary-key IntegrityErrors during
             # the transactional import.
-            self._repair_serial_sequences(session)
+            # Repairing every BIGSERIAL with MAX(id) on every workbook becomes
+            # progressively slower as the historical corpus grows. Sequences only
+            # need this recovery pass once per verified training process; normal
+            # inserts advance them automatically afterwards.
+            if (not bulk_history) or (not self.__class__._r741_sequences_repaired):
+                self._repair_serial_sequences(session)
+                if bulk_history:
+                    self.__class__._r741_sequences_repaired = True
 
             sync_preview = sync_service.preview_with_session(
                 session,
@@ -848,9 +887,24 @@ class IntelligentExcelImportService:
                 # Persist the identity-resolution evidence inside the same
                 # transaction as the workbook import.  A rollback therefore also
                 # rolls back learned aliases from this workbook.
-                identity_result = factory_intelligence.resolve_analysis(
-                    session, analysis, import_run_id=run_id, persist=True
-                )
+                if bulk_history:
+                    # R7.4.3: preview already performed the expensive deterministic
+                    # identity resolution and mutated high-confidence rows. Persist
+                    # that exact result without resolving the workbook a second time.
+                    identity_result = dict(identity_preview)
+                    identity_result.update(
+                        factory_intelligence.persist_identity_resolutions(
+                            session,
+                            resolutions=dict(identity_preview.get("_resolutions") or {}),
+                            import_run_id=run_id,
+                            analysis=analysis,
+                            plan_date=plan_date,
+                        )
+                    )
+                else:
+                    identity_result = factory_intelligence.resolve_analysis(
+                        session, analysis, import_run_id=run_id, persist=True
+                    )
 
                 self._save_profiles_and_issues(session, run_id, analysis)
                 self._save_workbook_registry(
@@ -911,10 +965,15 @@ class IntelligentExcelImportService:
                         analysis=analysis,
                         import_mode=sync_preview.mode,
                     )
-                    resource_intelligence.sync_operational_oven_columns(
-                        session,
-                        import_run_id=run_id,
-                    )
+                    # _commit_oven_plan already writes the first-class line /
+                    # cavity / mold columns. The legacy backfill UPDATE is redundant
+                    # during historical bulk ingestion and is retained for normal
+                    # interactive/live imports.
+                    if not bulk_history:
+                        resource_intelligence.sync_operational_oven_columns(
+                            session,
+                            import_run_id=run_id,
+                        )
                     counters.update({
                         k: v for k, v in resource_result.items()
                         if isinstance(v, int)
@@ -953,7 +1012,20 @@ class IntelligentExcelImportService:
                     if isinstance(value, int):
                         counters[key] += value
 
+                self._progress(progress, 88, "Capturing Monthly Stock LIVE / FINAL snapshots")
+                monthly_stock_result = monthly_stock.capture_import(
+                    session,
+                    import_run_id=run_id,
+                    analysis=analysis,
+                    import_mode=sync_preview.mode,
+                )
+                learning_result["monthly_stock"] = monthly_stock_result
+                for key, value in monthly_stock_result.items():
+                    if isinstance(value, int):
+                        counters[key] += value
+
                 if options.get("capture_learning_observations", True):
+                    learning_started = datetime.now()
                     self._progress(
                         progress,
                         90,
@@ -982,6 +1054,13 @@ class IntelligentExcelImportService:
                         model_result = learning_service.rebuild_models(session)
                         learning_result.update(model_result)
                         counters.update(model_result)
+                    if bulk_history:
+                        learning_seconds = (datetime.now() - learning_started).total_seconds()
+                        print(
+                            f"[R7.4.3 LEARN BATCH] {analysis.workbook_name}: "
+                            f"{learning_seconds:.1f}s",
+                            flush=True,
+                        )
 
                 self._progress(
                     progress,
@@ -999,28 +1078,40 @@ class IntelligentExcelImportService:
                     if isinstance(value, int):
                         counters[key] += value
 
-                self._progress(progress, 98, "Training real factory capacity and resource-intelligence models")
-                capacity_result = factory_intelligence.train_capacity_models(session)
-                planner_policy_result = factory_intelligence.train_planner_policy(session)
-                resource_capacity_result = resource_intelligence.train_profiles(session)
-                intelligence_state = factory_intelligence.refresh_state(session)
-                learning_result["factory_intelligence"] = {
-                    **capacity_result,
-                    **planner_policy_result,
-                    **resource_capacity_result,
-                    **intelligence_state,
-                    **{k: v for k, v in identity_result.items() if not k.startswith("_")},
-                    **opening_result,
-                }
-                for key, value in capacity_result.items():
-                    if isinstance(value, int):
-                        counters[key] += value
-                for key, value in planner_policy_result.items():
-                    if isinstance(value, int):
-                        counters[key] += value
-                for key, value in resource_capacity_result.items():
-                    if isinstance(value, int):
-                        counters[key] += value
+                if options.get("defer_factory_intelligence_training", False):
+                    self._progress(
+                        progress,
+                        98,
+                        "Deferring factory-intelligence retraining until historical ingestion completes",
+                    )
+                    learning_result["factory_intelligence"] = {
+                        "training_deferred": True,
+                        **{k: v for k, v in identity_result.items() if not k.startswith("_")},
+                        **opening_result,
+                    }
+                else:
+                    self._progress(progress, 98, "Training real factory capacity and resource-intelligence models")
+                    capacity_result = factory_intelligence.train_capacity_models(session)
+                    planner_policy_result = factory_intelligence.train_planner_policy(session)
+                    resource_capacity_result = resource_intelligence.train_profiles(session)
+                    intelligence_state = factory_intelligence.refresh_state(session)
+                    learning_result["factory_intelligence"] = {
+                        **capacity_result,
+                        **planner_policy_result,
+                        **resource_capacity_result,
+                        **intelligence_state,
+                        **{k: v for k, v in identity_result.items() if not k.startswith("_")},
+                        **opening_result,
+                    }
+                    for key, value in capacity_result.items():
+                        if isinstance(value, int):
+                            counters[key] += value
+                    for key, value in planner_policy_result.items():
+                        if isinstance(value, int):
+                            counters[key] += value
+                    for key, value in resource_capacity_result.items():
+                        if isinstance(value, int):
+                            counters[key] += value
                 for key, value in identity_result.items():
                     if isinstance(value, int):
                         counters[key] += value
@@ -1137,6 +1228,7 @@ class IntelligentExcelImportService:
     def rollback(self, run_id: int, *, rolled_back_by: str = "") -> dict[str, Any]:
         with _get_session() as session:
             self.ensure_schema(session)
+            MonthlyStockSnapshotService.ensure_schema(session)
             run = session.execute(
                 text(
                     """
@@ -1194,6 +1286,13 @@ class IntelligentExcelImportService:
                     text(f"DELETE FROM {table} WHERE run_id = :run_id"),
                     {"run_id": int(run_id)},
                 )
+            session.execute(
+                text(
+                    "DELETE FROM mpps_monthly_stock_snapshots "
+                    "WHERE import_run_id = :run_id"
+                ),
+                {"run_id": int(run_id)},
+            )
             session.execute(
                 text(
                     "DELETE FROM excel_learning_observations "
@@ -1640,7 +1739,8 @@ class IntelligentExcelImportService:
             if _normalize(sheet_name) == "daily plan":
                 value = workbook[sheet_name]["C3"].value
                 parsed = _as_date(value)
-                if parsed:
+                # 2060+ values are factory control sentinels, not workbook dates.
+                if parsed and parsed.year < 2060:
                     return parsed
         month_names = {
             "january": 1,
@@ -2705,59 +2805,76 @@ class IntelligentExcelImportService:
         }
 
     def _archive_workbook(self, path: Path, digest: str) -> str:
+        # R7.3 rolling-NVMe mode keeps the authoritative historical source on D:\n        # and uses C: only as a disposable processing cache.  The updater verifies
+        # the relative file map before training, so the import can register that
+        # already-preserved D: source without copying every workbook back to D:.
+        fast_root = str(os.environ.get("MPPS_HISTORICAL_INBOX") or "").strip()
+        archive_root = str(os.environ.get("MPPS_HISTORICAL_ARCHIVE_ROOT") or "").strip()
+        if fast_root and archive_root:
+            try:
+                relative = path.resolve().relative_to(Path(fast_root).resolve())
+                return str(Path(archive_root) / relative)
+            except (OSError, ValueError):
+                pass
+
         archive_dir = self.project_root / "data_sources" / "import_archive"
         archive_dir.mkdir(parents=True, exist_ok=True)
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", path.name).strip("_")
         destination = archive_dir / f"{digest[:16]}_{safe_name}"
         if not destination.exists():
             shutil.copy2(path, destination)
-        return str(destination)
+        try:
+            return str(destination.relative_to(self.project_root))
+        except Exception:
+            return str(destination)
 
     def _save_profiles_and_issues(self, session, run_id, analysis) -> None:
-        for profile in analysis.sheet_profiles:
-            session.execute(
-                text(
-                    """
-                    INSERT INTO excel_import_sheet_profiles (
-                        run_id, sheet_name, detected_role, confidence_score,
-                        max_row, max_column, nonempty_cells, formula_cells,
-                        cached_error_cells, header_row, evidence
-                    ) VALUES (
-                        :run_id, :sheet_name, :role, :confidence,
-                        :max_row, :max_column, :nonempty, :formula,
-                        :errors, :header_row, :evidence
-                    )
-                    """
-                ),
-                {
-                    "run_id": run_id,
-                    "sheet_name": profile.sheet_name,
-                    "role": profile.role,
-                    "confidence": profile.confidence,
-                    "max_row": profile.max_row,
-                    "max_column": profile.max_column,
-                    "nonempty": profile.nonempty_cells,
-                    "formula": profile.formula_cells,
-                    "errors": profile.cached_error_cells,
-                    "header_row": profile.header_row,
-                    "evidence": profile.evidence,
-                },
+        profile_sql = text(
+            """
+            INSERT INTO excel_import_sheet_profiles (
+                run_id, sheet_name, detected_role, confidence_score,
+                max_row, max_column, nonempty_cells, formula_cells,
+                cached_error_cells, header_row, evidence
+            ) VALUES (
+                :run_id, :sheet_name, :role, :confidence,
+                :max_row, :max_column, :nonempty, :formula,
+                :errors, :header_row, :evidence
             )
-        for issue in analysis.issues:
-            session.execute(
-                text(
-                    """
-                    INSERT INTO excel_import_issues (
-                        run_id, severity, category, sheet_name, cell_address,
-                        item_key, message, recommendation
-                    ) VALUES (
-                        :run_id, :severity, :category, :sheet_name, :cell_address,
-                        :item_key, :message, :recommendation
-                    )
-                    """
-                ),
-                {"run_id": run_id, **asdict(issue)},
+            """
+        )
+        profile_params = [
+            {
+                "run_id": run_id,
+                "sheet_name": profile.sheet_name,
+                "role": profile.role,
+                "confidence": profile.confidence,
+                "max_row": profile.max_row,
+                "max_column": profile.max_column,
+                "nonempty": profile.nonempty_cells,
+                "formula": profile.formula_cells,
+                "errors": profile.cached_error_cells,
+                "header_row": profile.header_row,
+                "evidence": profile.evidence,
+            }
+            for profile in analysis.sheet_profiles
+        ]
+        if profile_params:
+            session.execute(profile_sql, profile_params)
+
+        issue_sql = text(
+            """
+            INSERT INTO excel_import_issues (
+                run_id, severity, category, sheet_name, cell_address,
+                item_key, message, recommendation
+            ) VALUES (
+                :run_id, :severity, :category, :sheet_name, :cell_address,
+                :item_key, :message, :recommendation
             )
+            """
+        )
+        issue_params = [{"run_id": run_id, **asdict(issue)} for issue in analysis.issues]
+        if issue_params:
+            session.execute(issue_sql, issue_params)
 
     def _save_workbook_registry(
         self,
@@ -2972,37 +3089,33 @@ class IntelligentExcelImportService:
         counters,
     ) -> dict[str, Any]:
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        params = []
         for row in analysis.shipment_rows:
             grouped[row["shipment_column"]].append(row)
             source_target_date = row.get("source_target_date")
             if isinstance(source_target_date, str) and source_target_date:
                 source_target_date = date.fromisoformat(source_target_date)
+            params.append(
+                {
+                    "run_id": run_id,
+                    "plan_date": plan_date,
+                    **row,
+                    "source_target_date": source_target_date,
+                }
+            )
+
+        if params:
             session.execute(
                 text(
                     """
                     INSERT INTO excel_import_shipment_snapshots (
-                        run_id,
-                        shipment_column,
-                        shipment_name,
-                        source_status,
-                        source_target_date,
-                        source_date_class,
-                        source_item_code,
-                        item_description,
-                        quantity,
-                        plan_date
-                    )
-                    VALUES (
-                        :run_id,
-                        :shipment_column,
-                        :shipment_name,
-                        :source_status,
-                        :source_target_date,
-                        :source_date_class,
-                        :sap_code,
-                        :description,
-                        :quantity,
-                        :plan_date
+                        run_id, shipment_column, shipment_name, source_status,
+                        source_target_date, source_date_class, source_item_code,
+                        item_description, quantity, plan_date
+                    ) VALUES (
+                        :run_id, :shipment_column, :shipment_name, :source_status,
+                        :source_target_date, :source_date_class, :sap_code,
+                        :description, :quantity, :plan_date
                     )
                     ON CONFLICT (run_id, shipment_column, source_item_code)
                     DO UPDATE SET
@@ -3015,22 +3128,14 @@ class IntelligentExcelImportService:
                         plan_date = EXCLUDED.plan_date
                     """
                 ),
-                {
-                    "run_id": run_id,
-                    "plan_date": plan_date,
-                    **row,
-                    "source_target_date": source_target_date,
-                },
+                params,
             )
-            counters["shipment_snapshot_items"] += 1
+            counters["shipment_snapshot_items"] += len(params)
 
         counters["shipment_snapshots"] = len(grouped)
         if not options.get("sync_live_shipments", False):
             return {
-                "sync_mode": options.get(
-                    "resolved_import_mode",
-                    "SNAPSHOT_ONLY",
-                ),
+                "sync_mode": options.get("resolved_import_mode", "SNAPSHOT_ONLY"),
                 "sync_reason": options.get(
                     "resolved_import_reason",
                     "Shipment data was retained as a dated snapshot only.",
@@ -3175,32 +3280,37 @@ class IntelligentExcelImportService:
             counters["material_plan_rows_imported"] += 1
 
     def _commit_production_history(self, session, run_id, analysis, counters) -> None:
-        for row in analysis.production_history_rows:
-            session.execute(
-                text(
-                    """
-                    INSERT INTO excel_import_production_history (
-                        run_id, production_date, sap_code, item_description,
-                        production_qty, source_sheet, source_row
-                    ) VALUES (
-                        :run_id, :production_date, :sap_code, :description,
-                        :production_qty, :source_sheet, :source_row
-                    )
-                    ON CONFLICT (run_id, production_date, sap_code)
-                    DO UPDATE SET
-                        item_description = EXCLUDED.item_description,
-                        production_qty = EXCLUDED.production_qty,
-                        source_sheet = EXCLUDED.source_sheet,
-                        source_row = EXCLUDED.source_row
-                    """
-                ),
-                {
-                    "run_id": run_id,
-                    **row,
-                    "production_date": date.fromisoformat(row["production_date"]),
-                },
-            )
-            counters["production_history_rows_imported"] += 1
+        params = [
+            {
+                "run_id": run_id,
+                **row,
+                "production_date": date.fromisoformat(row["production_date"]),
+            }
+            for row in analysis.production_history_rows
+        ]
+        if not params:
+            return
+        session.execute(
+            text(
+                """
+                INSERT INTO excel_import_production_history (
+                    run_id, production_date, sap_code, item_description,
+                    production_qty, source_sheet, source_row
+                ) VALUES (
+                    :run_id, :production_date, :sap_code, :description,
+                    :production_qty, :source_sheet, :source_row
+                )
+                ON CONFLICT (run_id, production_date, sap_code)
+                DO UPDATE SET
+                    item_description = EXCLUDED.item_description,
+                    production_qty = EXCLUDED.production_qty,
+                    source_sheet = EXCLUDED.source_sheet,
+                    source_row = EXCLUDED.source_row
+                """
+            ),
+            params,
+        )
+        counters["production_history_rows_imported"] += len(params)
 
     def _fetch_existing(self, session, table_name, key_fields):
         self._validate_table_and_columns(table_name, key_fields)

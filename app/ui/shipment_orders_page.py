@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 # STOCK ALLOCATION INTEGRITY V6.2
 
@@ -6053,3 +6053,621 @@ class ShipmentDetailsPage(ShipmentOrdersPage):
             on_new_shipment=on_new_shipment,
         )
 
+
+
+# MPPS V25 SHIPMENT PORTFOLIO CLEAN COLUMNS
+_mpps_v25_original_setup_list_table = (
+    ShipmentDetailsPage._setup_list_table
+)
+
+
+def _mpps_v25_setup_list_table(self) -> None:
+    # Preserve all existing table setup, calculations and data indexes.
+    _mpps_v25_original_setup_list_table(self)
+
+    # Cleaner user-facing portfolio: duplicate decision-output columns are
+    # hidden, while their underlying data remains available to KPIs/filters.
+    hidden_headers = {
+        "Risk",
+        "Delivery Status",
+    }
+
+    model = self.list_table.model()
+
+    for column in range(self.list_table.columnCount()):
+        label = str(
+            model.headerData(
+                column,
+                Qt.Orientation.Horizontal,
+            )
+            or ""
+        ).strip()
+
+        if label in hidden_headers:
+            self.list_table.setColumnHidden(
+                column,
+                True,
+            )
+
+    self.list_table.horizontalHeader().setStretchLastSection(
+        True
+    )
+
+
+ShipmentDetailsPage._setup_list_table = (
+    _mpps_v25_setup_list_table
+)
+
+
+# MPPS V26 SHIPMENT COMMAND CENTER UI POLISH
+_mpps_v26_original_init = ShipmentDetailsPage.__init__
+_mpps_v26_original_setup_list_table = (
+    ShipmentDetailsPage._setup_list_table
+)
+
+
+def _mpps_v26_header_map(table):
+    result = {}
+    model = table.model()
+
+    for column in range(table.columnCount()):
+        label = str(
+            model.headerData(
+                column,
+                Qt.Orientation.Horizontal,
+            )
+            or ""
+        ).strip()
+        if label:
+            result[label] = column
+
+    return result
+
+
+def _mpps_v26_setup_list_table(self) -> None:
+    _mpps_v26_original_setup_list_table(self)
+
+    table = self.list_table
+    header = table.horizontalHeader()
+    columns = _mpps_v26_header_map(table)
+
+    table.setAlternatingRowColors(True)
+    table.setSelectionBehavior(
+        QAbstractItemView.SelectionBehavior.SelectRows
+    )
+    table.setSelectionMode(
+        QAbstractItemView.SelectionMode.SingleSelection
+    )
+    table.verticalHeader().setVisible(False)
+    table.verticalHeader().setDefaultSectionSize(40)
+
+    table_css = (
+        "QTableWidget {"
+        "background:#ffffff;"
+        "alternate-background-color:#f8fafc;"
+        "gridline-color:#e2e8f0;"
+        "border:1px solid #dbe4f0;"
+        "border-radius:10px;"
+        "selection-background-color:#dbeafe;"
+        "selection-color:#0f172a;"
+        "}"
+        "QTableWidget::item {"
+        "padding:5px 8px;"
+        "}"
+        "QTableWidget::item:selected {"
+        "background:#dbeafe;"
+        "color:#0f172a;"
+        "border-top:1px solid #bfdbfe;"
+        "border-bottom:1px solid #bfdbfe;"
+        "}"
+        "QHeaderView::section {"
+        "background:#edf3f9;"
+        "color:#172033;"
+        "border:none;"
+        "border-right:1px solid #dbe4f0;"
+        "border-bottom:1px solid #dbe4f0;"
+        "padding:9px 7px;"
+        "font-weight:900;"
+        "}"
+    )
+    table.setStyleSheet(
+        table.styleSheet() + table_css
+    )
+
+    header.setMinimumHeight(42)
+    header.setDefaultAlignment(
+        Qt.AlignmentFlag.AlignCenter
+    )
+    header.setStretchLastSection(False)
+
+    fixed_widths = {
+        "Priority": 72,
+        "Target": 108,
+        "Factory Can Out": 132,
+        "Delivery Variance": 128,
+        "Qty": 88,
+        "Stock": 88,
+        "Coverage": 100,
+        "Prod Gap": 108,
+    }
+
+    for label, width in fixed_widths.items():
+        column = columns.get(label)
+        if column is None:
+            continue
+        header.setSectionResizeMode(
+            column,
+            QHeaderView.ResizeMode.Fixed,
+        )
+        table.setColumnWidth(column, width)
+
+    shipment_column = columns.get("Shipment")
+    if shipment_column is not None:
+        header.setSectionResizeMode(
+            shipment_column,
+            QHeaderView.ResizeMode.Stretch,
+        )
+
+    for label, column in columns.items():
+        item = table.horizontalHeaderItem(column)
+        if item is None:
+            continue
+        if label == "Shipment":
+            item.setTextAlignment(
+                Qt.AlignmentFlag.AlignLeft
+                | Qt.AlignmentFlag.AlignVCenter
+            )
+        else:
+            item.setTextAlignment(
+                Qt.AlignmentFlag.AlignCenter
+            )
+
+
+def _mpps_v26_find_metric_frame(label):
+    parent = label.parentWidget()
+
+    while parent is not None:
+        if isinstance(parent, QFrame):
+            return parent
+        parent = parent.parentWidget()
+
+    return None
+
+
+def _mpps_v26_polish_page(self) -> None:
+    metric_names = {
+        "Visible Shipments",
+        "Shipment Qty",
+        "Stock Coverage",
+        "Production Gap",
+        "Critical / Late",
+        "Needs Review",
+    }
+
+    for label in self.findChildren(QLabel):
+        text_value = label.text().strip()
+
+        if text_value in metric_names:
+            label.setStyleSheet(
+                label.styleSheet()
+                + (
+                    "color:#64748b;"
+                    "font-size:8.5pt;"
+                    "font-weight:800;"
+                )
+            )
+
+            frame = _mpps_v26_find_metric_frame(label)
+            if frame is not None:
+                frame.setMinimumHeight(70)
+
+        if "LIVE OVEN" in text_value:
+            label.setMinimumWidth(145)
+            label.setAlignment(
+                Qt.AlignmentFlag.AlignCenter
+            )
+
+    for combo in self.findChildren(QComboBox):
+        current = combo.currentText().strip()
+
+        if current.startswith("Risk:"):
+            combo.setMinimumWidth(160)
+            combo.setMaximumWidth(180)
+            combo.setMinimumHeight(38)
+        elif current.startswith("Promise:"):
+            combo.setMinimumWidth(190)
+            combo.setMaximumWidth(210)
+            combo.setMinimumHeight(38)
+        elif current.startswith("Stock:"):
+            combo.setMinimumWidth(160)
+            combo.setMaximumWidth(180)
+            combo.setMinimumHeight(38)
+        elif current.startswith("Target:"):
+            combo.setMinimumWidth(165)
+            combo.setMaximumWidth(185)
+            combo.setMinimumHeight(38)
+
+    for edit in self.findChildren(QLineEdit):
+        placeholder = edit.placeholderText().lower()
+
+        if "search shipment" in placeholder:
+            edit.setMinimumHeight(38)
+            edit.setMinimumWidth(420)
+
+    for button in self.findChildren(QPushButton):
+        caption = button.text().strip().lower()
+
+        if caption in {"clear", "refresh"}:
+            button.setMinimumHeight(38)
+        elif caption.startswith("actions"):
+            button.setMinimumHeight(38)
+            button.setMinimumWidth(105)
+
+    page_css = (
+        "QLineEdit {"
+        "border-radius:9px;"
+        "}"
+        "QComboBox {"
+        "border-radius:9px;"
+        "padding-left:9px;"
+        "}"
+        "QPushButton {"
+        "border-radius:9px;"
+        "font-weight:850;"
+        "}"
+    )
+    self.setStyleSheet(
+        self.styleSheet() + page_css
+    )
+
+
+def _mpps_v26_init(self, *args, **kwargs):
+    _mpps_v26_original_init(
+        self,
+        *args,
+        **kwargs,
+    )
+    QTimer.singleShot(
+        0,
+        lambda: _mpps_v26_polish_page(self),
+    )
+
+
+ShipmentDetailsPage._setup_list_table = (
+    _mpps_v26_setup_list_table
+)
+ShipmentDetailsPage.__init__ = _mpps_v26_init
+
+
+# MPPS V27 SHIPMENT DETAIL FINAL UI POLISH
+_mpps_v27_original_init = ShipmentDetailsPage.__init__
+
+
+def _mpps_v27_table_header_map(table):
+    result = {}
+    model = table.model()
+
+    for column in range(table.columnCount()):
+        label = str(
+            model.headerData(
+                column,
+                Qt.Orientation.Horizontal,
+            )
+            or ""
+        ).strip()
+
+        if label:
+            result[label] = column
+
+    return result
+
+
+def _mpps_v27_polish_item_table(self):
+    target_headers = {
+        "SAP Code",
+        "Item Description",
+        "Qty",
+        "Stock Allocated",
+        "Shortage",
+        "Complete %",
+        "Production Start",
+        "Receive / Finish",
+        "State",
+    }
+
+    for table in self.findChildren(QTableWidget):
+        columns = _mpps_v27_table_header_map(table)
+
+        if not target_headers.issubset(
+            set(columns)
+        ):
+            continue
+
+        header = table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setMinimumHeight(42)
+        header.setDefaultAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(42)
+        table.setAlternatingRowColors(True)
+
+        fixed_widths = {
+            "SAP Code": 112,
+            "Qty": 72,
+            "Stock Allocated": 116,
+            "Shortage": 88,
+            "Complete %": 96,
+            "Production Start": 126,
+            "Receive / Finish": 126,
+            "State": 136,
+        }
+
+        for label, width in fixed_widths.items():
+            column = columns[label]
+            header.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.Fixed,
+            )
+            table.setColumnWidth(
+                column,
+                width,
+            )
+
+        desc_col = columns[
+            "Item Description"
+        ]
+        header.setSectionResizeMode(
+            desc_col,
+            QHeaderView.ResizeMode.Stretch,
+        )
+
+        for label, column in columns.items():
+            item = table.horizontalHeaderItem(
+                column
+            )
+            if item is None:
+                continue
+
+            if label == "Item Description":
+                item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignLeft
+                    | Qt.AlignmentFlag.AlignVCenter
+                )
+            else:
+                item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignCenter
+                )
+
+        table_css = (
+            "QTableWidget {"
+            "background:#ffffff;"
+            "alternate-background-color:#f8fafc;"
+            "gridline-color:#e2e8f0;"
+            "border:1px solid #dbe4f0;"
+            "border-radius:10px;"
+            "selection-background-color:#dbeafe;"
+            "selection-color:#0f172a;"
+            "}"
+            "QTableWidget::item {"
+            "padding:6px 8px;"
+            "}"
+            "QTableWidget::item:selected {"
+            "background:#dbeafe;"
+            "color:#0f172a;"
+            "}"
+            "QHeaderView::section {"
+            "background:#edf3f9;"
+            "color:#172033;"
+            "border:none;"
+            "border-right:1px solid #dbe4f0;"
+            "border-bottom:1px solid #dbe4f0;"
+            "padding:9px 7px;"
+            "font-weight:900;"
+            "}"
+        )
+        table.setStyleSheet(
+            table.styleSheet()
+            + table_css
+        )
+
+
+def _mpps_v27_clean_detail_text(self):
+    for label in self.findChildren(QLabel):
+        value = label.text().strip()
+        normalized = value.lower()
+
+        # Keep the source concept, remove long workbook/hash/file details.
+        if (
+            "latest oven excel" in normalized
+            and (
+                "xls-" in normalized
+                or ".xlsx" in normalized
+                or " • " in value
+            )
+        ):
+            label.setText(
+                "LATEST OVEN EXCEL"
+            )
+            label.setObjectName(
+                "DetailSourceBadge"
+            )
+            label.setAlignment(
+                Qt.AlignmentFlag.AlignCenter
+            )
+            label.setMinimumWidth(150)
+            label.setMaximumWidth(180)
+
+        # Technical audit line is kept in backend/history but not shown
+        # in the operational detail view.
+        if (
+            normalized.startswith(
+                "last replanned:"
+            )
+            or (
+                "final shipment snapshot"
+                in normalized
+                and ".xlsx" in normalized
+            )
+        ):
+            label.hide()
+
+        # Remove the long explanatory subtitle beside the item schedule.
+        if (
+            "stock allocation" in normalized
+            and "shortage" in normalized
+            and "production timing" in normalized
+        ):
+            label.hide()
+
+        # Softer late emphasis without changing the actual value.
+        if (
+            "days late" in normalized
+            and any(ch.isdigit() for ch in value)
+        ):
+            label.setStyleSheet(
+                label.styleSheet()
+                + (
+                    "color:#b42318;"
+                    "font-weight:900;"
+                )
+            )
+
+
+def _mpps_v27_polish_metric_cards(self):
+    for frame in self.findChildren(QFrame):
+        if frame.objectName() == "MetricCard":
+            frame.setMinimumHeight(68)
+
+    for label in self.findChildren(QLabel):
+        if label.objectName() == "MetricLabel":
+            label.setStyleSheet(
+                label.styleSheet()
+                + (
+                    "color:#64748b;"
+                    "font-size:8.5pt;"
+                    "font-weight:800;"
+                )
+            )
+
+        if label.objectName() == "MetricValue":
+            label.setStyleSheet(
+                label.styleSheet()
+                + (
+                    "color:#0f172a;"
+                    "font-weight:950;"
+                )
+            )
+
+
+def _mpps_v27_apply_polish(self):
+    _mpps_v27_clean_detail_text(self)
+    _mpps_v27_polish_metric_cards(self)
+    _mpps_v27_polish_item_table(self)
+
+    self.setStyleSheet(
+        self.styleSheet()
+        + (
+            "QLabel#DetailSourceBadge {"
+            "background:#eff6ff;"
+            "color:#1d4ed8;"
+            "border:1px solid #bfdbfe;"
+            "border-radius:9px;"
+            "padding:7px 11px;"
+            "font-size:8.5pt;"
+            "font-weight:900;"
+            "}"
+        )
+    )
+
+
+def _mpps_v27_init(self, *args, **kwargs):
+    _mpps_v27_original_init(
+        self,
+        *args,
+        **kwargs,
+    )
+
+    # Run after page construction. A second pass catches detail labels
+    # populated immediately after initial async shipment loading.
+    QTimer.singleShot(
+        0,
+        lambda: _mpps_v27_apply_polish(self),
+    )
+    QTimer.singleShot(
+        900,
+        lambda: _mpps_v27_apply_polish(self),
+    )
+
+
+ShipmentDetailsPage.__init__ = _mpps_v27_init
+
+
+# MPPS V27.1 SHIPMENT DETAIL HEADER CLEANUP
+_mpps_v27_1_original_init = ShipmentDetailsPage.__init__
+
+
+def _mpps_v27_1_hide_header_extras(self) -> None:
+    for widget in self.findChildren(QWidget):
+        text_getter = getattr(widget, "text", None)
+
+        if not callable(text_getter):
+            continue
+
+        try:
+            value = str(text_getter() or "").strip()
+        except Exception:
+            continue
+
+        normalized = value.lower()
+
+        if (
+            normalized.startswith("xls-final")
+            or normalized.startswith("last replanned:")
+            or (
+                "final shipment snapshot" in normalized
+                and ".xlsx" in normalized
+            )
+            or (
+                "latest oven excel" in normalized
+                and "crown tyres" in normalized
+            )
+        ):
+            widget.hide()
+            continue
+
+        if normalized in {
+            "delayed",
+            "forecast",
+            "actions",
+            "actions ▼",
+            "actions ▾",
+        }:
+            widget.hide()
+            continue
+
+
+def _mpps_v27_1_init(self, *args, **kwargs):
+    _mpps_v27_1_original_init(
+        self,
+        *args,
+        **kwargs,
+    )
+
+    QTimer.singleShot(
+        0,
+        lambda: _mpps_v27_1_hide_header_extras(self),
+    )
+    QTimer.singleShot(
+        500,
+        lambda: _mpps_v27_1_hide_header_extras(self),
+    )
+    QTimer.singleShot(
+        1200,
+        lambda: _mpps_v27_1_hide_header_extras(self),
+    )
+
+
+ShipmentDetailsPage.__init__ = _mpps_v27_1_init

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 from typing import Any
@@ -146,3 +146,86 @@ class TyreItemRepository:
 
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM smds WHERE id = :id"), {"id": item_id})
+
+# MPPS V32 FAST READ PATH
+def _v32_fast_list_items(self, search_text: str = "") -> list[dict]:
+    """Pure SELECT read path. No DDL/schema migration is allowed here."""
+    query = """
+        SELECT
+            id,
+            sap_code,
+            material_description AS description,
+            line,
+            key_code,
+            casing_type,
+            curing_cycle,
+            normal_curing_minutes,
+            normal_curing_time_text,
+            handling_time,
+            day_plan,
+            night_plan,
+            total_plan
+        FROM smds
+        WHERE 1=1
+    """
+    params: dict[str, object] = {}
+
+    if search_text:
+        query += """
+            AND (
+                sap_code ILIKE :search
+                OR material_description ILIKE :search
+                OR COALESCE(key_code, '') ILIKE :search
+                OR COALESCE(casing_type, '') ILIKE :search
+                OR COALESCE(curing_cycle, '') ILIKE :search
+                OR COALESCE(line, '') ILIKE :search
+            )
+        """
+        params["search"] = f"%{search_text}%"
+
+    query += " ORDER BY sap_code LIMIT 3000"
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(query),
+            params,
+        ).mappings().all()
+
+    items: list[dict] = []
+
+    for row in rows:
+        item = dict(row)
+        description = _text_value(
+            item.get("description")
+        )
+        item["tyre_size"] = guess_tyre_size(
+            description
+        )
+
+        minutes = item.get(
+            "normal_curing_minutes"
+        )
+        if not minutes:
+            minutes = curing_cycle_to_minutes(
+                item.get("curing_cycle")
+            )
+
+        item["normal_curing_minutes"] = minutes
+        item["normal_curing_time_text"] = (
+            item.get("normal_curing_time_text")
+            or minutes_to_duration_text(minutes)
+        )
+        item["normal_curing_display"] = (
+            minutes_to_display_text(minutes)
+        )
+        item["short_cycle_curing_minutes"] = 0
+        item["handling_minutes"] = (
+            item.get("handling_time") or 0
+        )
+        item["status"] = "Active"
+        items.append(item)
+
+    return items
+
+
+TyreItemRepository.list_items = _v32_fast_list_items

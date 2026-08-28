@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 from decimal import Decimal, InvalidOperation
@@ -155,3 +155,24 @@ def refresh_smds_curing_time_columns() -> int:
             )
 
     return len(updates)
+
+# MPPS V32 CURING SCHEMA ENSURE ONCE
+import threading as _v32_curing_threading
+
+_v32_original_ensure_smds_curing_time_columns = ensure_smds_curing_time_columns
+_v32_curing_lock = _v32_curing_threading.Lock()
+_v32_curing_schema_ready = False
+
+
+def ensure_smds_curing_time_columns() -> None:
+    global _v32_curing_schema_ready
+
+    if _v32_curing_schema_ready:
+        return
+
+    with _v32_curing_lock:
+        if _v32_curing_schema_ready:
+            return
+
+        _v32_original_ensure_smds_curing_time_columns()
+        _v32_curing_schema_ready = True

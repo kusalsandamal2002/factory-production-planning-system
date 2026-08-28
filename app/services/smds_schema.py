@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from sqlalchemy import text
 
@@ -229,3 +229,28 @@ def ensure_excel_foundation_tables() -> None:
 def ensure_smds_and_legacy_tables() -> None:
     ensure_excel_foundation_tables()
     ensure_smds_table()
+
+# MPPS V32 SCHEMA ENSURE ONCE
+import threading as _v32_schema_threading
+
+_v32_original_ensure_smds_table = ensure_smds_table
+_v32_schema_lock = _v32_schema_threading.Lock()
+_v32_schema_ready = False
+
+
+def ensure_smds_table() -> None:
+    """Run schema migration at most once per application process.
+
+    Normal page reads must not execute 30+ ALTER/INDEX statements repeatedly.
+    """
+    global _v32_schema_ready
+
+    if _v32_schema_ready:
+        return
+
+    with _v32_schema_lock:
+        if _v32_schema_ready:
+            return
+
+        _v32_original_ensure_smds_table()
+        _v32_schema_ready = True

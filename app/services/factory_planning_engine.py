@@ -15,6 +15,7 @@ from app.services.process_standard_resolution import (
 from app.services.factory_resource_intelligence_service import (
     FactoryResourceIntelligenceService,
 )
+from app.services.operational_source_service import OperationalSourceService
 
 from app.services.master_data_normalization import (
     is_no_casing,
@@ -59,11 +60,14 @@ def is_auto_target_source(value: Any) -> bool:
 def shipment_target_is_locked(shipment: dict[str, Any]) -> bool:
     if bool(shipment.get("target_date_is_manual")):
         return True
-    if shipment.get("target_date") is None:
+    target = shipment.get("target_date")
+    if target is None:
         return False
-    return not is_auto_target_source(
-        shipment.get("target_date_source")
-    )
+    if isinstance(target, datetime):
+        target = target.date()
+    if isinstance(target, date) and target.year >= 2060:
+        return False
+    return not is_auto_target_source(shipment.get("target_date_source"))
 
 
 @dataclass
@@ -419,7 +423,6 @@ class FactoryPlanningEngine:
             FactoryResourceIntelligenceService.ensure_schema(conn)
 
     def replan_all_open_shipments(self, trigger_reason: str = "", created_by: str = "") -> PlanningRunResult:
-        self.ensure_schema()
         planning_version = int(datetime.utcnow().timestamp() * 1000)
         self._resource_usage.clear()
         self._preview_mode = False
@@ -481,6 +484,7 @@ class FactoryPlanningEngine:
                         WHEN COALESCE(target_date_is_manual, FALSE)
                         THEN 0
                         WHEN target_date IS NOT NULL
+                         AND target_date < DATE '2060-01-01'
                          AND LOWER(
                                 COALESCE(target_date_source, '')
                              ) NOT LIKE 'auto%%'
@@ -494,6 +498,7 @@ class FactoryPlanningEngine:
                         WHEN COALESCE(target_date_is_manual, FALSE)
                           OR (
                                 target_date IS NOT NULL
+                            AND target_date < DATE '2060-01-01'
                             AND LOWER(
                                     COALESCE(target_date_source, '')
                                 ) NOT LIKE 'auto%%'
@@ -778,7 +783,6 @@ class FactoryPlanningEngine:
         return PlanningRunResult(planning_run_id=run_id, planning_version=planning_version, status="Completed", message="Planning completed", shipments=shipment_results)
 
     def replan_single_shipment_preview(self, shipment_id: int) -> ShipmentPlanResult:
-        self.ensure_schema()
         result = self.replan_all_open_shipments(trigger_reason=f"single_shipment_{shipment_id}", created_by="ui")
         for shipment in result.shipments:
             if shipment.shipment_id == shipment_id:
@@ -794,7 +798,6 @@ class FactoryPlanningEngine:
         draft_created_at: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """Preview a draft inside the complete active shipment queue."""
-        self.ensure_schema()
         manual_target = (
             bool(target_date_is_manual)
             if target_date_is_manual is not None
@@ -1705,10 +1708,35 @@ class FactoryPlanningEngine:
         sap_code: str,
         exclude_shipment_id: int | None = None,
     ) -> int:
-        canonical_sap = normalize_sap_code(
-            sap_code
-        )
+        canonical_sap = normalize_sap_code(sap_code)
         try:
+            current_table = bool(
+                conn.execute(
+                    text("SELECT to_regclass('public.mpps_current_stock_snapshots') IS NOT NULL")
+                ).scalar()
+            )
+            latest_run_id = None
+            if current_table:
+                source = OperationalSourceService.latest(conn)
+                latest_run_id = source.import_run_id
+            if latest_run_id is not None:
+                stock = conn.execute(
+                    text(
+                        """
+                        SELECT GREATEST(COALESCE(current_stock,0),0)
+                        FROM mpps_current_stock_snapshots
+                        WHERE UPPER(TRIM(sap_code))=UPPER(TRIM(:sap_code))
+                          AND import_run_id=:run_id
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"sap_code": canonical_sap, "run_id": int(latest_run_id)},
+                ).scalar_one_or_none()
+                # Missing SAP in the authoritative LIVE snapshot is zero. Never
+                # fall forward to a newer historical import-run id.
+                return max(0, int(stock or 0))
+
             stock = conn.execute(
                 text(
                     """
@@ -1726,14 +1754,7 @@ class FactoryPlanningEngine:
                 ),
                 {"sap_code": canonical_sap},
             ).scalar_one_or_none()
-
-            if stock is None:
-                return 0
-
-            return max(
-                0,
-                int(stock),
-            )
+            return max(0, int(stock or 0))
         except Exception:
             return 0
 

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections.abc import Callable
 import time
@@ -53,7 +53,6 @@ class _CapacityWorker(QThread):
             self._report(8, "Opening data", "Connecting to PostgreSQL")
             with get_session() as session:
                 service = FactoryResourceIntelligenceService()
-                service.ensure_schema(session)
                 if self.action == "header":
                     self._report(55, "Reading LIVE OVEN", "Loading current operational authority")
                     payload = service.header_snapshot(session)
@@ -202,7 +201,7 @@ class FactoryCapacityPage(QWidget):
         card = QFrame(); card.setObjectName("HeaderCard")
         row = QHBoxLayout(card); row.setContentsMargins(20, 13, 20, 13); row.setSpacing(12)
         left = QVBoxLayout(); left.setSpacing(2)
-        crumb = QLabel("Master Data  /  Factory Resource & Capacity"); crumb.setObjectName("Breadcrumb")
+        crumb = QLabel("Data / Factory Resource & Capacity"); crumb.setObjectName("Breadcrumb")
         title = QLabel("Factory Resource & Capacity"); title.setObjectName("PageTitle")
         left.addWidget(crumb); left.addWidget(title)
         self.live_badge = QLabel("LIVE OVEN\nLOADING"); self.live_badge.setObjectName("GoodBadge")

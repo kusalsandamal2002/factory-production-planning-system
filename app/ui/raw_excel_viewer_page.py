@@ -1,12 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
-import traceback
-from typing import Any, Callable
+from typing import Any
 
-from PySide6.QtCore import QThread, Signal, Qt
+from PySide6.QtCore import QObject, QTimer, Signal, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -32,6 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.core.task_manager import TaskManager
 from app.services.factory_planning_engine import (
     FactoryPlanningEngine,
 )
@@ -44,23 +44,8 @@ from app.services.intelligent_excel_import_service import (
 from app.utils.import_error_utils import extract_task_error_reason
 
 
-class _TaskWorker(QThread):
+class _ProgressBridge(QObject):
     progress = Signal(int, str)
-    completed = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, action: Callable[[Callable[[int, str], None]], Any]):
-        super().__init__()
-        self.action = action
-
-    def run(self) -> None:
-        try:
-            result = self.action(
-                lambda percent, message: self.progress.emit(percent, message)
-            )
-            self.completed.emit(result)
-        except Exception:
-            self.failed.emit(traceback.format_exc())
 
 
 class RawExcelViewerPage(QWidget):
@@ -73,7 +58,10 @@ class RawExcelViewerPage(QWidget):
         self.service = IntelligentExcelImportService(self.project_root)
         self.analysis: WorkbookAnalysis | None = None
         self.sync_preview: dict[str, Any] = {}
-        self.worker: _TaskWorker | None = None
+        self.tasks = TaskManager.instance()
+        self._task_running = False
+        self._progress_bridge = _ProgressBridge(self)
+        self._progress_bridge.progress.connect(self._on_progress)
         self.selected_file = ""
         self._task_kind = "idle"
         self._pipeline_active_index = -1
@@ -84,7 +72,7 @@ class RawExcelViewerPage(QWidget):
             QSizePolicy.Policy.Expanding,
         )
         self._build_ui()
-        self.refresh_history()
+        QTimer.singleShot(250, self.refresh_history_async)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -521,8 +509,35 @@ class RawExcelViewerPage(QWidget):
         if not path or not Path(path).exists():
             QMessageBox.warning(self, "Workbook Required", "Select an existing Excel workbook.")
             return
+        preview_options = {
+            key: box.isChecked()
+            for key, box in self.option_boxes.items()
+        }
+
+        def analyze_job(progress):
+            analysis = self.service.analyze(
+                path,
+                progress=progress,
+            )
+            try:
+                preview = self.service.preview_shipment_sync(
+                    analysis,
+                    options=preview_options,
+                )
+            except Exception as exc:
+                preview = {
+                    "mode": "UNAVAILABLE",
+                    "reason": str(exc),
+                    "summary": {},
+                    "rows": [],
+                }
+            return {
+                "analysis": analysis,
+                "preview": preview,
+            }
+
         self._start_task(
-            lambda progress: self.service.analyze(path, progress=progress),
+            analyze_job,
             self._analysis_complete,
             "Analyzing workbook",
         )
@@ -667,17 +682,24 @@ class RawExcelViewerPage(QWidget):
         progress(100, "Rollback complete")
         return result
 
+    def refresh_history_async(self) -> None:
+        def history_job():
+            return self.service.list_history(100)
+
+        self.tasks.submit(
+            "excel-pipeline-r6:history",
+            history_job,
+            on_result=self._history_loaded,
+            on_error=self._history_failed,
+            replace=True,
+        )
+
     def refresh_history(self) -> None:
-        try:
-            rows = self.service.list_history(100)
-        except Exception as exc:
-            self.output.setPlainText(
-                "Import history is not available yet. The schema will be created on "
-                f"the first successful analysis/commit.\n\n{exc}"
-            )
-            return
+        self.refresh_history_async()
+
+    def _history_loaded(self, rows) -> None:
         self.history_table.setRowCount(0)
-        for row_data in rows:
+        for row_data in list(rows or []):
             row = self.history_table.rowCount()
             self.history_table.insertRow(row)
             values = [
@@ -692,23 +714,57 @@ class RawExcelViewerPage(QWidget):
                 row_data.get("rollback_at"),
             ]
             for column, value in enumerate(values):
-                self.history_table.setItem(row, column, QTableWidgetItem(_display(value)))
+                self.history_table.setItem(
+                    row,
+                    column,
+                    QTableWidgetItem(_display(value)),
+                )
+
+    def _history_failed(self, message: str) -> None:
+        detail = str(message or "").splitlines()
+        reason = detail[-1] if detail else "history unavailable"
+        self.output.setPlainText(
+            "Import history is not available yet. The schema will be created on "
+            "the first successful analysis/commit.\n\n"
+            + reason
+        )
 
     def _start_task(self, action, completed, label: str) -> None:
-        if self.worker and self.worker.isRunning():
-            QMessageBox.information(self, "Task Running", "Wait for the current task to finish.")
+        if self._task_running:
+            QMessageBox.information(
+                self,
+                "Task Running",
+                "Wait for the current task to finish.",
+            )
             return
+
         lower_label = label.lower()
         if "commit" in lower_label or "update" in lower_label:
             self._task_kind = "commit"
-            badge = ("COMMITTING UPDATE", "#dbeafe", "#1d4ed8", "#93c5fd")
+            badge = (
+                "COMMITTING UPDATE",
+                "#dbeafe",
+                "#1d4ed8",
+                "#93c5fd",
+            )
         elif "rollback" in lower_label:
             self._task_kind = "rollback"
-            badge = ("ROLLING BACK", "#fef3c7", "#92400e", "#fde68a")
+            badge = (
+                "ROLLING BACK",
+                "#fef3c7",
+                "#92400e",
+                "#fde68a",
+            )
         else:
             self._task_kind = "analyze"
-            badge = ("ANALYZING", "#e0f2fe", "#075985", "#7dd3fc")
+            badge = (
+                "ANALYZING",
+                "#e0f2fe",
+                "#075985",
+                "#7dd3fc",
+            )
 
+        self._task_running = True
         self._set_busy(True)
         self.progress.setValue(0)
         self.progress.setFormat("%p%")
@@ -716,22 +772,39 @@ class RawExcelViewerPage(QWidget):
         self._configure_pipeline(self._task_kind)
         self._set_status(*badge)
         self.output.setPlainText(label + "...")
-        worker = _TaskWorker(action)
-        self.worker = worker
-        worker.progress.connect(self._on_progress)
-        worker.completed.connect(completed)
-        worker.failed.connect(self._task_failed)
-        # Re-enable controls only after QThread.run() has actually returned.
-        # Enabling them from completed/failed can let a second task overwrite
-        # self.worker while the first QThread is still finishing, which causes
-        # "QThread: Destroyed while thread is still running".
-        worker.finished.connect(self._worker_finished)
-        worker.start()
 
-    def _worker_finished(self) -> None:
-        sender = self.sender()
-        if sender is self.worker:
-            self.worker = None
+        def run_job():
+            return action(
+                lambda percent, message:
+                self._progress_bridge.progress.emit(
+                    int(percent),
+                    str(message),
+                )
+            )
+
+        def result_handler(payload):
+            try:
+                completed(payload)
+            finally:
+                self._task_finished()
+
+        def error_handler(message):
+            try:
+                self._task_failed(message)
+            finally:
+                self._task_finished()
+
+        self.tasks.submit(
+            f"excel-pipeline-r6:{self._task_kind}",
+            run_job,
+            on_result=result_handler,
+            on_error=error_handler,
+            priority=1,
+            replace=True,
+        )
+
+    def _task_finished(self) -> None:
+        self._task_running = False
         self._set_busy(False)
 
     def _on_progress(self, percent: int, message: str) -> None:
@@ -840,25 +913,14 @@ class RawExcelViewerPage(QWidget):
             f"CURRENT DATA STAGE: {stage_name}  •  {message}  •  overall {percent}%"
         )
 
-    def _analysis_complete(self, analysis: WorkbookAnalysis) -> None:
+    def _analysis_complete(self, payload) -> None:
+        data = dict(payload or {})
+        analysis = data.get("analysis")
+        if analysis is None:
+            raise RuntimeError("Workbook analysis returned no payload.")
         self.analysis = analysis
+        self.sync_preview = dict(data.get("preview") or {})
         self._populate_analysis(analysis)
-        preview_options = {
-            key: box.isChecked()
-            for key, box in self.option_boxes.items()
-        }
-        try:
-            self.sync_preview = self.service.preview_shipment_sync(
-                analysis,
-                options=preview_options,
-            )
-        except Exception as exc:
-            self.sync_preview = {
-                "mode": "UNAVAILABLE",
-                "reason": str(exc),
-                "summary": {},
-                "rows": [],
-            }
         self._populate_sync_preview(self.sync_preview)
         blockers = analysis.summary.get("blocker_count", 0)
         self.commit_btn.setEnabled(blockers == 0)
@@ -896,7 +958,7 @@ class RawExcelViewerPage(QWidget):
                 for key, value in sorted(result.get("changes", {}).items())
             )
         )
-        self.refresh_history()
+        self.refresh_history_async()
         self.preview_tabs.setCurrentWidget(self.history_table)
         QMessageBox.information(
             self,
@@ -916,7 +978,7 @@ class RawExcelViewerPage(QWidget):
             f"Inserted rows removed: {result['removed_rows']}\n"
             "The archived workbook and audit history were retained."
         )
-        self.refresh_history()
+        self.refresh_history_async()
 
     def _task_failed(self, details: str) -> None:
         self._set_status("TASK FAILED", "#fee2e2", "#991b1b", "#fecaca")
@@ -1022,7 +1084,7 @@ class RawExcelViewerPage(QWidget):
                     row["remaining_to_plan"],
                     row.get("weight_kg") or "",
                 ]
-                for row in analysis.stock_rows[:5000]
+                for row in analysis.stock_rows[:1000]
             ],
         )
         self._fill_table(
@@ -1038,7 +1100,7 @@ class RawExcelViewerPage(QWidget):
                     row["description"],
                     row["quantity"],
                 ]
-                for row in analysis.shipment_rows[:10000]
+                for row in analysis.shipment_rows[:2000]
             ],
         )
         self._fill_table(
@@ -1068,7 +1130,7 @@ class RawExcelViewerPage(QWidget):
                 "",
                 f"{row['source_sheet']}:{row['source_row']}",
             ]
-            for row in analysis.compound_rows[:5000]
+            for row in analysis.compound_rows[:1000]
         ]
         material_rows.extend(
             [

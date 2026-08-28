@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from difflib import SequenceMatcher
 import json
 import math
+import os
 import re
 from statistics import mean, median
 from typing import Any, Iterable
@@ -82,6 +83,17 @@ def _description_similarity(left: Any, right: Any) -> float:
     return _clamp(0.68 * seq + 0.32 * token, 0.0, 1.0)
 
 
+def _description_similarity_keys(a: str, b: str) -> float:
+    """Same scoring as _description_similarity, but keys are already normalized."""
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    seq = SequenceMatcher(None, a, b).ratio()
+    token = _token_similarity(a, b)
+    return _clamp(0.68 * seq + 0.32 * token, 0.0, 1.0)
+
+
 def _quantile(values: Iterable[float], q: float, default: float = 0.0) -> float:
     cleaned = sorted(float(v) for v in values if math.isfinite(float(v)))
     if not cleaned:
@@ -117,9 +129,36 @@ class FactoryIntelligenceService:
     """
 
     MODEL_VERSION = "MPPS-FI-V10"
+    # R7.4.3 bulk-history caches. Historical ingestion does not modify the
+    # canonical master, so expensive normalized master indexes can be reused.
+    _r743_master_context: dict[str, Any] | None = None
+    _r743_alias_map: dict[str, dict[str, Any]] | None = None
+    # R7.4.4: cache fuzzy master results by normalized description. The canonical
+    # master is immutable during bulk-history ingestion, so this remains exact.
+    _r744_fuzzy_cache: dict[str, tuple[dict[str, Any] | None, float, float]] = {}
 
     @staticmethod
     def ensure_schema(session) -> None:
+        # R7.4.1 fast preflight. These seven tables are the complete V10 schema;
+        # if they exist, replaying all additive DDL on every historical workbook
+        # is unnecessary. Fresh/partial databases still fall through safely.
+        try:
+            row = session.execute(text(
+                "SELECT "
+                "to_regclass('public.mpps_opening_stock_evidence') AS opening, "
+                "to_regclass('public.mpps_identity_aliases') AS aliases, "
+                "to_regclass('public.mpps_identity_resolution_log') AS resolution, "
+                "to_regclass('public.mpps_factory_capacity_models') AS capacity, "
+                "to_regclass('public.mpps_planner_policy_models') AS policy, "
+                "to_regclass('public.mpps_factory_daily_capacity') AS daily, "
+                "to_regclass('public.mpps_factory_intelligence_state') AS state"
+            )).mappings().first()
+            if row and all(row.get(k) for k in (
+                'opening', 'aliases', 'resolution', 'capacity', 'policy', 'daily', 'state'
+            )):
+                return
+        except Exception:
+            pass
         statements = [
             """
             CREATE TABLE IF NOT EXISTS mpps_opening_stock_evidence (
@@ -458,9 +497,342 @@ class FactoryIntelligenceService:
             result[key] = (sap, count, totals[key])
         return result
 
+    @classmethod
+    def _r743_bulk_identity_context(cls, session) -> dict[str, Any]:
+        """Precompute master/alias indexes once for historical bulk ingestion."""
+        if cls._r743_master_context is None:
+            master_rows = cls._master_rows(session)
+            by_sap = {
+                _code(row.get("sap_code")): row
+                for row in master_rows
+                if _code(row.get("sap_code"))
+            }
+            by_desc: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            # R7.4.4 candidate blocking. A high-confidence result uses the
+            # second-best score to compute its confidence, capped once the margin
+            # reaches 0.15. Since high-confidence best >= 0.975, only candidates
+            # scoring >= 0.825 can affect any returned decision/confidence value.
+            # With SequenceMatcher <= 1, score >= 0.825 requires token Jaccard
+            # >= 0.453125. Index by token and preserve the original exact scoring
+            # for every candidate capable of affecting the resolver output.
+            candidates: list[tuple[dict[str, Any], str, frozenset[str], int]] = []
+            token_index: dict[str, list[int]] = defaultdict(list)
+            for row in master_rows:
+                key = _description_key(row.get("description"))
+                if key:
+                    by_desc[key].append(row)
+                    tokens = frozenset(key.split())
+                    idx = len(candidates)
+                    candidates.append((row, key, tokens, len(key)))
+                    for token in tokens:
+                        token_index[token].append(idx)
+            cls._r743_master_context = {
+                "master_rows": master_rows,
+                "by_sap": by_sap,
+                "by_desc": by_desc,
+                "candidates": candidates,
+                "token_index": token_index,
+            }
+            cls._r744_fuzzy_cache = {}
+
+        if cls._r743_alias_map is None:
+            alias_rows = session.execute(
+                text(
+                    """
+                    SELECT alias_key, canonical_sap_code, canonical_description,
+                           confidence_score, evidence_count, is_approved
+                    FROM mpps_identity_aliases
+                    WHERE alias_type = 'DESCRIPTION'
+                    ORDER BY alias_key, is_approved DESC,
+                             confidence_score DESC, evidence_count DESC
+                    """
+                )
+            ).mappings().all()
+            alias_map: dict[str, dict[str, Any]] = {}
+            for raw in alias_rows:
+                row = dict(raw)
+                key = str(row.get("alias_key") or "")
+                if key and key not in alias_map:
+                    alias_map[key] = row
+            cls._r743_alias_map = alias_map
+
+        return {
+            **cls._r743_master_context,
+            "aliases": cls._r743_alias_map,
+        }
+
+    @classmethod
+    def _r743_resolve_identity(
+        cls,
+        *,
+        raw_sap_code: Any,
+        description: Any,
+        workbook_consensus: dict[str, tuple[str, int, int]] | None,
+        context: dict[str, Any],
+    ) -> IdentityResolution:
+        """Semantics-equivalent identity resolver using precomputed indexes."""
+        raw = _code(raw_sap_code)
+        raw_desc = clean_text(description)
+        desc_key = _description_key(raw_desc)
+        by_sap: dict[str, dict[str, Any]] = context["by_sap"]
+        by_desc: dict[str, list[dict[str, Any]]] = context["by_desc"]
+        aliases: dict[str, dict[str, Any]] = context["aliases"]
+
+        if raw and raw in by_sap:
+            row = by_sap[raw]
+            return IdentityResolution(
+                raw, raw, raw_desc, clean_text(row.get("description") or raw_desc),
+                1.0, "EXACT_SAP", "KEEP", "SAP code exists in the canonical tyre master."
+            )
+
+        if desc_key:
+            alias = aliases.get(desc_key)
+            if alias and _code(alias.get("canonical_sap_code")):
+                confidence = max(
+                    _float(alias.get("confidence_score")),
+                    0.985 if alias.get("is_approved") else 0.94,
+                )
+                action = "AUTO_CORRECT" if confidence >= 0.985 else "REVIEW"
+                return IdentityResolution(
+                    raw,
+                    _code(alias.get("canonical_sap_code")),
+                    raw_desc,
+                    clean_text(alias.get("canonical_description") or raw_desc),
+                    _clamp(confidence, 0.0, 1.0),
+                    "LEARNED_ALIAS",
+                    action,
+                    f"Historical description alias seen {int(alias.get('evidence_count') or 1)} time(s).",
+                )
+
+        if desc_key and workbook_consensus and desc_key in workbook_consensus:
+            canonical, count, total = workbook_consensus[desc_key]
+            ratio = count / max(1, total)
+            if canonical and canonical in by_sap and count >= 2 and ratio >= 0.80:
+                confidence = _clamp(0.965 + min(0.03, count * 0.003), 0.0, 0.995)
+                return IdentityResolution(
+                    raw, canonical, raw_desc,
+                    clean_text(by_sap[canonical].get("description") or raw_desc),
+                    confidence, "WORKBOOK_CONSENSUS",
+                    "AUTO_CORRECT" if confidence >= 0.985 else "REVIEW",
+                    f"Same normalized description maps to SAP {canonical} in {count}/{total} workbook rows.",
+                )
+
+        if desc_key:
+            exact_desc = by_desc.get(desc_key, [])
+            unique_codes = {
+                _code(row.get("sap_code"))
+                for row in exact_desc
+                if _code(row.get("sap_code"))
+            }
+            if len(unique_codes) == 1:
+                canonical = next(iter(unique_codes))
+                row = next(
+                    row for row in exact_desc
+                    if _code(row.get("sap_code")) == canonical
+                )
+                return IdentityResolution(
+                    raw, canonical, raw_desc,
+                    clean_text(row.get("description") or raw_desc),
+                    0.995, "EXACT_DESCRIPTION", "AUTO_CORRECT",
+                    "Description is an exact unique match in the canonical tyre master.",
+                )
+
+        best_row: dict[str, Any] | None = None
+        best_score = 0.0
+        second_score = 0.0
+        if desc_key:
+            cached = cls._r744_fuzzy_cache.get(desc_key)
+            if cached is not None:
+                best_row, best_score, second_score = cached
+            else:
+                query_tokens = frozenset(desc_key.split())
+                candidate_ids: set[int] = set()
+                token_index: dict[str, list[int]] = context["token_index"]
+                for token in query_tokens:
+                    candidate_ids.update(token_index.get(token, ()))
+
+                query_len = len(desc_key)
+                for idx in sorted(candidate_ids):
+                    row, candidate_key, candidate_tokens, candidate_len = context["candidates"][idx]
+                    intersection = len(query_tokens & candidate_tokens)
+                    if not intersection:
+                        continue
+                    token_score = intersection / max(1, len(query_tokens | candidate_tokens))
+                    # A candidate below 0.825 cannot affect a >=0.90 review
+                    # decision, nor the confidence of a >=0.975 high-confidence
+                    # match once its 0.15 margin cap is considered.
+                    if token_score < 0.453125:
+                        continue
+                    seq_upper = (
+                        2.0 * min(query_len, candidate_len) / max(1, query_len + candidate_len)
+                    )
+                    if (0.68 * seq_upper + 0.32 * token_score) < 0.825:
+                        continue
+                    seq_score = SequenceMatcher(None, desc_key, candidate_key).ratio()
+                    score = _clamp(0.68 * seq_score + 0.32 * token_score, 0.0, 1.0)
+                    if score > best_score:
+                        second_score = best_score
+                        best_score = score
+                        best_row = row
+                    elif score > second_score:
+                        second_score = score
+
+                # Values below 0.825 cannot alter a review decision and, for a
+                # high-confidence best >=0.975, are at least 0.15 behind so the
+                # confidence margin contribution is already fully saturated.
+                cls._r744_fuzzy_cache[desc_key] = (best_row, best_score, second_score)
+
+        if best_row is not None:
+            canonical = _code(best_row.get("sap_code"))
+            margin = best_score - second_score
+            if best_score >= 0.975 and margin >= 0.035:
+                confidence = _clamp(
+                    0.90 + 0.08 * best_score + 0.02 * min(1.0, margin / 0.15),
+                    0.0, 0.992,
+                )
+                return IdentityResolution(
+                    raw, canonical, raw_desc,
+                    clean_text(best_row.get("description") or raw_desc),
+                    confidence, "FUZZY_DESCRIPTION",
+                    "AUTO_CORRECT" if confidence >= 0.985 else "REVIEW",
+                    f"Best description similarity {best_score:.3f}; separation from next candidate {margin:.3f}.",
+                )
+            if best_score >= 0.90:
+                return IdentityResolution(
+                    raw, canonical, raw_desc,
+                    clean_text(best_row.get("description") or raw_desc),
+                    _clamp(0.72 + 0.18 * best_score, 0.0, 0.94),
+                    "FUZZY_DESCRIPTION", "REVIEW",
+                    f"Possible description match ({best_score:.3f}) requires human review.",
+                )
+
+        return IdentityResolution(
+            raw, raw, raw_desc, raw_desc, 0.25, "UNRESOLVED", "REVIEW",
+            "No sufficiently reliable historical or master-data identity match was found.",
+        )
+
+    @classmethod
+    def persist_identity_resolutions(
+        cls,
+        session,
+        *,
+        resolutions: dict[tuple[str, str], IdentityResolution],
+        import_run_id: int | None,
+        analysis,
+        plan_date: date | None,
+    ) -> dict[str, int]:
+        """Persist already-computed resolution evidence without resolving twice."""
+        alias_params = []
+        log_params = []
+        for resolution in resolutions.values():
+            if resolution.action == "AUTO_CORRECT" and resolution.canonical_sap_code:
+                alias_key = _description_key(resolution.raw_description)
+                if alias_key:
+                    alias_params.append(
+                        {
+                            "alias_key": alias_key,
+                            "raw_value": resolution.raw_description,
+                            "canonical_sap_code": resolution.canonical_sap_code,
+                            "canonical_description": resolution.canonical_description,
+                            "confidence_score": resolution.confidence_score,
+                            "source": resolution.method,
+                            "plan_date": plan_date,
+                        }
+                    )
+            log_params.append(
+                {
+                    "import_run_id": import_run_id,
+                    "plan_date": plan_date,
+                    "raw_sap_code": resolution.raw_sap_code,
+                    "canonical_sap_code": resolution.canonical_sap_code,
+                    "raw_description": resolution.raw_description,
+                    "canonical_description": resolution.canonical_description,
+                    "confidence_score": resolution.confidence_score,
+                    "resolution_method": resolution.method,
+                    "action": resolution.action,
+                    "explanation": resolution.explanation,
+                    "source_workbook": str(getattr(analysis, "workbook_name", "") or ""),
+                }
+            )
+
+        if alias_params:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO mpps_identity_aliases (
+                        alias_type, alias_key, raw_value, canonical_sap_code,
+                        canonical_description, confidence_score, evidence_count,
+                        source, is_approved, last_seen_plan_date, updated_at
+                    ) VALUES (
+                        'DESCRIPTION', :alias_key, :raw_value, :canonical_sap_code,
+                        :canonical_description, :confidence_score, 1,
+                        :source, FALSE, :plan_date, CURRENT_TIMESTAMP
+                    )
+                    ON CONFLICT (alias_type, alias_key, canonical_sap_code)
+                    DO UPDATE SET
+                        confidence_score = GREATEST(
+                            mpps_identity_aliases.confidence_score,
+                            EXCLUDED.confidence_score
+                        ),
+                        evidence_count = mpps_identity_aliases.evidence_count + 1,
+                        last_seen_plan_date = EXCLUDED.last_seen_plan_date,
+                        updated_at = CURRENT_TIMESTAMP
+                    """
+                ),
+                alias_params,
+            )
+            if cls._r743_alias_map is not None:
+                for item in alias_params:
+                    key = item["alias_key"]
+                    previous = cls._r743_alias_map.get(key)
+                    candidate = {
+                        "alias_key": key,
+                        "canonical_sap_code": item["canonical_sap_code"],
+                        "canonical_description": item["canonical_description"],
+                        "confidence_score": item["confidence_score"],
+                        "evidence_count": int((previous or {}).get("evidence_count") or 0) + 1,
+                        "is_approved": bool((previous or {}).get("is_approved") or False),
+                    }
+                    if previous is None or (
+                        candidate["is_approved"],
+                        float(candidate["confidence_score"] or 0),
+                        int(candidate["evidence_count"] or 0),
+                    ) >= (
+                        bool(previous.get("is_approved")),
+                        float(previous.get("confidence_score") or 0),
+                        int(previous.get("evidence_count") or 0),
+                    ):
+                        cls._r743_alias_map[key] = candidate
+
+        if log_params:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO mpps_identity_resolution_log (
+                        import_run_id, plan_date, raw_sap_code, canonical_sap_code,
+                        raw_description, canonical_description, confidence_score,
+                        resolution_method, action, explanation, source_workbook
+                    ) VALUES (
+                        :import_run_id, :plan_date, :raw_sap_code, :canonical_sap_code,
+                        :raw_description, :canonical_description, :confidence_score,
+                        :resolution_method, :action, :explanation, :source_workbook
+                    )
+                    """
+                ),
+                log_params,
+            )
+        return {
+            "identity_alias_rows_persisted": len(alias_params),
+            "identity_resolution_logs_persisted": len(log_params),
+        }
+
     def resolve_analysis(self, session, analysis, *, import_run_id: int | None = None, persist: bool = True) -> dict[str, Any]:
         self.ensure_schema(session)
-        master_rows = self._master_rows(session)
+        bulk_history = str(os.environ.get("MPPS_R741_BULK_HISTORY") or "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        master_rows = self._master_rows(session) if not bulk_history else None
+        context = self._r743_bulk_identity_context(session) if bulk_history else None
         consensus = self._workbook_consensus(analysis)
         plan_date = None
         try:
@@ -473,108 +845,62 @@ class FactoryIntelligenceService:
         reviewed = 0
         unresolved = 0
         touched = 0
-        collections = ('stock_rows', 'shipment_rows', 'oven_rows', 'production_history_rows')
+        collections = ("stock_rows", "shipment_rows", "oven_rows", "production_history_rows")
         for collection_name in collections:
             for row in getattr(analysis, collection_name, []) or []:
-                # Keep the original workbook identity across preview -> commit.
-                # The preview pass may already have replaced row['sap_code'] with
-                # a high-confidence canonical code; raw_sap_code preserves the
-                # evidence needed to learn/audit that correction on commit.
-                raw_sap = _code(row.get('raw_sap_code') or row.get('sap_code'))
-                description = row.get('description') or row.get('item_description') or ''
+                raw_sap = _code(row.get("raw_sap_code") or row.get("sap_code"))
+                description = row.get("description") or row.get("item_description") or ""
                 cache_key = (raw_sap, _description_key(description))
                 resolution = resolutions.get(cache_key)
                 if resolution is None:
-                    resolution = self.resolve_identity(
-                        session,
-                        raw_sap_code=raw_sap,
-                        description=description,
-                        master_rows=master_rows,
-                        workbook_consensus=consensus,
-                    )
+                    if bulk_history:
+                        resolution = self._r743_resolve_identity(
+                            raw_sap_code=raw_sap,
+                            description=description,
+                            workbook_consensus=consensus,
+                            context=context,
+                        )
+                    else:
+                        resolution = self.resolve_identity(
+                            session,
+                            raw_sap_code=raw_sap,
+                            description=description,
+                            master_rows=master_rows,
+                            workbook_consensus=consensus,
+                        )
                     resolutions[cache_key] = resolution
                 touched += 1
-                if resolution.action == 'AUTO_CORRECT' and resolution.canonical_sap_code and resolution.canonical_sap_code != raw_sap:
-                    row['raw_sap_code'] = raw_sap
-                    row['sap_code'] = resolution.canonical_sap_code
-                    row['identity_resolution_method'] = resolution.method
-                    row['identity_confidence'] = resolution.confidence_score
+                if (
+                    resolution.action == "AUTO_CORRECT"
+                    and resolution.canonical_sap_code
+                    and resolution.canonical_sap_code != raw_sap
+                ):
+                    row["raw_sap_code"] = raw_sap
+                    row["sap_code"] = resolution.canonical_sap_code
+                    row["identity_resolution_method"] = resolution.method
+                    row["identity_confidence"] = resolution.confidence_score
                     auto_corrected += 1
-                elif resolution.action == 'REVIEW':
+                elif resolution.action == "REVIEW":
                     reviewed += 1
-                    if resolution.method == 'UNRESOLVED':
+                    if resolution.method == "UNRESOLVED":
                         unresolved += 1
 
         if persist:
-            for resolution in resolutions.values():
-                if resolution.action == 'AUTO_CORRECT' and resolution.canonical_sap_code:
-                    alias_key = _description_key(resolution.raw_description)
-                    if alias_key:
-                        session.execute(
-                            text(
-                                """
-                                INSERT INTO mpps_identity_aliases (
-                                    alias_type, alias_key, raw_value, canonical_sap_code,
-                                    canonical_description, confidence_score, evidence_count,
-                                    source, is_approved, last_seen_plan_date, updated_at
-                                ) VALUES (
-                                    'DESCRIPTION', :alias_key, :raw_value, :canonical_sap_code,
-                                    :canonical_description, :confidence_score, 1,
-                                    :source, FALSE, :plan_date, CURRENT_TIMESTAMP
-                                )
-                                ON CONFLICT (alias_type, alias_key, canonical_sap_code)
-                                DO UPDATE SET
-                                    confidence_score = GREATEST(mpps_identity_aliases.confidence_score, EXCLUDED.confidence_score),
-                                    evidence_count = mpps_identity_aliases.evidence_count + 1,
-                                    last_seen_plan_date = EXCLUDED.last_seen_plan_date,
-                                    updated_at = CURRENT_TIMESTAMP
-                                """
-                            ),
-                            {
-                                'alias_key': alias_key,
-                                'raw_value': resolution.raw_description,
-                                'canonical_sap_code': resolution.canonical_sap_code,
-                                'canonical_description': resolution.canonical_description,
-                                'confidence_score': resolution.confidence_score,
-                                'source': resolution.method,
-                                'plan_date': plan_date,
-                            },
-                        )
-                session.execute(
-                    text(
-                        """
-                        INSERT INTO mpps_identity_resolution_log (
-                            import_run_id, plan_date, raw_sap_code, canonical_sap_code,
-                            raw_description, canonical_description, confidence_score,
-                            resolution_method, action, explanation, source_workbook
-                        ) VALUES (
-                            :import_run_id, :plan_date, :raw_sap_code, :canonical_sap_code,
-                            :raw_description, :canonical_description, :confidence_score,
-                            :resolution_method, :action, :explanation, :source_workbook
-                        )
-                        """
-                    ),
-                    {
-                        'import_run_id': import_run_id,
-                        'plan_date': plan_date,
-                        'raw_sap_code': resolution.raw_sap_code,
-                        'canonical_sap_code': resolution.canonical_sap_code,
-                        'raw_description': resolution.raw_description,
-                        'canonical_description': resolution.canonical_description,
-                        'confidence_score': resolution.confidence_score,
-                        'resolution_method': resolution.method,
-                        'action': resolution.action,
-                        'explanation': resolution.explanation,
-                        'source_workbook': str(getattr(analysis, 'workbook_name', '') or ''),
-                    },
-                )
+            self.persist_identity_resolutions(
+                session,
+                resolutions=resolutions,
+                import_run_id=import_run_id,
+                analysis=analysis,
+                plan_date=plan_date,
+            )
+
         return {
-            'identity_rows_checked': touched,
-            'identity_unique_pairs': len(resolutions),
-            'identity_auto_corrected': auto_corrected,
-            'identity_review_rows': reviewed,
-            'identity_unresolved_rows': unresolved,
-            '_resolutions': resolutions,
+            "identity_rows_checked": touched,
+            "identity_unique_pairs": len(resolutions),
+            "identity_auto_corrected": auto_corrected,
+            "identity_review_rows": reviewed,
+            "identity_unresolved_rows": unresolved,
+            "_resolutions": resolutions,
         }
 
     def capture_opening_stock(
@@ -604,11 +930,28 @@ class FactoryIntelligenceService:
 
         changes = 0
         negative = 0
+        params = []
         for row in rows:
             raw = _int(row.get('fg_stock'))
             normalized = max(0, raw)
             if raw < 0:
                 negative += 1
+            params.append({
+                'import_run_id': import_run_id,
+                'plan_date': plan_date,
+                'month_key': month_key,
+                'sap_code': _code(row.get('sap_code')),
+                'item_description': clean_text(row.get('description') or ''),
+                'raw_stock_qty': raw,
+                'normalized_opening_qty': normalized,
+                'scrap_qty': max(0, _int(row.get('scrap_stock'))),
+                'blocked_qty': max(0, _int(row.get('blocked_stock'))),
+                'import_mode': mode,
+                'source_workbook': str(getattr(analysis, 'workbook_name', '') or ''),
+                'source_sheet': str(row.get('source_sheet') or 'PROD'),
+                'source_row': row.get('source_row'),
+            })
+        if params:
             session.execute(
                 text(
                     """
@@ -630,21 +973,7 @@ class FactoryIntelligenceService:
                         item_description = EXCLUDED.item_description
                     """
                 ),
-                {
-                    'import_run_id': import_run_id,
-                    'plan_date': plan_date,
-                    'month_key': month_key,
-                    'sap_code': _code(row.get('sap_code')),
-                    'item_description': clean_text(row.get('description') or ''),
-                    'raw_stock_qty': raw,
-                    'normalized_opening_qty': normalized,
-                    'scrap_qty': max(0, _int(row.get('scrap_stock'))),
-                    'blocked_qty': max(0, _int(row.get('blocked_stock'))),
-                    'import_mode': mode,
-                    'source_workbook': str(getattr(analysis, 'workbook_name', '') or ''),
-                    'source_sheet': str(row.get('source_sheet') or 'PROD'),
-                    'source_row': row.get('source_row'),
-                },
+                params,
             )
 
         if mode == 'LIVE' and rows:

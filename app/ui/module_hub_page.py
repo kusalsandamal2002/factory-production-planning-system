@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 
@@ -285,49 +285,8 @@ def create_manager_output_page(open_callback=None) -> ModuleHubPage:
         open_callback=open_callback,
     )
 
+def create_admin_control_page(open_callback=None):
+    # R4 professional admin workspace. Import lazily so normal startup remains light.
+    from app.ui.admin_control_center_page import AdminControlCenterPage
 
-def create_admin_control_page(open_callback=None) -> ModuleHubPage:
-    return ModuleHubPage(
-        title="Admin Control Center",
-        subtitle=(
-            "System administration area for data audit, raw Excel traceability, users, backup and restore."
-        ),
-        cards=[
-            ModuleCard(
-                title="Data Quality Issues",
-                description="Review and resolve data warnings found during Excel-to-database mapping.",
-                action_key="data_quality",
-            ),
-            ModuleCard(
-                title="Raw Excel Data Viewer",
-                description="Trace any app value back to workbook, sheet, row and cell.",
-                action_key="raw_excel_viewer",
-            ),
-            ModuleCard(
-                title="Users & Roles",
-                description="Manage admin, manager, operator and viewer access levels.",
-                action_key="users_roles",
-            ),
-            ModuleCard(
-                title="Backup / Restore",
-                description="Backup PostgreSQL data and restore previous safe snapshots.",
-                action_key="backup_restore",
-            ),
-            ModuleCard(
-                title="Audit Log",
-                description="Track who changed master data, stock, demand and schedule records.",
-                action_key="audit_log",
-            ),
-            ModuleCard(
-                title="Factory Out Date Logic",
-                description="View shipment item receive-date and final factory-out-date calculation logic before scheduler automation is connected.",
-                action_key="factory_out_date_logic",
-            ),
-            ModuleCard(
-                title="Database Viewer",
-                description="View PostgreSQL tables safely with lazy loading, search, pagination and CSV export.",
-                action_key="database_viewer",
-            ),
-        ],
-        open_callback=open_callback,
-    )
+    return AdminControlCenterPage(open_callback=open_callback)

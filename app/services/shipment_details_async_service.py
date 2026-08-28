@@ -6,7 +6,6 @@ from typing import Any, Callable, Mapping
 from sqlalchemy import text
 
 from app.database import engine
-from app.services.factory_out_forecast_service import load_shipment_forecasts
 from app.services.operational_source_service import OperationalSourceService
 from app.services.shipment_command_service import portfolio_metrics, shipment_risk_profile
 
@@ -144,16 +143,27 @@ def load_shipment_portfolio(
                     shipment.shipment_no
                 ) AS shipment_name,
                 shipment.customer_name,
-                shipment.target_date AS target_date,
-                COALESCE(
-                    NULLIF(shipment.target_date_source, ''),
-                    'Auto Earliest Feasible Factory Out'
-                ) AS target_date_source,
+                CASE
+                    WHEN NOT COALESCE(shipment.target_date_is_manual, FALSE)
+                     AND shipment.target_date >= DATE '2060-01-01'
+                    THEN NULL
+                    ELSE shipment.target_date
+                END AS target_date,
+                CASE
+                    WHEN NOT COALESCE(shipment.target_date_is_manual, FALSE)
+                     AND shipment.target_date >= DATE '2060-01-01'
+                    THEN 'Auto Earliest Feasible Factory Out'
+                    ELSE COALESCE(
+                        NULLIF(shipment.target_date_source, ''),
+                        'Auto Earliest Feasible Factory Out'
+                    )
+                END AS target_date_source,
                 COALESCE(shipment.target_date_is_manual, FALSE) AS target_date_is_manual,
                 (
                     NOT COALESCE(shipment.target_date_is_manual, FALSE)
                     AND (
                         shipment.target_date IS NULL
+                        OR shipment.target_date >= DATE '2060-01-01'
                         OR LOWER(COALESCE(shipment.target_date_source, '')) LIKE 'auto%'
                         OR LOWER(COALESCE(shipment.target_date_source, '')) LIKE 'automatic%'
                     )
@@ -190,6 +200,10 @@ def load_shipment_portfolio(
                 COALESCE(item.item_search_text, '') AS item_search_text,
                 COALESCE(NULLIF(shipment.status, ''), 'Planned') AS shipment_status,
                 COALESCE(NULLIF(shipment.planning_status, ''), 'Pending') AS planning_status,
+                COALESCE(NULLIF(shipment.lifecycle_status, ''), 'ACTIVE') AS lifecycle_status,
+                COALESCE(shipment.source_missing_from_latest, FALSE) AS source_missing_from_latest,
+                shipment.actual_factory_out_date,
+                COALESCE(shipment.closure_reason, '') AS closure_reason,
                 (
                     LOWER(COALESCE(shipment.status, '')) IN (
                         'imported review',
@@ -258,42 +272,23 @@ def load_shipment_portfolio(
     _emit(progress, 24, "Loading shipment portfolio from PostgreSQL...")
     with engine.begin() as connection:
         raw_rows = connection.execute(text(query), params).mappings().all()
-        _emit(progress, 48, "Loading Factory Can Out forecasts...")
-        forecast_map = load_shipment_forecasts(
-            connection,
-            [int(row["shipment_pk"]) for row in raw_rows],
-            as_of_date=as_of_date,
-        )
 
-    _emit(progress, 62, "Calculating shipment risk and delivery state...")
+    _emit(progress, 62, "Reading canonical Factory Can Out and delivery state...")
     rows: list[dict[str, Any]] = []
     total_raw = max(1, len(raw_rows))
 
     for row_index, raw in enumerate(raw_rows):
         row = dict(raw)
-        forecast = forecast_map.get(int(row.get("shipment_pk") or 0))
-        if (
-            not row.get("review_required")
-            and row.get("factory_can_receive_date") is None
-            and forecast is not None
-        ):
-            if forecast.factory_out_date is not None:
-                row["factory_can_receive_date"] = forecast.factory_out_date
-                row["factory_out_forecast"] = True
-                row["factory_out_source"] = forecast.source
-                row["factory_out_confidence"] = forecast.confidence
-            else:
-                row["factory_out_forecast"] = False
-                row["factory_out_source"] = "BLOCKED"
-                row["factory_out_blocker"] = forecast.blocker
+        row["factory_out_forecast"] = False
+        if row.get("factory_can_receive_date") is not None:
+            row["factory_out_source"] = "R6_CANONICAL"
+            row["factory_out_confidence"] = 1.0
+        elif row.get("review_required"):
+            row["factory_out_source"] = "CLOSURE_REVIEW"
+            row["factory_out_confidence"] = 0.0
         else:
-            row["factory_out_forecast"] = False
-            row["factory_out_source"] = (
-                "VERIFIED" if row.get("factory_can_receive_date") else ""
-            )
-            row["factory_out_confidence"] = (
-                1.0 if row.get("factory_can_receive_date") else 0.0
-            )
+            row["factory_out_source"] = "PENDING_CANONICAL_REPLAN"
+            row["factory_out_confidence"] = 0.0
 
         target = row.get("target_date")
         factory_out = row.get("factory_can_receive_date")
@@ -395,3 +390,68 @@ def load_shipment_portfolio(
         "refreshed_at": datetime.now(),
         "filters": filters,
     }
+
+# MPPS R7463 HOTFIX SHIPMENT DETAIL API
+def load_shipment_detail(shipment_id: int, *, progress=None):
+    shipment_id = int(shipment_id)
+    if shipment_id <= 0:
+        raise ValueError("A valid shipment id is required.")
+
+    _emit(progress, 10, "Reading shipment header...")
+    with engine.connect() as connection:
+        shipment = connection.execute(
+            text("SELECT * FROM mpps_shipments WHERE id=:id"),
+            {"id": shipment_id},
+        ).mappings().first()
+        if not shipment:
+            raise ValueError(f"Shipment {shipment_id} was not found.")
+
+        rows = connection.execute(
+            text("SELECT * FROM mpps_shipment_items WHERE shipment_id=:id ORDER BY id"),
+            {"id": shipment_id},
+        ).mappings().all()
+
+        try:
+            source = OperationalSourceService.latest(connection)
+        except Exception:
+            source = None
+
+    items = []
+    for raw in rows:
+        item = dict(raw)
+
+        def q(name):
+            try:
+                return max(0, int(float(item.get(name) or 0)))
+            except Exception:
+                return 0
+
+        qty = q("quantity")
+        stock = min(qty, q("stock_allocated_qty"))
+        produced = min(qty, q("produced_qty"))
+        completed = min(qty, max(q("completed_qty"), produced))
+
+        item.setdefault("production_required_qty", max(qty - stock - produced, 0))
+        item.setdefault("remaining_qty", max(qty - completed, 0))
+        item.setdefault("production_start", item.get("start_date"))
+        item.setdefault(
+            "expected_finish",
+            item.get("end_date") or item.get("receive_date") or item.get("item_receive_date"),
+        )
+        if qty > 0 and completed >= qty:
+            item.setdefault("item_status", "COMPLETED")
+        elif produced > 0:
+            item.setdefault("item_status", "IN PRODUCTION")
+        elif qty > 0 and stock >= qty:
+            item.setdefault("item_status", "STOCK COVERED")
+        else:
+            item.setdefault("item_status", "PENDING")
+        items.append(item)
+
+    return {
+        "shipment": dict(shipment),
+        "items": items,
+        "source": source,
+        "refreshed_at": datetime.now(),
+    }
+

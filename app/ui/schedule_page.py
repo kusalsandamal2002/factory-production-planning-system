@@ -1,9 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import date
 from typing import Any
 
-from PySide6.QtCore import QDate, QObject, QThread, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QDate, Qt, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.core.task_manager import TaskManager
 from app.database import get_session
 from app.services.operational_source_service import OperationalSourceService
 from app.services.cavity_daily_plan_service import (
@@ -72,6 +73,7 @@ TABLE_HEADERS = [
     "Balance",
     "CASING TYPE",
     "Mold Type",
+    "Priority",
 ]
 
 COLUMN_WIDTHS = [
@@ -98,38 +100,12 @@ COLUMN_WIDTHS = [
     100,
     125,
     150,
+    90,
 ]
 
 
 # PRODUCTION PLANNING FAST ASYNC LOAD V7.1
 # MPPS ULTRA PERFORMANCE + GLOBAL PROGRESS V7.2
-
-
-class _PlanGenerationWorker(QObject):
-    result_ready = Signal(object, object, object)
-    progress = Signal(int, str)
-    failed = Signal(str)
-
-    def __init__(self, settings: CavityPlanSettings):
-        super().__init__()
-        self.settings = settings
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            with get_session() as session:
-                rows, summary, blocked = generate_cavity_plan(
-                    session,
-                    settings=self.settings,
-                    progress_callback=(
-                        lambda percent, message:
-                        self.progress.emit(percent, message)
-                    ),
-                )
-            self.result_ready.emit(rows, summary, blocked)
-        except Exception as exc:
-            self.failed.emit(str(exc))
-
 
 
 class SchedulePage(QWidget):
@@ -145,24 +121,22 @@ class SchedulePage(QWidget):
         self.current_run_id: int | None = None
         self.preview_is_saved = False
         self._auto_refresh_pending = False
-        self._plan_thread: QThread | None = None
-        self._plan_worker: _PlanGenerationWorker | None = None
+        self.tasks = TaskManager.instance()
+        self._plan_running = False
+        self._save_running = False
+        self._saved_load_token = 0
+        self._table_render_token = 0
 
         self.plan_date = QDateEdit()
         self.plan_date.setCalendarPopup(True)
         self.plan_date.setDisplayFormat("yyyy-MM-dd")
         initial_date = date.today()
-        try:
-            with get_session() as session:
-                initial_date = OperationalSourceService.next_plan_date(session, fallback=date.today())
-        except Exception:
-            initial_date = date.today()
         self.plan_date.setDate(QDate(initial_date.year, initial_date.month, initial_date.day))
         self.plan_date.setToolTip(
             "Defaults to the day after the newest LIVE OVEN workbook. Older workbooks remain history/ML only."
         )
         self.plan_date.dateChanged.connect(
-            self._load_saved_or_preview
+            self._request_saved_plan_load
         )
 
         self.shift_selector = QComboBox()
@@ -221,7 +195,7 @@ class SchedulePage(QWidget):
             "SecondaryButton"
         )
         self.refresh_button.clicked.connect(
-            self._load_saved_or_preview
+            self._request_saved_plan_load
         )
 
         self.recalculate_button = QPushButton(
@@ -252,6 +226,8 @@ class SchedulePage(QWidget):
         self.status_badge.setObjectName("StatusBadge")
         self.saved_badge = QLabel("PREVIEW")
         self.saved_badge.setObjectName("PreviewBadge")
+        self.reconciliation_badge = QLabel("AWAITING PLAN")
+        self.reconciliation_badge.setObjectName("PreviewBadge")
 
         self.plan_progress = QProgressBar()
         self.plan_progress.setRange(0, 100)
@@ -303,11 +279,14 @@ class SchedulePage(QWidget):
         self._setup_tables()
         self._apply_styles()
         self._build_ui()
-        self._load_saved_or_preview()
+        QTimer.singleShot(
+            0,
+            self._start_initial_async_load,
+        )
 
     def showEvent(self, event) -> None:
-        # V7.1: heavy production planning is never launched from showEvent.
-        # Recalculate Plan runs it in a background QThread.
+        # Heavy production planning is never launched from showEvent.
+        # R6 runs plan generation through the shared bounded TaskManager.
         super().showEvent(event)
 
     def _build_ui(self) -> None:
@@ -333,11 +312,10 @@ class SchedulePage(QWidget):
         )
         title.setObjectName("PageTitle")
         subtitle = QLabel(
-            "Displays every factory cavity. Automatic "
-            "allocation uses approved SMDS data, shipment "
-            "shortage, SAP stock, line compatibility, mold "
-            "and casing concurrency, curing time, handling "
-            "time and cavity operating status. Fixed shifts: "
+            "Displays every factory cavity. Automatic allocation uses canonical "
+            "shipment priority, current-stock authority, approved tyre compatibility, "
+            "mold/casing constraints, curing time, changeover and cavity availability. "
+            "Fixed shifts: "
             "DAY 07:00-19:00 and NIGHT 19:00-07:00."
         )
         subtitle.setWordWrap(True)
@@ -347,6 +325,7 @@ class SchedulePage(QWidget):
 
         heading_row.addLayout(title_area, 1)
         heading_row.addWidget(self.saved_badge)
+        heading_row.addWidget(self.reconciliation_badge)
         heading_row.addWidget(self.status_badge)
         heading_row.addWidget(self.refresh_button)
         heading_row.addWidget(
@@ -765,23 +744,11 @@ class SchedulePage(QWidget):
         if not self.isVisible():
             return
 
-        try:
-            settings = self._settings()
-            with get_session() as session:
-                rows, summary, blocked = generate_cavity_plan(
-                    session,
-                    settings=settings,
-                )
-
-            self.current_run_id = None
-            self.preview_is_saved = False
-            self._apply_result(rows, summary, blocked)
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "Shift Plan Refresh",
-                str(exc),
-            )
+        # V24: never run generate_cavity_plan on the Qt UI thread.
+        self.plan_progress_label.setText(
+            "Shift changed — recalculating in background..."
+        )
+        self.recalculate_plan()
 
     def _settings(self) -> CavityPlanSettings:
         planning_date = self.plan_date.date().toPython()
@@ -811,53 +778,165 @@ class SchedulePage(QWidget):
             ),
         )
 
+    def _start_initial_async_load(self) -> None:
+        self._start_saved_plan_worker(
+            planning_date=None,
+            resolve_latest=True,
+        )
+
+    def _request_saved_plan_load(
+        self,
+        *args,
+    ) -> None:
+        planning_date = self.plan_date.date().toPython()
+        if not isinstance(planning_date, date):
+            planning_date = date(
+                planning_date.year,
+                planning_date.month,
+                planning_date.day,
+            )
+        self._start_saved_plan_worker(
+            planning_date=planning_date,
+            resolve_latest=False,
+        )
+
     def _load_saved_or_preview(
         self,
         *args,
     ) -> None:
-        """Fast page load: read a saved plan only.
+        # Compatibility alias. Saved plans now load asynchronously.
+        self._request_saved_plan_load(*args)
 
-        A missing saved plan no longer triggers the full cavity planner
-        inside the UI page constructor. The user can recalculate in the
-        background with the existing Recalculate Plan button.
-        """
-        try:
-            settings = self._settings()
+    def _start_saved_plan_worker(
+        self,
+        planning_date,
+        *,
+        resolve_latest: bool,
+    ) -> None:
+        self._saved_load_token += 1
+        token = self._saved_load_token
+
+        self.plan_progress.setRange(0, 100)
+        self.plan_progress.setValue(8)
+        self.plan_progress_label.setText(
+            "Loading saved production plan in background..."
+        )
+        self.saved_badge.setText("LOADING SAVED PLAN")
+        self.refresh_button.setEnabled(False)
+
+        def load_saved_job():
+            resolved_date = planning_date
             with get_session() as session:
+                if resolve_latest:
+                    resolved_date = OperationalSourceService.next_plan_date(
+                        session,
+                        fallback=date.today(),
+                    )
                 saved = load_latest_saved_plan(
                     session,
-                    planning_date=settings.planning_date,
+                    planning_date=resolved_date,
                 )
+            return {
+                "token": token,
+                "planning_date": resolved_date,
+                "saved": saved,
+            }
 
-            if saved:
-                (
-                    rows,
-                    summary,
-                    blocked,
-                    saved_settings,
-                    run_id,
-                ) = saved
-                self._set_shift_controls(saved_settings)
-                self.current_run_id = run_id
-                self.preview_is_saved = True
-                self._apply_result(rows, summary, blocked)
-                self.plan_progress.setValue(100)
-                self.plan_progress_label.setText(
-                    "Saved plan loaded — 100%"
+        self.tasks.submit(
+            "production-planning-r6:saved-plan",
+            load_saved_job,
+            on_result=self._on_saved_plan_payload,
+            on_error=lambda message, tok=token: self._on_saved_plan_failed(
+                tok,
+                message,
+            ),
+            priority=1,
+            replace=True,
+        )
+
+    def _on_saved_plan_payload(self, payload) -> None:
+        data = dict(payload or {})
+        self._on_saved_plan_ready(
+            int(data.get("token") or 0),
+            data.get("planning_date"),
+            data.get("saved"),
+        )
+
+    def _on_saved_plan_ready(
+        self,
+        token: int,
+        planning_date,
+        saved,
+    ) -> None:
+        if token != self._saved_load_token:
+            return
+
+        self.refresh_button.setEnabled(True)
+
+        if planning_date is not None:
+            current_date = self.plan_date.date().toPython()
+            if current_date != planning_date:
+                self.plan_date.blockSignals(True)
+                self.plan_date.setDate(
+                    QDate(
+                        planning_date.year,
+                        planning_date.month,
+                        planning_date.day,
+                    )
                 )
-                self.save_button.setEnabled(True)
-                return
+                self.plan_date.blockSignals(False)
 
-            self.current_run_id = None
-            self.preview_is_saved = False
-            self._show_no_saved_plan_state()
+        if saved:
+            (
+                rows,
+                summary,
+                blocked,
+                saved_settings,
+                run_id,
+            ) = saved
 
-        except Exception as exc:
+            self._set_shift_controls(saved_settings)
+            self.current_run_id = run_id
+            self.preview_is_saved = True
+            self._apply_result(
+                rows,
+                summary,
+                blocked,
+            )
+            self.plan_progress.setValue(100)
+            self.plan_progress_label.setText(
+                "Saved plan loaded — 100%"
+            )
+            self.save_button.setEnabled(True)
+            return
+
+        self.current_run_id = None
+        self.preview_is_saved = False
+        self._show_no_saved_plan_state()
+
+    def _on_saved_plan_failed(
+        self,
+        token: int,
+        message: str,
+    ) -> None:
+        if token != self._saved_load_token:
+            return
+
+        self.refresh_button.setEnabled(True)
+        self.plan_progress.setRange(0, 100)
+        self.plan_progress.setValue(0)
+        self.plan_progress_label.setText(
+            "Saved plan load failed"
+        )
+
+        if self.isVisible():
+            detail = str(message or "").splitlines()
+            reason = detail[-1] if detail else "Unknown error"
             QMessageBox.critical(
                 self,
                 "Production Planning",
-                "Could not load the saved cavity-level "
-                f"production plan.\n\n{exc}",
+                "Could not load the saved cavity-level production plan.\n\n"
+                + reason,
             )
 
     def _show_no_saved_plan_state(self) -> None:
@@ -878,6 +957,14 @@ class SchedulePage(QWidget):
             "font-weight:950;"
         )
         self.saved_badge.setText("NO SAVED PLAN")
+        self.reconciliation_badge.setText("AWAITING PLAN")
+        self.reconciliation_badge.setStyleSheet(
+            "background:#e2e8f0;"
+            "color:#334155;"
+            "border-radius:9px;"
+            "padding:8px 11px;"
+            "font-weight:950;"
+        )
         self.saved_badge.setStyleSheet(
             "background:#e2e8f0;"
             "color:#334155;"
@@ -906,9 +993,9 @@ class SchedulePage(QWidget):
         self.changeover_minutes.setEnabled(not running)
 
         if running:
-            self.plan_progress.setValue(0)
+            self.plan_progress.setRange(0, 0)
             self.plan_progress_label.setText(
-                "Starting high-priority planner..."
+                "Running priority-aware finite-capacity planner in background..."
             )
             self.status_badge.setText(
                 "CALCULATING 0%"
@@ -922,10 +1009,7 @@ class SchedulePage(QWidget):
             )
 
     def recalculate_plan(self, *args) -> None:
-        if (
-            self._plan_thread is not None
-            and self._plan_thread.isRunning()
-        ):
+        if self._plan_running:
             return
 
         try:
@@ -938,71 +1022,34 @@ class SchedulePage(QWidget):
             )
             return
 
+        self._plan_running = True
         self._set_generation_running(True)
         self.current_run_id = None
         self.preview_is_saved = False
 
-        thread = QThread(self)
-        worker = _PlanGenerationWorker(settings)
-        worker.moveToThread(thread)
+        def plan_job():
+            with get_session() as session:
+                rows, summary, blocked = generate_cavity_plan(
+                    session,
+                    settings=settings,
+                )
+            return rows, summary, blocked
 
-        self._plan_thread = thread
-        self._plan_worker = worker
-
-        thread.started.connect(worker.run)
-        worker.result_ready.connect(
-            self._on_background_plan_ready
-        )
-        worker.progress.connect(
-            self._on_background_plan_progress
-        )
-        worker.failed.connect(
-            self._on_background_plan_failed
-        )
-        worker.result_ready.connect(
-            lambda *_: thread.quit()
-        )
-        worker.failed.connect(
-            lambda *_: thread.quit()
-        )
-        worker.result_ready.connect(
-            lambda *_: worker.deleteLater()
-        )
-        worker.failed.connect(
-            lambda *_: worker.deleteLater()
-        )
-        thread.finished.connect(
-            self._on_background_thread_finished
-        )
-        thread.finished.connect(thread.deleteLater)
-        thread.start(QThread.Priority.HighPriority)
-
-    @Slot(int, str)
-    def _on_background_plan_progress(
-        self,
-        percent: int,
-        message: str,
-    ) -> None:
-        value = max(0, min(100, int(percent)))
-        self.plan_progress.setValue(value)
-        self.plan_progress_label.setText(
-            message or "Calculating production plan..."
-        )
-        self.status_badge.setText(
-            f"CALCULATING {value}%"
-            if value < 100
-            else "PLAN READY 100%"
+        self.tasks.submit(
+            "production-planning-r6:generate",
+            plan_job,
+            on_result=self._on_background_plan_ready,
+            on_error=self._on_background_plan_failed,
+            priority=2,
+            replace=True,
         )
 
-    @Slot(object, object, object)
-    def _on_background_plan_ready(
-        self,
-        rows,
-        summary,
-        blocked,
-    ) -> None:
+    def _on_background_plan_ready(self, payload) -> None:
+        rows, summary, blocked = payload
+        self._plan_running = False
         self.current_run_id = None
         self.preview_is_saved = False
+        self.plan_progress.setRange(0, 100)
         self._apply_result(rows, summary, blocked)
         self._set_generation_running(False)
         self.plan_progress.setValue(100)
@@ -1010,36 +1057,37 @@ class SchedulePage(QWidget):
             "Production plan ready — 100%"
         )
 
-        QMessageBox.information(
-            self,
-            "Plan Recalculated",
-            (
-                f"Generated {len(rows):,} display rows "
-                f"for {summary.total_cavities:,} "
-                "factory cavities.\n\n"
-                "No plan was saved yet. Click Save Plan "
-                "after reviewing the allocation."
-            ),
-        )
+        if self.isVisible():
+            QMessageBox.information(
+                self,
+                "Plan Recalculated",
+                (
+                    f"Generated {len(rows):,} display rows "
+                    f"for {summary.total_cavities:,} factory cavities.\n\n"
+                    "No plan was saved yet. Click Save Plan after reviewing "
+                    "the allocation."
+                ),
+            )
 
-    @Slot(str)
     def _on_background_plan_failed(self, message: str) -> None:
+        self._plan_running = False
+        self.plan_progress.setRange(0, 100)
         self._set_generation_running(False)
         self.plan_progress_label.setText(
             "Planner stopped — see error"
         )
+        detail = str(message or "").splitlines()
+        reason = detail[-1] if detail else "Unknown planner error"
         QMessageBox.critical(
             self,
             "Recalculate Plan",
-            message,
+            reason,
         )
 
-    @Slot()
-    def _on_background_thread_finished(self) -> None:
-        self._plan_thread = None
-        self._plan_worker = None
-
     def save_plan(self, *args) -> None:
+        if self._save_running:
+            return
+
         if not self.plan_rows or self.summary is None:
             QMessageBox.warning(
                 self,
@@ -1062,10 +1110,9 @@ class SchedulePage(QWidget):
             self,
             "Save Cavity Plan",
             (
-                "Save this cavity-level plan as the latest "
-                f"plan for {settings.planning_date}"
-                "?\n\nA new version will be created; older "
-                "saved versions are retained."
+                "Save this priority-aware cavity-level plan as the latest "
+                f"plan for {settings.planning_date}?\n\n"
+                "A new version will be created; older saved versions are retained."
             ),
             (
                 QMessageBox.StandardButton.Yes
@@ -1073,39 +1120,121 @@ class SchedulePage(QWidget):
             ),
             QMessageBox.StandardButton.No,
         )
-        if (
-            confirmation
-            != QMessageBox.StandardButton.Yes
-        ):
+        if confirmation != QMessageBox.StandardButton.Yes:
             return
 
-        try:
+        rows = list(self.plan_rows)
+        summary = self.summary
+        blocked = list(self.blocked_rows)
+        created_by = self._current_user_name()
+
+        self._save_running = True
+        self.save_button.setEnabled(False)
+        self.plan_progress.setRange(0, 0)
+        self.plan_progress_label.setText(
+            "Saving plan and reconciling canonical planning snapshot..."
+        )
+
+        def save_job():
             with get_session() as session:
                 run_id = save_cavity_plan(
                     session,
                     settings=settings,
-                    rows=self.plan_rows,
-                    summary=self.summary,
-                    blocked=self.blocked_rows,
-                    created_by=self._current_user_name(),
+                    rows=rows,
+                    summary=summary,
+                    blocked=blocked,
+                    created_by=created_by,
                 )
-            self.current_run_id = run_id
-            self.preview_is_saved = True
-            self._update_saved_badge()
-            QMessageBox.information(
-                self,
-                "Plan Saved",
-                (
-                    "Cavity-level production plan saved "
-                    f"successfully.\n\nRun ID: {run_id}"
-                ),
+
+            can_out_error = ""
+            try:
+                from app.services.factory_can_out_service import (
+                    FactoryCanOutService,
+                )
+
+                FactoryCanOutService.replan_open_shipments(
+                    trigger_reason=f"saved_cavity_plan_{run_id}",
+                    created_by="production_planning_r6",
+                )
+            except Exception as exc:
+                can_out_error = str(exc)
+
+            snapshot_id = None
+            snapshot_error = ""
+            try:
+                from app.services.planning_authority_service import (
+                    PlanningAuthorityService,
+                )
+                snapshot_id = PlanningAuthorityService.persist_snapshot()
+            except Exception as exc:
+                snapshot_error = str(exc)
+
+            return {
+                "run_id": run_id,
+                "snapshot_id": snapshot_id,
+                "snapshot_error": snapshot_error,
+                "can_out_error": can_out_error,
+            }
+
+        self.tasks.submit(
+            "production-planning-r6:save",
+            save_job,
+            on_result=self._save_done,
+            on_error=self._save_failed,
+            priority=2,
+            replace=True,
+        )
+
+    def _save_done(self, payload) -> None:
+        self._save_running = False
+        self.plan_progress.setRange(0, 100)
+        self.plan_progress.setValue(100)
+        self.save_button.setEnabled(True)
+
+        data = dict(payload or {})
+        run_id = int(data.get("run_id") or 0)
+        self.current_run_id = run_id or None
+        self.preview_is_saved = True
+        self._update_saved_badge()
+        self.plan_progress_label.setText(
+            "Plan saved and canonical snapshot refreshed."
+        )
+
+        snapshot_note = ""
+        if data.get("can_out_error"):
+            snapshot_note += (
+                "\n\nPlan saved. Factory Can Out reconciliation will retry "
+                "from the next shipment/planning refresh."
             )
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "Save Plan Failed",
-                str(exc),
+        if data.get("snapshot_error"):
+            snapshot_note += (
+                "\n\nCanonical snapshot refresh will retry "
+                "from Dashboard/next planning refresh."
             )
+
+        QMessageBox.information(
+            self,
+            "Plan Saved",
+            (
+                "Cavity-level production plan saved successfully."
+                f"\n\nRun ID: {run_id}"
+                + snapshot_note
+            ),
+        )
+
+    def _save_failed(self, message: str) -> None:
+        self._save_running = False
+        self.plan_progress.setRange(0, 100)
+        self.plan_progress.setValue(0)
+        self.save_button.setEnabled(bool(self.plan_rows))
+        self.plan_progress_label.setText("Plan save failed")
+        detail = str(message or "").splitlines()
+        reason = detail[-1] if detail else "Unknown save error"
+        QMessageBox.critical(
+            self,
+            "Save Plan Failed",
+            reason,
+        )
 
     def _apply_result(
         self,
@@ -1158,6 +1287,32 @@ class SchedulePage(QWidget):
         self.metric_labels["tons"].setText(
             f"{summary.planned_tons:,.3f}"
         )
+
+        expected_required = (
+            int(summary.today_planned_qty)
+            + int(summary.next_day_planned_qty)
+            + int(summary.remaining_balance_qty)
+        )
+        reconciled = int(summary.production_required_qty) == expected_required
+        if reconciled:
+            self.reconciliation_badge.setText("RECONCILED")
+            self.reconciliation_badge.setStyleSheet(
+                "background:#dcfce7;"
+                "color:#166534;"
+                "border-radius:9px;"
+                "padding:8px 11px;"
+                "font-weight:950;"
+            )
+        else:
+            self.reconciliation_badge.setText("RECALCULATE REQUIRED")
+            self.reconciliation_badge.setStyleSheet(
+                "background:#fee2e2;"
+                "color:#991b1b;"
+                "border-radius:9px;"
+                "padding:8px 11px;"
+                "font-weight:950;"
+            )
+
         self.status_badge.setText(
             summary.status_text
         )
@@ -1320,75 +1475,114 @@ class SchedulePage(QWidget):
         )
 
     def _populate_table(self) -> None:
-        self.table.setRowCount(0)
+        # Render large cavity plans in UI-friendly batches.
+        self._table_render_token += 1
+        token = self._table_render_token
+        rows = list(self.visible_rows)
 
-        for row_index, row in enumerate(
-            self.visible_rows
-        ):
-            self.table.insertRow(row_index)
-            values = [
-                row.line_name,
-                row.oven_no,
-                row.oven_status,
-                row.tyre_code or "-",
-                row.description or "-",
-                row.heel,
-                row.soft,
-                row.tred,
-                row.remark,
-                f"{row.total_to_be_produced:,}",
-                f"{row.today_qty:,}",
-                f"{row.day_plan_pcs:,}",
-                f"{row.night_plan_pcs:,}",
-                row.core,
-                f"{row.next_day_plan:,}",
-                f"{row.total:,}",
-                f"{row.weight_per_tyre_kg:,.3f}",
-                f"{row.day_plan_weight:,.3f}",
-                f"{row.night_plan_weight:,.3f}",
-                f"{row.total_plan:,}",
-                f"{row.balance:,}",
-                row.casing_type,
-                row.mold_type,
-            ]
+        self.table.clearContents()
+        self.table.setRowCount(len(rows))
 
-            tooltip = self._row_tooltip(row)
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(str(value))
-                item.setFlags(
-                    Qt.ItemFlag.ItemIsSelectable
-                    | Qt.ItemFlag.ItemIsEnabled
-                )
-                item.setToolTip(tooltip)
+        batch_size = 32
 
-                if column not in {
-                    0,
-                    1,
-                    3,
-                    4,
-                    5,
-                    6,
-                    7,
-                    8,
-                    13,
-                    21,
-                    22,
-                }:
-                    item.setTextAlignment(
-                        Qt.AlignmentFlag.AlignCenter
-                    )
+        def render_batch(offset: int = 0) -> None:
+            if token != self._table_render_token:
+                return
 
-                if column == 2:
-                    self._style_oven_status(
-                        item,
+            end = min(
+                len(rows),
+                offset + batch_size,
+            )
+            self.table.setUpdatesEnabled(False)
+
+            try:
+                for row_index in range(offset, end):
+                    row = rows[row_index]
+                    values = [
+                        row.line_name,
+                        row.oven_no,
                         row.oven_status,
-                    )
+                        row.tyre_code or "-",
+                        row.description or "-",
+                        row.heel,
+                        row.soft,
+                        row.tred,
+                        row.remark,
+                        f"{row.total_to_be_produced:,}",
+                        f"{row.today_qty:,}",
+                        f"{row.day_plan_pcs:,}",
+                        f"{row.night_plan_pcs:,}",
+                        row.core,
+                        f"{row.next_day_plan:,}",
+                        f"{row.total:,}",
+                        f"{row.weight_per_tyre_kg:,.3f}",
+                        f"{row.day_plan_weight:,.3f}",
+                        f"{row.night_plan_weight:,.3f}",
+                        f"{row.total_plan:,}",
+                        f"{row.balance:,}",
+                        row.casing_type,
+                        row.mold_type,
+                        (
+                            f"#{row.priority_no}"
+                            if row.priority_no is not None
+                            else "-"
+                        ),
+                    ]
 
-                self.table.setItem(
-                    row_index,
-                    column,
-                    item,
+                    tooltip = self._row_tooltip(row)
+
+                    for column, value in enumerate(values):
+                        item = QTableWidgetItem(
+                            str(value)
+                        )
+                        item.setFlags(
+                            Qt.ItemFlag.ItemIsSelectable
+                            | Qt.ItemFlag.ItemIsEnabled
+                        )
+                        item.setToolTip(tooltip)
+
+                        if column not in {
+                            0,
+                            1,
+                            3,
+                            4,
+                            5,
+                            6,
+                            7,
+                            8,
+                            13,
+                            21,
+                            22,
+                        }:
+                            item.setTextAlignment(
+                                Qt.AlignmentFlag.AlignCenter
+                            )
+
+                        if column == 2:
+                            self._style_oven_status(
+                                item,
+                                row.oven_status,
+                            )
+
+                        self.table.setItem(
+                            row_index,
+                            column,
+                            item,
+                        )
+            finally:
+                self.table.setUpdatesEnabled(True)
+
+            if end < len(rows):
+                QTimer.singleShot(
+                    0,
+                    lambda next_offset=end:
+                    render_batch(next_offset),
                 )
+
+        QTimer.singleShot(
+            0,
+            render_batch,
+        )
 
     def _populate_blocked_table(self) -> None:
         self.blocked_table.setRowCount(
@@ -1497,6 +1691,7 @@ class SchedulePage(QWidget):
             f"Line: {row.line_name}\n"
             f"Oven: {row.oven_no}\n"
             f"Status: {row.oven_status}\n"
+            f"Priority: #{row.priority_no if row.priority_no is not None else '-'}\n"
             f"Sequence: {row.sequence_no}\n"
             f"Schedule: {schedule}\n"
             f"Shift: {row.shift_name or '-'}\n"
@@ -1586,3 +1781,6 @@ class SchedulePage(QWidget):
             f"{minute // 60:02d}:"
             f"{minute % 60:02d}"
         )
+
+
+# MPPS V24 PRODUCTION PLANNING NON-BLOCKING LOAD
